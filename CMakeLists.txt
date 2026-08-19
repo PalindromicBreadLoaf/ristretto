@@ -13,6 +13,8 @@ endif()
 
 add_executable(ristretto
     src/main.c
+    src/boot/boot.c
+    src/boot/dol.c
     src/mem/wii_memory.c
 )
 

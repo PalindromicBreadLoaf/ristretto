@@ -5,6 +5,7 @@
 #include <whb/gfx.h>
 #include <whb/log.h>
 #include <whb/log_udp.h>
+#include <whb/sdcard.h>
 
 #include <gx2/draw.h>
 #include <gx2/mem.h>
@@ -19,9 +20,11 @@
 
 #include <malloc.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "boot/boot.h"
 #include "gpu/tev_modulate_shader.h"
 #include "mem/wii_memory.h"
 
@@ -154,6 +157,114 @@ static bool selfTestWiiMemory(void) {
     return ok;
 }
 
+static void putBe32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+// Build a minimal test DOL
+#define TEST_DOL_SIZE   0x140u
+#define TEST_TEXT_EA    0x80004000u
+#define TEST_DATA_EA    0x80004100u
+#define TEST_BSS_EA     0x80004200u
+
+static uint32_t buildSyntheticDol(uint8_t *buf) {
+    memset(buf, 0, TEST_DOL_SIZE);
+    putBe32(buf + 0x00, 0x100);           // text[0] file offset
+    putBe32(buf + 0x1C, 0x120);           // data[0] file offset
+    putBe32(buf + 0x48, TEST_TEXT_EA);    // text[0] address
+    putBe32(buf + 0x64, TEST_DATA_EA);    // data[0] address
+    putBe32(buf + 0x90, 0x20);            // text[0] size
+    putBe32(buf + 0xAC, 0x20);            // data[0] size
+    putBe32(buf + 0xD8, TEST_BSS_EA);     // bss address
+    putBe32(buf + 0xDC, 0x40);            // bss size
+    putBe32(buf + 0xE0, TEST_TEXT_EA);    // entry point
+
+    putBe32(buf + 0x100, 0x7C13FBA6);     // mtspr HID4, r0
+    putBe32(buf + 0x104, 0xDEADBEEF);     // text marker
+    putBe32(buf + 0x120, 0xCAFEB0BA);     // data marker
+    return TEST_DOL_SIZE;
+}
+
+static bool selfTestBoot(void) {
+    uint8_t dol[TEST_DOL_SIZE];
+    uint32_t size = buildSyntheticDol(dol);
+
+    DolLoadResult r;
+    if (!boot_dol_from_buffer(dol, size, "RTST01", &r)) {
+        WHBLogPrint("boot selftest: dol_load rejected a valid image");
+        return false;
+    }
+
+    bool ok = true;
+    if (r.entry_point != TEST_TEXT_EA || r.section_count != 2 || !r.is_wii) {
+        WHBLogPrintf("boot selftest: header wrong (entry=0x%08X sects=%u wii=%d)",
+                     r.entry_point, r.section_count, r.is_wii);
+        ok = false;
+    }
+    if (wii_read_u32(TEST_TEXT_EA) != 0x7C13FBA6 ||
+        wii_read_u32(TEST_TEXT_EA + 4) != 0xDEADBEEF ||
+        wii_read_u32(TEST_DATA_EA) != 0xCAFEB0BA) {
+        WHBLogPrint("boot selftest: section bytes did not land in guest memory");
+        ok = false;
+    }
+    if (wii_read_u32(0x80000030) != (TEST_BSS_EA + 0x40)) {
+        WHBLogPrintf("boot selftest: arenaLo wrong (0x%08X)", wii_read_u32(0x80000030));
+        ok = false;
+    }
+    if (memcmp(wii_mem_ptr(0x80000000), "RTST01", 6) != 0) {
+        WHBLogPrint("boot selftest: disc ID not written to __OSBootInfo");
+        ok = false;
+    }
+    return ok;
+}
+
+// Load proper Wii DOL from SD Card.
+static void tryLoadDolFromSd(void) {
+    if (!WHBMountSdCard()) {
+        WHBLogPrint("boot: SD mount failed. Skipping real DOL smoke test");
+        return;
+    }
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/wiiu/apps/ristretto/boot.dol",
+             WHBGetSdCardMountPath());
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        WHBLogPrintf("boot: no %s (optional). Skipping real DOL smoke test", path);
+        WHBUnmountSdCard();
+        return;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len <= 0) {
+        WHBLogPrint("boot: boot.dol is empty");
+        fclose(f);
+        WHBUnmountSdCard();
+        return;
+    }
+
+    uint8_t *buf = malloc((size_t)len);
+    if (buf && fread(buf, 1, (size_t)len, f) == (size_t)len) {
+        DolLoadResult r;
+        WHBLogPrintf("boot: loading real DOL from SD (%ld bytes)", len);
+        if (boot_dol_from_buffer(buf, (uint32_t)len, NULL, &r))
+            WHBLogPrint("boot: real DOL loaded OK");
+        else
+            WHBLogPrint("boot: real DOL failed to load");
+    } else {
+        WHBLogPrint("boot: failed to read boot.dol");
+    }
+    free(buf);
+    fclose(f);
+    WHBUnmountSdCard();
+}
+
 int main(int argc, char **argv) {
     WHBProcInit();
     WHBLogUdpInit();
@@ -169,6 +280,8 @@ int main(int argc, char **argv) {
     wii_mem_setup_lowmem();
     wii_mem_log_layout();
     WHBLogPrintf("wii_mem selftest: %s", selfTestWiiMemory() ? "PASS" : "FAIL");
+    WHBLogPrintf("boot selftest: %s", selfTestBoot() ? "PASS" : "FAIL");
+    tryLoadDolFromSd();
 
     int result = 0;
     WHBGfxShaderGroup group = {0};
