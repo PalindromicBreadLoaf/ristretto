@@ -15,6 +15,7 @@ add_executable(ristretto
     src/main.c
     src/boot/boot.c
     src/boot/dol.c
+    src/cpu/cpu_exec.c
     src/mem/wii_memory.c
 )
 

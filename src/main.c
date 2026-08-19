@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include "boot/boot.h"
+#include "cpu/cpu_exec.h"
 #include "gpu/tev_modulate_shader.h"
 #include "mem/wii_memory.h"
 
@@ -282,6 +283,12 @@ int main(int argc, char **argv) {
     WHBLogPrintf("wii_mem selftest: %s", selfTestWiiMemory() ? "PASS" : "FAIL");
     WHBLogPrintf("boot selftest: %s", selfTestBoot() ? "PASS" : "FAIL");
     tryLoadDolFromSd();
+
+    switch (cpu_exec_selftest()) {
+        case CPU_EXEC_PASS:        WHBLogPrint("cpu_exec selftest: PASS"); break;
+        case CPU_EXEC_UNAVAILABLE: WHBLogPrint("cpu_exec selftest: UNAVAILABLE"); break;
+        case CPU_EXEC_FAIL:        WHBLogPrint("cpu_exec selftest: FAIL"); break;
+    }
 
     int result = 0;
     WHBGfxShaderGroup group = {0};
