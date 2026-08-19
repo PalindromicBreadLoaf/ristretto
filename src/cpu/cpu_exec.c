@@ -5,7 +5,9 @@
 
 #include <coreinit/cache.h>
 #include <coreinit/codegen.h>
+#include <coreinit/context.h>
 #include <coreinit/core.h>
+#include <coreinit/exception.h>
 #include <coreinit/thread.h>
 #include <whb/log.h>
 
@@ -130,4 +132,89 @@ CpuExecStatus cpu_exec_selftest(void) {
     free(stack);
 
     return s_status;
+}
+
+// One paired-single op as a raw opcode word for testing.
+__asm__(
+    ".globl ps_probe_asm\n"
+    ".type ps_probe_asm, @function\n"
+    "ps_probe_asm:\n"
+    "  .long 0x10210072\n"   // ps_mul f1, f1, f1
+    "  blr\n"
+    ".size ps_probe_asm, .-ps_probe_asm\n"
+);
+extern float ps_probe_asm(float a);
+
+static volatile bool s_ps_illegal;
+
+// Program exception fires when ps_mul decodes as illegal.
+static BOOL psProgramHandler(OSContext *ctx) {
+    s_ps_illegal = true;
+    ctx->srr0 += 4;
+    return TRUE;
+}
+
+static CpuPsStatus  s_ps_status;
+static float        s_ps_result;
+
+static int psThreadEntry(int argc, const char **argv) {
+    (void)argc;
+    (void)argv;
+
+    s_ps_illegal = false;
+    OSExceptionCallbackFn prev =
+        OSSetExceptionCallback(OS_EXCEPTION_TYPE_PROGRAM, psProgramHandler);
+
+    s_ps_result = ps_probe_asm(3.0f);
+
+    OSSetExceptionCallback(OS_EXCEPTION_TYPE_PROGRAM, prev);
+    s_ps_status = s_ps_illegal ? CPU_PS_ILLEGAL : CPU_PS_ENABLED;
+    return 0;
+}
+
+CpuPsStatus cpu_ps_probe_core(uint32_t core) {
+    s_ps_status = CPU_PS_ERROR;
+
+    static OSThread thread;
+    const uint32_t stackSize = 64u * 1024u;
+    uint8_t *stack = memalign(16, stackSize);
+    if (!stack) {
+        WHBLogPrint("cpu_exec: failed to allocate ps-probe thread stack");
+        return CPU_PS_ERROR;
+    }
+
+    OSThreadAttributes affinity = (OSThreadAttributes)(1u << core);
+    if (!OSCreateThread(&thread, psThreadEntry, 0, NULL,
+                        stack + stackSize, stackSize, 16, affinity)) {
+        WHBLogPrint("cpu_exec: OSCreateThread failed for ps probe");
+        free(stack);
+        return CPU_PS_ERROR;
+    }
+
+    OSResumeThread(&thread);
+    int ret = 0;
+    OSJoinThread(&thread, &ret);
+    free(stack);
+
+    return s_ps_status;
+}
+
+void cpu_ps_probe_all(void) {
+    int enabled = 0;
+    for (uint32_t core = 0; core < 3; ++core) {
+        CpuPsStatus st = cpu_ps_probe_core(core);
+        const char *label = st == CPU_PS_ENABLED ? "enabled"
+                          : st == CPU_PS_ILLEGAL ? "illegal"
+                                                 : "probe error";
+        if (st == CPU_PS_ENABLED) {
+            ++enabled;
+            WHBLogPrintf("cpu_exec: ps core=%u %s ps_mul(3,3)=%d/1000(want 9000)",
+                         core, label, (int)(s_ps_result * 1000.0f));
+        } else {
+            WHBLogPrintf("cpu_exec: ps core=%u %s", core, label);
+        }
+    }
+    WHBLogPrintf("cpu_exec: paired-singles %s (%d/3 cores)",
+                 enabled == 3 ? "AVAILABLE" : enabled > 0 ? "PARTIAL" : "UNAVAILABLE",
+                 enabled);
 }

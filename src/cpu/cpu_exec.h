@@ -28,3 +28,16 @@ void cpu_exec_probe(CpuCodegenInfo *out);
 // Copy small hand-assembled PPC routines into the codegen area, run them on the
 // codegen core.
 CpuExecStatus cpu_exec_selftest(void);
+
+typedef enum {
+    CPU_PS_ENABLED,   // a paired-single op executed correctly
+    CPU_PS_ILLEGAL,   // ps_* raised a Program exception
+    CPU_PS_ERROR,     // probe could not run
+} CpuPsStatus;
+
+// Wii guest code uses Gekko/Broadway paired-single (ps_*) floats heavily,
+// and as such, we need paired singles to work properly. This checks whether paired
+// singles are usable.
+CpuPsStatus cpu_ps_probe_core(uint32_t core);
+
+void cpu_ps_probe_all(void);

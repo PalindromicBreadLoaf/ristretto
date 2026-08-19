@@ -289,6 +289,7 @@ int main(int argc, char **argv) {
         case CPU_EXEC_UNAVAILABLE: WHBLogPrint("cpu_exec selftest: UNAVAILABLE"); break;
         case CPU_EXEC_FAIL:        WHBLogPrint("cpu_exec selftest: FAIL"); break;
     }
+    cpu_ps_probe_all();
 
     int result = 0;
     WHBGfxShaderGroup group = {0};
