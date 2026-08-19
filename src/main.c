@@ -27,6 +27,7 @@
 #include "boot/boot.h"
 #include "cpu/cpu_exec.h"
 #include "gpu/tev_modulate_shader.h"
+#include "ios/ios_ipc.h"
 #include "mem/wii_memory.h"
 
 // PoC for a fixed-function pipeline via GX2.
@@ -290,6 +291,11 @@ int main(int argc, char **argv) {
         case CPU_EXEC_FAIL:        WHBLogPrint("cpu_exec selftest: FAIL"); break;
     }
     cpu_ps_probe_all();
+
+    switch (ios_ipc_selftest()) {
+        case IOS_IPC_SELFTEST_PASS: WHBLogPrint("ios_ipc selftest: PASS"); break;
+        case IOS_IPC_SELFTEST_FAIL: WHBLogPrint("ios_ipc selftest: FAIL"); break;
+    }
 
     int result = 0;
     WHBGfxShaderGroup group = {0};
