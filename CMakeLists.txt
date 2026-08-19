@@ -13,7 +13,10 @@ endif()
 
 add_executable(ristretto
     src/main.c
+    src/mem/wii_memory.c
 )
+
+target_include_directories(ristretto PRIVATE src)
 
 target_link_libraries(ristretto PRIVATE wut)
 

@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "gpu/tev_modulate_shader.h"
+#include "mem/wii_memory.h"
 
 // PoC for a fixed-function pipeline via GX2.
 
@@ -122,10 +123,52 @@ static bool makeAttributeBuffer(GX2RBuffer *buffer, const void *data,
     return true;
 }
 
+// Verify memory setup worked before relying on it.
+static bool selfTestWiiMemory(void) {
+    bool ok = true;
+
+    wii_write_u32(0x80000200, 0xC0FFEE00);
+    if (wii_read_u32(0xC0000200) != 0xC0FFEE00 || wii_read_u32(0x00000200) != 0xC0FFEE00) {
+        WHBLogPrint("wii_mem selftest: MEM1 cached/uncached/physical mirrors disagree");
+        ok = false;
+    }
+
+    wii_write_u32(0x90001000, 0xABCDEF12);
+    if (wii_read_u32(0xD0001000) != 0xABCDEF12) {
+        WHBLogPrint("wii_mem selftest: MEM2 cached/uncached mirror disagree");
+        ok = false;
+    }
+
+    if (wii_mem_ptr(0x81800000) != NULL || wii_mem_ptr(0x94000000) != NULL) {
+        WHBLogPrint("wii_mem selftest: out-of-range EA resolved to a pointer");
+        ok = false;
+    }
+
+    if (wii_mem_range(0x817FFFFC, 8) != NULL) {
+        WHBLogPrint("wii_mem selftest: range crossing MEM1 end was accepted");
+        ok = false;
+    }
+
+    wii_write_u32(0x80000200, 0);
+    wii_write_u32(0x90001000, 0);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     WHBProcInit();
     WHBLogUdpInit();
     WHBGfxInit();
+
+    if (!wii_mem_init()) {
+        WHBLogPrint("Failed to allocate guest memory map");
+        WHBGfxShutdown();
+        WHBLogUdpDeinit();
+        WHBProcShutdown();
+        return -1;
+    }
+    wii_mem_setup_lowmem();
+    wii_mem_log_layout();
+    WHBLogPrintf("wii_mem selftest: %s", selfTestWiiMemory() ? "PASS" : "FAIL");
 
     int result = 0;
     WHBGfxShaderGroup group = {0};
@@ -205,6 +248,7 @@ exit:
     GX2RDestroyBufferEx(&texCoordBuffer, 0);
     WHBGfxFreeShaderGroup(&group);
 
+    wii_mem_shutdown();
     WHBGfxShutdown();
     WHBLogUdpDeinit();
     WHBProcShutdown();
