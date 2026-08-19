@@ -28,6 +28,7 @@
 #include "cpu/cpu_exec.h"
 #include "disc/disc.h"
 #include "gpu/gx_fifo.h"
+#include "gpu/gx_state.h"
 #include "gpu/tev_modulate_shader.h"
 #include "ios/ios_ipc.h"
 #include "mem/wii_memory.h"
@@ -357,6 +358,7 @@ int main(int argc, char **argv) {
     tryMountDiscFromSd();
 
     WHBLogPrintf("gx_fifo selftest: %s", gx_fifo_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("gx_state selftest: %s", gx_state_selftest() ? "PASS" : "FAIL");
 
     int result = 0;
     WHBGfxShaderGroup group = {0};
