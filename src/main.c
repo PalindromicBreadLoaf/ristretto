@@ -26,6 +26,7 @@
 
 #include "boot/boot.h"
 #include "cpu/cpu_exec.h"
+#include "disc/disc.h"
 #include "gpu/tev_modulate_shader.h"
 #include "ios/ios_ipc.h"
 #include "mem/wii_memory.h"
@@ -267,6 +268,60 @@ static void tryLoadDolFromSd(void) {
     WHBUnmountSdCard();
 }
 
+// A disc image kept mounted for the app's lifetime.
+static Disc g_disc;
+static bool g_disc_mounted = false;
+
+static void tryMountDiscFromSd(void) {
+    if (!WHBMountSdCard()) {
+        WHBLogPrint("disc: SD mount failed. Skipping disc loopback test");
+        return;
+    }
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/wiiu/apps/ristretto/game.iso",
+             WHBGetSdCardMountPath());
+
+    if (!disc_open_file(&g_disc, path)) {
+        WHBLogPrintf("disc: no %s. Skipping disc loopback test", path);
+        WHBUnmountSdCard();
+        return;
+    }
+
+    g_disc_mounted = true;
+    ios_ipc_mount_disc(&g_disc);
+    WHBLogPrintf("disc: mounted id=%s (%s) size=%llu MiB", g_disc.game_id,
+                 g_disc.is_wii ? "Wii" : "GC",
+                 (unsigned long long)(g_disc.size >> 20));
+
+    if (!g_disc.is_wii) {
+        WHBLogPrint("disc: GC image mounted");
+        return;
+    }
+
+    uint64_t part;
+    if (!disc_find_game_partition(&g_disc, &part)) {
+        WHBLogPrint("disc: no data partition found");
+        return;
+    }
+    if (!disc_open_partition(&g_disc, part)) {
+        WHBLogPrintf("disc: open partition @0x%llx failed",
+                     (unsigned long long)part);
+        return;
+    }
+
+    uint8_t boot[0x20];
+    if (!disc_read_partition(&g_disc, 0, boot, sizeof(boot))) {
+        WHBLogPrint("disc: decrypted partition read failed");
+        return;
+    }
+    // Decrypted partition data opens with boot.bin.
+    char id[7] = {0};
+    memcpy(id, boot, 6);
+    WHBLogPrintf("disc: game partition @0x%llx decrypted OK, boot id=%s",
+                 (unsigned long long)part, id);
+}
+
 int main(int argc, char **argv) {
     WHBProcInit();
     WHBLogUdpInit();
@@ -296,6 +351,9 @@ int main(int argc, char **argv) {
         case IOS_IPC_SELFTEST_PASS: WHBLogPrint("ios_ipc selftest: PASS"); break;
         case IOS_IPC_SELFTEST_FAIL: WHBLogPrint("ios_ipc selftest: FAIL"); break;
     }
+
+    WHBLogPrintf("disc selftest: %s", disc_selftest() ? "PASS" : "FAIL");
+    tryMountDiscFromSd();
 
     int result = 0;
     WHBGfxShaderGroup group = {0};
@@ -375,6 +433,11 @@ exit:
     GX2RDestroyBufferEx(&texCoordBuffer, 0);
     WHBGfxFreeShaderGroup(&group);
 
+    if (g_disc_mounted) {
+        ios_ipc_mount_disc(NULL);
+        disc_close(&g_disc);
+        WHBUnmountSdCard();
+    }
     wii_mem_shutdown();
     WHBGfxShutdown();
     WHBLogUdpDeinit();

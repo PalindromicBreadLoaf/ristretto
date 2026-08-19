@@ -8,6 +8,7 @@
 
 #include <whb/log.h>
 
+#include "disc/disc.h"
 #include "mem/wii_memory.h"
 
 // Starlet ABI
@@ -56,20 +57,86 @@ static int32_t es_ioctl(int32_t fd, uint32_t request,
     }
 }
 
-#define DI_DVDLOWINQUIRY 0x12
+// DI
+#define DI_DVDLOWINQUIRY         0x12
+#define DI_DVDLOWREADDISKID      0x70
+#define DI_DVDLOWREAD            0x71
+#define DI_DVDLOWOPENPARTITION   0x8B  // ioctlv
+#define DI_DVDLOWUNENCRYPTEDREAD 0x8D
+
+// DI results occupy their own code space
+#define DI_RESULT_SUCCESS  1
+#define DI_RESULT_DRIVE    2
+#define DI_RESULT_SECURITY 32
+#define DI_RESULT_BADARG   128
+
+static Disc *s_disc = NULL;
+
+void ios_ipc_mount_disc(Disc *disc) {
+    s_disc = disc;
+}
 
 static int32_t di_ioctl(int32_t fd, uint32_t request,
                         uint32_t in_ea, uint32_t in_len,
                         uint32_t io_ea, uint32_t io_len) {
-    (void)fd; (void)in_ea; (void)in_len;
-    if (request == DI_DVDLOWINQUIRY) {
-        if (io_len < 8 || !wii_mem_range(io_ea, 8)) return IOS_IPC_EINVAL;
+    (void)fd;
+    switch (request) {
+    case DI_DVDLOWINQUIRY:
+        if (io_len < 8 || !wii_mem_range(io_ea, 8)) return DI_RESULT_SECURITY;
         // driveinfo: [0]=revision level, [1]=device code, [2..]=release date.
         wii_write_u32(io_ea + 0, 0x00000002u);
         wii_write_u32(io_ea + 4, 0x20080203u);
-        return IOS_IPC_SUCCESS;
+        return DI_RESULT_SUCCESS;
+
+    case DI_DVDLOWREADDISKID: {
+        if (!s_disc || !s_disc->valid) return DI_RESULT_DRIVE;
+        void *dst = wii_mem_range(io_ea, 0x20);
+        if (io_len < 0x20 || !dst) return DI_RESULT_SECURITY;
+        if (!disc_read_raw(s_disc, 0, dst, 0x20)) return DI_RESULT_DRIVE;
+        return DI_RESULT_SUCCESS;
     }
-    return IOS_IPC_EINVAL;
+
+    case DI_DVDLOWREAD: {
+        if (!s_disc || !s_disc->part_open) return DI_RESULT_SECURITY;
+        if (in_len < 12 || !wii_mem_range(in_ea, 12)) return DI_RESULT_SECURITY;
+        uint32_t length = wii_read_u32(in_ea + 4);
+        uint64_t position = (uint64_t)wii_read_u32(in_ea + 8) << 2;
+        void *dst = wii_mem_range(io_ea, length);
+        if (io_len < length || !dst) return DI_RESULT_SECURITY;
+        if (!disc_read_partition(s_disc, position, dst, length)) return DI_RESULT_DRIVE;
+        return DI_RESULT_SUCCESS;
+    }
+
+    case DI_DVDLOWUNENCRYPTEDREAD: {
+        if (!s_disc || !s_disc->valid) return DI_RESULT_DRIVE;
+        if (in_len < 12 || !wii_mem_range(in_ea, 12)) return DI_RESULT_SECURITY;
+        uint32_t length = wii_read_u32(in_ea + 4);
+        uint64_t position = (uint64_t)wii_read_u32(in_ea + 8) << 2;
+        void *dst = wii_mem_range(io_ea, length);
+        if (io_len < length || !dst) return DI_RESULT_SECURITY;
+        if (!disc_read_raw(s_disc, position, dst, length)) return DI_RESULT_DRIVE;
+        return DI_RESULT_SUCCESS;
+    }
+
+    default:
+        return DI_RESULT_BADARG;
+    }
+}
+
+static int32_t di_ioctlv(int32_t fd, uint32_t request,
+                         uint32_t in_count, uint32_t io_count,
+                         const IosIoVector *vectors) {
+    (void)fd;
+    if (request != DI_DVDLOWOPENPARTITION) return DI_RESULT_BADARG;
+    if (in_count != 3 || io_count != 2) return DI_RESULT_BADARG;
+    if (!s_disc || !s_disc->valid) return DI_RESULT_DRIVE;
+
+    uint32_t params = vectors[0].addr;
+    if (vectors[0].size < 8 || !wii_mem_range(params, 8)) return DI_RESULT_SECURITY;
+    uint64_t part_offset = (uint64_t)wii_read_u32(params + 4) << 2;
+    if (!disc_open_partition(s_disc, part_offset)) return DI_RESULT_SECURITY;
+    // TODO: copy the partition TMD into the first io vector once TMD parsing exists.
+    return DI_RESULT_SUCCESS;
 }
 
 // ISFS
@@ -134,7 +201,7 @@ static int32_t sdi_ioctl(int32_t fd, uint32_t request,
 
 static const IosDevice kDevices[] = {
     {"/dev/es",          NULL, NULL, es_ioctl,  NULL},
-    {"/dev/di",          NULL, NULL, di_ioctl,  NULL},
+    {"/dev/di",          NULL, NULL, di_ioctl,  di_ioctlv},
     {"/dev/fs",          NULL, NULL, fs_ioctl,  fs_ioctlv},
     {"/dev/sdio/slot0",  NULL, NULL, sdi_ioctl, NULL},
 };

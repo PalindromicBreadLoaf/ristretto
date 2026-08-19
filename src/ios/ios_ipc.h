@@ -7,6 +7,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "disc/disc.h"
+
 // HLE of the Wii IOS IPC surface.
 // At this point is basically a stub
 
@@ -64,6 +66,9 @@ typedef struct IosDevice {
 
 // Register the inbuilt device stubs
 void ios_ipc_init(void);
+
+// Attach a disc image for /dev/di to loop its reads back over.
+void ios_ipc_mount_disc(Disc *disc);
 
 // Service one guest-resident IPC command block at effective address `cmd_block_ea`.
 int32_t ios_ipc_dispatch(uint32_t cmd_block_ea);

@@ -16,6 +16,8 @@ add_executable(ristretto
     src/boot/boot.c
     src/boot/dol.c
     src/cpu/cpu_exec.c
+    src/disc/aes.c
+    src/disc/disc.c
     src/ios/ios_ipc.c
     src/mem/wii_memory.c
 )
