@@ -26,6 +26,8 @@
 
 #include "boot/boot.h"
 #include "cpu/cpu_exec.h"
+#include "cpu/ppc_decode.h"
+#include "cpu/ppc_interp.h"
 #include "disc/disc.h"
 #include "gpu/gx_fifo.h"
 #include "gpu/gx_state.h"
@@ -349,6 +351,10 @@ int main(int argc, char **argv) {
         case CPU_EXEC_FAIL:        WHBLogPrint("cpu_exec selftest: FAIL"); break;
     }
     cpu_ps_probe_all();
+    cpu_privilege_probe_all();
+
+    WHBLogPrintf("cpu_xlate selftest: decoder %s", ppc_decode_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("cpu_xlate selftest: interp %s", ppc_interp_selftest() ? "PASS" : "FAIL");
 
     switch (ios_ipc_selftest()) {
         case IOS_IPC_SELFTEST_PASS: WHBLogPrint("ios_ipc selftest: PASS"); break;
