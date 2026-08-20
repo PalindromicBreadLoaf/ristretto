@@ -33,6 +33,7 @@
 #include "gpu/gx_fifo.h"
 #include "gpu/gx_state.h"
 #include "gpu/gx_texture.h"
+#include "gpu/r700_emit.h"
 #include "gpu/tev_modulate_shader.h"
 #include "ios/ios_ipc.h"
 #include "mem/wii_memory.h"
@@ -373,6 +374,7 @@ int main(int argc, char **argv) {
     WHBLogPrintf("gx_fifo selftest: %s", gx_fifo_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_state selftest: %s", gx_state_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_texture selftest: %s", gx_texture_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("r700_emit selftest: %s", r700_emit_selftest() ? "PASS" : "FAIL");
 
     int result = 0;
     WHBGfxShaderGroup group = {0};

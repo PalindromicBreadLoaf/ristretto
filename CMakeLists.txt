@@ -24,6 +24,7 @@ add_executable(ristretto
     src/gpu/gx_fifo.c
     src/gpu/gx_state.c
     src/gpu/gx_texture.c
+    src/gpu/r700_emit.c
     src/ios/ios_ipc.c
     src/mem/wii_memory.c
     src/mem/wii_mmio.c
