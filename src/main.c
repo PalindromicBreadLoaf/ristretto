@@ -358,6 +358,9 @@ int main(int argc, char **argv) {
     WHBLogPrintf("cpu_xlate selftest: interp %s", ppc_interp_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("cpu_xlate selftest: identity-block %s", ppc_xlate_identity_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("cpu_xlate selftest: memblock %s", ppc_xlate_memblock_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("cpu_xlate selftest: branches %s", ppc_xlate_branch_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("cpu_xlate selftest: mmio %s", ppc_xlate_mmio_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("cpu_xlate selftest: entry %s", ppc_xlate_entry_selftest() ? "PASS" : "FAIL");
 
     switch (ios_ipc_selftest()) {
         case IOS_IPC_SELFTEST_PASS: WHBLogPrint("ios_ipc selftest: PASS"); break;

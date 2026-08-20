@@ -5,7 +5,10 @@
 
 #include "cpu/ppc_decode.h"
 #include "cpu/ppc_interp.h"
+#include "gpu/gx_fifo.h"
+#include "ios/ios_ipc.h"
 #include "mem/wii_memory.h"
+#include "mem/wii_mmio.h"
 
 #include <coreinit/cache.h>
 #include <coreinit/codegen.h>
@@ -226,27 +229,32 @@ static void          *s_area;
 static uint32_t       s_area_size;
 static PpcXlateResult s_run_status;
 
-static int xlateThreadEntry(int argc, const char **argv) {
-    (void)argc; (void)argv;
-    uint8_t *dst = s_area;
-    uint32_t bytes = s_len * 4;
-
+// Copy `words` of translated code into the codegen area at `dst`.
+static bool codegen_commit(void *dst, const uint32_t *code, uint32_t words) {
+    uint32_t bytes = words * 4;
     if (!OSSwitchSecCodeGenMode(CODEGEN_RW_)) {
         WHBLogPrint("cpu_xlate: CODEGEN_RW_ failed");
-        s_run_status = PPC_XLATE_ERROR;
-        return 0;
+        return false;
     }
-    memcpy(dst, s_code, bytes);
+    memcpy(dst, code, bytes);
     DCFlushRange(dst, bytes);
     if (!OSSwitchSecCodeGenMode(CODEGEN_R_X)) {
         WHBLogPrint("cpu_xlate: CODEGEN_R_X failed");
-        s_run_status = PPC_XLATE_ERROR;
-        return 0;
+        return false;
     }
     ICInvalidateRange(dst, bytes);
     __asm__ volatile("isync");
+    return true;
+}
 
-    void (*fn)(void) = (void (*)(void))(uintptr_t)dst;
+static int xlateThreadEntry(int argc, const char **argv) {
+    (void)argc; (void)argv;
+    if (!codegen_commit(s_area, s_code, s_len)) {
+        s_run_status = PPC_XLATE_ERROR;
+        return 0;
+    }
+
+    void (*fn)(void) = (void (*)(void))(uintptr_t)s_area;
 
     BOOL irq = OSDisableInterrupts();
     fn();
@@ -300,6 +308,328 @@ PpcXlateResult ppc_xlate_run_block(PpcContext *ctx, uint32_t guest_pc,
         return PPC_XLATE_ERROR;
 
     return run_on_codegen_core();
+}
+
+// Block cache + dispatcher
+#define MAX_BLOCK_INSTS 256u
+
+typedef enum {
+    TERM_INTERP,       // branch / system / an op the emitter can't handle
+    TERM_MMIO,         // a memory op whose static EA lands in hardware registers
+    TERM_FALLTHROUGH,  // ran to the block length cap with no terminator
+} TermKind;
+
+typedef struct {
+    bool     used;
+    uint32_t start_pc;
+    uint32_t code_off;      // byte offset of the body in the codegen area
+    uint32_t guest_count;   // guest instructions emitted in the body
+    uint32_t term_pc;       // guest PC of the terminator
+    TermKind term_kind;
+    PpcInst  term;          // decoded terminator
+} XBlock;
+
+#define XCACHE_CAP 4096u
+static XBlock   s_cache[XCACHE_CAP];
+static uint32_t s_codegen_bump;
+
+// Session parameters and results
+static PpcContext   *s_ctx;
+static uint32_t      s_entry, s_stop, s_max_blocks;
+static bool          s_run_to_gx;
+static PpcXlateSession s_session;
+static PpcXlateResult  s_session_status;
+
+static XBlock *cache_find(uint32_t pc) {
+    uint32_t i = (pc >> 2) % XCACHE_CAP;
+    for (uint32_t n = 0; n < XCACHE_CAP; ++n) {
+        XBlock *b = &s_cache[i];
+        if (!b->used) return NULL;
+        if (b->start_pc == pc) return b;
+        i = (i + 1) % XCACHE_CAP;
+    }
+    return NULL;
+}
+
+static XBlock *cache_alloc(uint32_t pc) {
+    uint32_t i = (pc >> 2) % XCACHE_CAP;
+    for (uint32_t n = 0; n < XCACHE_CAP; ++n) {
+        XBlock *b = &s_cache[i];
+        if (!b->used) {
+            b->used = true;
+            b->start_pc = pc;
+            return b;
+        }
+        i = (i + 1) % XCACHE_CAP;
+    }
+    return NULL;   // cache full
+}
+
+// Enough to recognise a memory op whose base register was just loaded with an immediate (lis/li/addi/ori)
+static void track_alu(uint32_t *cval, bool *known, const PpcInst *in) {
+    switch (in->primary) {
+    case 14:  // addi / li
+        if (in->ra == 0)            { cval[in->rd] = (uint32_t)in->imm; known[in->rd] = true; }
+        else if (known[in->ra])     { cval[in->rd] = cval[in->ra] + (uint32_t)in->imm; known[in->rd] = true; }
+        else                        { known[in->rd] = false; }
+        return;
+    case 15:  // addis / lis
+        if (in->ra == 0)            { cval[in->rd] = (uint32_t)in->imm << 16; known[in->rd] = true; }
+        else if (known[in->ra])     { cval[in->rd] = cval[in->ra] + ((uint32_t)in->imm << 16); known[in->rd] = true; }
+        else                        { known[in->rd] = false; }
+        return;
+    case 24:  // ori
+        if (known[in->rd])          { cval[in->ra] = cval[in->rd] | (uint16_t)in->raw; known[in->ra] = true; }
+        else                        { known[in->ra] = false; }
+        return;
+    case 25:  // oris
+        if (known[in->rd])          { cval[in->ra] = cval[in->rd] | ((uint32_t)(uint16_t)in->raw << 16); known[in->ra] = true; }
+        else                        { known[in->ra] = false; }
+        return;
+    default:
+        // Conservatively drop both possible integer destinations.
+        known[in->rd] = false;
+        known[in->ra] = false;
+        return;
+    }
+}
+
+// Emit the straight-line body starting at `start_pc` into s_code.
+static bool emit_body(uint32_t start_pc, uint32_t *guest_count,
+                      TermKind *tk, uint32_t *term_pc, PpcInst *term) {
+    uint32_t cval[32];
+    bool     known[32];
+    memset(known, 0, sizeof known);
+
+    for (uint32_t i = 0;; ++i) {
+        if (i >= MAX_BLOCK_INSTS) {
+            *tk = TERM_FALLTHROUGH;
+            *term_pc = start_pc + i * 4;
+            *guest_count = i;
+            return true;
+        }
+        uint32_t pc = start_pc + i * 4;
+        uint32_t word = wii_read_u32(pc);
+        PpcInst in;
+        if (!ppc_decode(word, &in)) {
+            *tk = TERM_INTERP; *term_pc = pc; *term = in; *guest_count = i; return true;
+        }
+
+        switch (in.class) {
+        case PPC_CLASS_ALU:
+            if (gpr_reserved(in.rd) || gpr_reserved(in.ra)) {
+                *tk = TERM_INTERP; *term_pc = pc; *term = in; *guest_count = i; return true;
+            }
+            if (!emit(word)) return false;
+            track_alu(cval, known, &in);
+            break;
+        case PPC_CLASS_FP:
+            if (!emit(word)) return false;
+            break;
+        case PPC_CLASS_LOAD:
+        case PPC_CLASS_STORE: {
+            bool ea_known = false;
+            uint32_t ea = 0;
+            if (!in.mem_indexed) {
+                if (in.ra == 0)          { ea_known = true; ea = (uint32_t)in.imm; }
+                else if (known[in.ra])   { ea_known = true; ea = cval[in.ra] + (uint32_t)in.imm; }
+            }
+            if (ea_known && wii_ea_is_mmio(ea)) {
+                *tk = TERM_MMIO; *term_pc = pc; *term = in; *guest_count = i; return true;
+            }
+            if (!emit_mem(&in)) {   // indexed / update / reserved reg
+                *tk = TERM_INTERP; *term_pc = pc; *term = in; *guest_count = i; return true;
+            }
+            if (in.class == PPC_CLASS_LOAD && !in.is_fp_mem) known[in.rd] = false;
+            if (in.mem_update) known[in.ra] = false;
+            break;
+        }
+        default:   // BRANCH / SYSTEM / PS
+            *tk = TERM_INTERP; *term_pc = pc; *term = in; *guest_count = i; return true;
+        }
+    }
+}
+
+// Effective address of a memory op from the live context.
+static uint32_t mem_ea(const PpcContext *c, const PpcInst *in) {
+    uint32_t base = (in->ra == 0 && !in->mem_update) ? 0 : c->gpr[in->ra];
+    return in->mem_indexed ? base + c->gpr[in->rb] : base + (uint32_t)in->imm;
+}
+
+// Service one hardware register access by routing WGP writes to the GX FIFO capture
+// and IPC control writes to the IOS dispatcher.
+static void service_mmio(PpcContext *c, const PpcInst *in) {
+    uint32_t ea = mem_ea(c, in);
+    uint32_t size = in->mem_size;
+
+    if (in->class == PPC_CLASS_STORE) {
+        uint64_t val;
+        if (in->is_fp_mem) {
+            if (size == 8) {
+                val = c->fpr[in->rd].u;
+            } else {
+                float f = (float)c->fpr[in->rd].d;
+                uint32_t bits; memcpy(&bits, &f, 4); val = bits;
+            }
+        } else {
+            val = c->gpr[in->rd];
+        }
+        wii_mmio_write(ea, val, size);
+        if (wii_ea_is_wgp(ea) && s_session.first_gx_write_ea == 0)
+            s_session.first_gx_write_ea = ea;
+    } else {
+        uint32_t v = wii_mmio_read(ea, size);
+        if (in->is_fp_mem) {
+            if (size == 8) c->fpr[in->rd].u = (uint64_t)v << 32;
+            else { float f; uint32_t bits = v; memcpy(&f, &bits, 4); c->fpr[in->rd].d = (double)f; }
+        } else {
+            if (size == 1) v &= 0xFF; else if (size == 2) v &= 0xFFFF;
+            c->gpr[in->rd] = v;
+        }
+    }
+    if (in->mem_update)
+        c->gpr[in->ra] = ea;
+}
+
+// From an MMIO terminator service that access and every immediately following
+// memory op whose live EA is also MMIO.
+static bool service_mmio_run(PpcContext *c) {
+    for (;;) {
+        PpcInst in;
+        if (!ppc_decode(wii_read_u32(c->pc), &in))
+            return false;
+        if (in.class != PPC_CLASS_LOAD && in.class != PPC_CLASS_STORE)
+            return false;
+        if (!wii_ea_is_mmio(mem_ea(c, &in)))
+            return false;
+        service_mmio(c, &in);
+        c->pc += 4;
+        if (s_run_to_gx && s_session.first_gx_write_ea != 0)
+            return true;
+    }
+}
+
+// Ensure a block for `pc` exists in the cache, compiling and committing it if not.
+static XBlock *get_block(uint32_t pc) {
+    XBlock *b = cache_find(pc);
+    if (b) { s_session.cache_hits++; return b; }
+    s_session.cache_misses++;
+
+    b = cache_alloc(pc);
+    if (!b) { s_session_status = PPC_XLATE_ERROR; return NULL; }
+
+    s_len = 0;
+    if (!emit_prologue((uint32_t)(uintptr_t)s_ctx)) { s_session_status = PPC_XLATE_ERROR; return NULL; }
+    TermKind tk; uint32_t tpc, gcount; PpcInst term;
+    if (!emit_body(pc, &gcount, &tk, &tpc, &term))  { s_session_status = PPC_XLATE_ERROR; return NULL; }
+    if (!emit_epilogue((uint32_t)(uintptr_t)s_ctx)) { s_session_status = PPC_XLATE_ERROR; return NULL; }
+
+    uint32_t off = s_codegen_bump;
+    if (off + s_len * 4 > s_area_size) { s_session_status = PPC_XLATE_UNAVAILABLE; return NULL; }
+    if (!codegen_commit((uint8_t *)s_area + off, s_code, s_len)) {
+        s_session_status = PPC_XLATE_ERROR; return NULL;
+    }
+    s_codegen_bump = (off + s_len * 4 + 31u) & ~31u;
+
+    b->code_off = off;
+    b->guest_count = gcount;
+    b->term_kind = tk;
+    b->term_pc = tpc;
+    b->term = term;
+    return b;
+}
+
+static void session_run(void) {
+    OSGetCodegenVirtAddrRange(&s_area, &s_area_size);
+    if (!s_area || !wii_mem_fastmem_window()) { s_session_status = PPC_XLATE_UNAVAILABLE; return; }
+
+    memset(s_cache, 0, sizeof s_cache);
+    memset(&s_session, 0, sizeof s_session);
+    s_codegen_bump = 0;
+    s_session.stop = PPC_XSTOP_BUDGET;
+    s_session_status = PPC_XLATE_OK;
+
+    PpcContext *c = s_ctx;
+    uint32_t pc = s_entry;
+
+    while (s_session.blocks_run < s_max_blocks) {
+        if (pc == s_stop) { s_session.stop = PPC_XSTOP_STOP_PC; return; }
+
+        XBlock *b = get_block(pc);
+        if (!b) return;
+
+        void (*fn)(void) = (void (*)(void))(uintptr_t)((uint8_t *)s_area + b->code_off);
+        BOOL irq = OSDisableInterrupts();
+        fn();
+        OSRestoreInterrupts(irq);
+        s_session.blocks_run++;
+
+        switch (b->term_kind) {
+        case TERM_FALLTHROUGH:
+            pc = b->term_pc;
+            break;
+        case TERM_MMIO:
+            c->pc = b->term_pc;
+            if (service_mmio_run(c)) { s_session.stop = PPC_XSTOP_GX_WRITE; return; }
+            pc = c->pc;
+            break;
+        case TERM_INTERP: {
+            c->pc = b->term_pc;
+            uint32_t nostop = b->term_pc + 2;   // 4-aligned PC can never equal this
+            uint32_t ex = 0;
+            if (ppc_interp_run(c, nostop, 1, &ex) == PPC_INTERP_ILLEGAL || ex == 0) {
+                PpcInst fi;
+                if (!ppc_decode(wii_read_u32(b->term_pc), &fi)) fi.class = PPC_CLASS_ILLEGAL;
+                s_session.stop = PPC_XSTOP_FAULT;
+                s_session.last_pc = b->term_pc;
+                s_session.last_class = (uint8_t)fi.class;
+                return;
+            }
+            pc = c->pc;
+            break;
+        }
+        }
+    }
+}
+
+static int sessionThreadEntry(int argc, const char **argv) {
+    (void)argc; (void)argv;
+    session_run();
+    return 0;
+}
+
+PpcXlateResult ppc_xlate_run(PpcContext *ctx, uint32_t entry_pc, uint32_t stop_pc,
+                             uint32_t max_blocks, PpcXlateSession *out) {
+    if (!wii_mem_fastmem_window())
+        return PPC_XLATE_UNAVAILABLE;
+
+    s_ctx = ctx;
+    s_entry = entry_pc;
+    s_stop = stop_pc;
+    s_max_blocks = max_blocks;
+    s_run_to_gx = (stop_pc == PPC_XLATE_RUN_TO_GX);
+
+    static OSThread thread;
+    const uint32_t stackSize = 128u * 1024u;
+    uint8_t *stack = memalign(16, stackSize);
+    if (!stack)
+        return PPC_XLATE_ERROR;
+
+    OSThreadAttributes affinity = (OSThreadAttributes)(1u << OSGetCodegenCore());
+    s_session_status = PPC_XLATE_ERROR;
+    if (!OSCreateThread(&thread, sessionThreadEntry, 0, NULL,
+                        stack + stackSize, stackSize, 16, affinity)) {
+        free(stack);
+        return PPC_XLATE_ERROR;
+    }
+    OSResumeThread(&thread);
+    int ret = 0;
+    OSJoinThread(&thread, &ret);
+    free(stack);
+
+    if (out)
+        *out = s_session;
+    return s_session_status;
 }
 
 // Self test
@@ -406,6 +736,167 @@ bool ppc_xlate_memblock_selftest(void) {
     if (!ctx_equal(&want, &got) || got_w != want_w || got_d != want_d) {
         WHBLogPrintf("cpu_xlate: memblock r4 got=0x%08X want=0x%08X mem@0xC0001000 got=0x%08X want=0x%08X MISMATCH",
                      got.gpr[4], want.gpr[4], got_w, want_w);
+        return false;
+    }
+    return true;
+}
+
+bool ppc_xlate_branch_selftest(void) {
+    // A counted bdnz loop (acc = 1+..+5), a bl/blr call that doubles it, and a
+    // computed bctr into a final block.
+    static const uint32_t prog[] = {
+        0x38800000, 0x38a00005, 0x7ca903a6, 0x38c00000, 0x38c60001, 0x7c843214,
+        0x4200fff8, 0x48000011, 0x38ea0034, 0x7ce903a6, 0x4e800420, 0x7c842214,
+        0x4e800020, 0x7c642214, 0x48000004, 0x60000000,
+    };
+    const uint32_t base = 0x80006000u;
+    const uint32_t stop = base + 0x3c;   // `theend`
+    for (size_t i = 0; i < sizeof prog / sizeof prog[0]; ++i)
+        wii_write_u32(base + (uint32_t)i * 4, prog[i]);
+
+    PpcContext want; memset(&want, 0, sizeof want);
+    want.pc = base; want.gpr[10] = base;
+    uint32_t ex = 0;
+    if (ppc_interp_run(&want, stop, 256, &ex) != PPC_INTERP_STOP) {
+        WHBLogPrint("cpu_xlate: branch oracle did not reach stop");
+        return false;
+    }
+
+    PpcContext got; memset(&got, 0, sizeof got);
+    got.pc = base; got.gpr[10] = base;
+    PpcXlateSession s;
+    PpcXlateResult r = ppc_xlate_run(&got, base, stop, 256, &s);
+    if (r != PPC_XLATE_OK || s.stop != PPC_XSTOP_STOP_PC) {
+        WHBLogPrintf("cpu_xlate: branch run failed (r=%d stop=%d)", r, (int)s.stop);
+        return false;
+    }
+    WHBLogPrintf("cpu_xlate: block-cache hits=%u misses=%u", s.cache_hits, s.cache_misses);
+    if (s.cache_hits == 0) {
+        WHBLogPrint("cpu_xlate: branch loop never re-hit a cached block");
+        return false;
+    }
+    if (!ctx_equal(&want, &got)) {
+        WHBLogPrintf("cpu_xlate: branches r3 got=%u want=%u r4 got=%u want=%u ctr got=%u want=%u MISMATCH",
+                     got.gpr[3], want.gpr[3], got.gpr[4], want.gpr[4], got.ctr, want.ctr);
+        return false;
+    }
+    return true;
+}
+
+// MMIO/lowmem trap routing
+static int      s_bp_calls;
+static uint8_t  s_bp_cmd;
+static void mmio_on_bp(void *u, uint8_t cmd, uint32_t val) {
+    (void)u; (void)val; s_bp_calls++; s_bp_cmd = cmd;
+}
+
+bool ppc_xlate_mmio_selftest(void) {
+    // Translated block bursts a GX command stream (NOP, BP-load, NOP)
+    // into the write-gather pipe
+    wii_mmio_reset();
+    static const uint32_t wgp[] = {
+        0x3c60cc00, 0x60638000, 0x38800000, 0x38a00061, 0x38c00041,
+        0x98830000, 0x98a30000, 0x98c30000, 0x98830000, 0x98830000, 0x98830000, 0x98830000,
+        0x4e800020,
+    };
+    const uint32_t base = 0x80007000u;
+    const uint32_t stop = base + (uint32_t)sizeof wgp;   // blr returns to the sentinel
+    for (size_t i = 0; i < sizeof wgp / sizeof wgp[0]; ++i)
+        wii_write_u32(base + (uint32_t)i * 4, wgp[i]);
+
+    PpcContext c; memset(&c, 0, sizeof c);
+    c.pc = base; c.lr = stop;
+    PpcXlateSession s;
+    PpcXlateResult r = ppc_xlate_run(&c, base, stop, 64, &s);
+    if (r != PPC_XLATE_OK) {
+        WHBLogPrintf("cpu_xlate: mmio wgp run failed (%d)", r);
+        return false;
+    }
+
+    uint32_t wlen = 0;
+    const uint8_t *wdata = wii_mmio_wgp_data(&wlen);
+    if (wlen != 7) {
+        WHBLogPrintf("cpu_xlate: mmio wgp captured %u bytes (want 7)", wlen);
+        return false;
+    }
+    s_bp_calls = 0; s_bp_cmd = 0;
+    GXFifoState st; gx_fifo_state_reset(&st);
+    GXFifoSink sink; memset(&sink, 0, sizeof sink);
+    sink.on_bp = mmio_on_bp;
+    gx_fifo_run(&st, wdata, wlen, &sink, NULL);
+    if (s_bp_calls != 1 || s_bp_cmd != 0x41) {
+        WHBLogPrintf("cpu_xlate: mmio gx_fifo bp_calls=%d cmd=0x%02X (want 1 / 0x41)",
+                     s_bp_calls, s_bp_cmd);
+        return false;
+    }
+    WHBLogPrint("cpu_xlate: mmio scheme=wgp+ipc ok");
+
+    ios_ipc_init();
+    const uint32_t blk  = 0x90003000u;   // command block in MEM2
+    const uint32_t path = 0x90003100u;
+    wii_mem_write(path, "/dev/es", 8);
+    wii_write_u32(blk + 0x00, 1);            // IOS_CMD_OPEN
+    wii_write_u32(blk + 0x04, 0xFFFFFFFFu);  // poison result; dispatch overwrites it
+    wii_write_u32(blk + 0x0C, path);         // arg0: path pointer
+    wii_write_u32(blk + 0x10, 0);            // arg1: mode
+
+    static const uint32_t ipc[] = {
+        0x3c60cd00, 0x3c809000, 0x60843000, 0x38a00001, 0x90830000, 0x90a30004, 0x4e800020,
+    };
+    const uint32_t ibase = 0x80007100u;
+    const uint32_t istop = ibase + (uint32_t)sizeof ipc;
+    for (size_t i = 0; i < sizeof ipc / sizeof ipc[0]; ++i)
+        wii_write_u32(ibase + (uint32_t)i * 4, ipc[i]);
+
+    PpcContext ic; memset(&ic, 0, sizeof ic);
+    ic.pc = ibase; ic.lr = istop;
+    r = ppc_xlate_run(&ic, ibase, istop, 64, &s);
+    if (r != PPC_XLATE_OK) {
+        WHBLogPrintf("cpu_xlate: mmio ipc run failed (%d)", r);
+        return false;
+    }
+    int32_t result = (int32_t)wii_read_u32(blk + 0x04);
+    if (result < 0) {
+        WHBLogPrintf("cpu_xlate: mmio ipc dispatch result=%d (want fd>=0)", result);
+        return false;
+    }
+    return true;
+}
+
+//Self test
+bool ppc_xlate_entry_selftest(void) {
+    wii_mmio_reset();
+    // A counted loop (r3 -> 10) stored to RAM, then a first write-gather-pipe write.
+    static const uint32_t prog[] = {
+        0x38600000, 0x3880000a, 0x7c8903a6, 0x38630001, 0x4200fffc,
+        0x3ca09000, 0x60a55000, 0x90650000, 0x3cc0cc00, 0x60c68000, 0x38e00000, 0x98e60000,
+        0x4e800020,
+    };
+    const uint32_t base = 0x80004000u;   // a DOL-style entry EA
+    for (size_t i = 0; i < sizeof prog / sizeof prog[0]; ++i)
+        wii_write_u32(base + (uint32_t)i * 4, prog[i]);
+    wii_write_u32(0x90005000u, 0);
+
+    PpcContext c; memset(&c, 0, sizeof c);
+    c.pc = base; c.lr = base + (uint32_t)sizeof prog;
+    PpcXlateSession s;
+    PpcXlateResult r = ppc_xlate_run(&c, base, PPC_XLATE_RUN_TO_GX, 256, &s);
+    if (r != PPC_XLATE_OK) {
+        WHBLogPrintf("cpu_xlate: entry run failed (%d)", r);
+        return false;
+    }
+    if (s.stop != PPC_XSTOP_GX_WRITE) {
+        if (s.stop == PPC_XSTOP_FAULT)
+            WHBLogPrintf("cpu_xlate: entry faulted @0x%08X class=%u", s.last_pc, s.last_class);
+        else
+            WHBLogPrintf("cpu_xlate: entry stopped=%d without a GX write", (int)s.stop);
+        return false;
+    }
+    WHBLogPrintf("cpu_xlate: entry=0x%08X ran %u blocks, first GX write @0x%08X",
+                 base, s.blocks_run, s.first_gx_write_ea);
+    if (c.gpr[3] != 10 || wii_read_u32(0x90005000u) != 10) {
+        WHBLogPrintf("cpu_xlate: entry r3=%u mem=%u (want 10) MISMATCH",
+                     c.gpr[3], wii_read_u32(0x90005000u));
         return false;
     }
     return true;

@@ -26,6 +26,7 @@ add_executable(ristretto
     src/gpu/gx_texture.c
     src/ios/ios_ipc.c
     src/mem/wii_memory.c
+    src/mem/wii_mmio.c
 )
 
 target_include_directories(ristretto PRIVATE src)
