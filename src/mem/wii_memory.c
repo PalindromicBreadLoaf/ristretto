@@ -10,6 +10,8 @@
 
 static uint8_t *sMem1;
 static uint8_t *sMem2;
+static uint8_t *sWindow;   // single window backing both banks, when available
+static bool     sFastmem;  // true when sMem1/sMem2 live inside sWindow
 
 // Resolve a guest EA to its backing bank, reporting the offset within that bank
 // and the bytes remaining to the bank's end.
@@ -39,8 +41,18 @@ bool wii_mem_init(void) {
     if (sMem1 && sMem2)
         return true;
 
-    sMem1 = memalign(0x10000, WII_MEM1_SIZE);
-    sMem2 = memalign(0x10000, WII_MEM2_SIZE);
+    // Prefer a single contiguous window with each bank at its physical offset
+    // (MEM1 at 0 MEM2 at 0x10000000).
+    sWindow = memalign(0x10000, WII_FASTMEM_WINDOW_SIZE);
+    if (sWindow) {
+        sMem1    = sWindow + WII_MEM1_PHYS;
+        sMem2    = sWindow + WII_MEM2_PHYS;
+        sFastmem = true;
+    } else {
+        sMem1    = memalign(0x10000, WII_MEM1_SIZE);
+        sMem2    = memalign(0x10000, WII_MEM2_SIZE);
+        sFastmem = false;
+    }
     if (!sMem1 || !sMem2) {
         WHBLogPrintf("wii_mem: allocation failed (mem1=%p mem2=%p)", sMem1, sMem2);
         wii_mem_shutdown();
@@ -53,10 +65,20 @@ bool wii_mem_init(void) {
 }
 
 void wii_mem_shutdown(void) {
-    free(sMem1);
-    free(sMem2);
-    sMem1 = NULL;
-    sMem2 = NULL;
+    if (sFastmem) {
+        free(sWindow);
+    } else {
+        free(sMem1);
+        free(sMem2);
+    }
+    sWindow  = NULL;
+    sMem1    = NULL;
+    sMem2    = NULL;
+    sFastmem = false;
+}
+
+void *wii_mem_fastmem_window(void) {
+    return sFastmem ? sWindow : NULL;
 }
 
 void *wii_mem_ptr(uint32_t ea) {
@@ -192,4 +214,9 @@ void wii_mem_log_layout(void) {
                  sMem2, WII_MEM2_SIZE >> 10, WII_MEM2_EA_CACHED, WII_MEM2_EA_UNCACHED);
     WHBLogPrintf("wii_mem: lowmem magic@0x80000020=0x%08X ramsize@0x80000028=0x%08X",
                  wii_read_u32(0x80000020), wii_read_u32(0x80000028));
+    if (sFastmem)
+        WHBLogPrintf("wii_mem: fastmem window=%p size=%u KiB (mask 0x%08X)",
+                     sWindow, WII_FASTMEM_WINDOW_SIZE >> 10, WII_FASTMEM_MASK);
+    else
+        WHBLogPrint("wii_mem: fastmem window UNAVAILABLE");
 }

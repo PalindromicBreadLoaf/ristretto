@@ -41,3 +41,14 @@ typedef enum {
 CpuPsStatus cpu_ps_probe_core(uint32_t core);
 
 void cpu_ps_probe_all(void);
+
+typedef enum {
+    CPU_PRIV_SUPERVISOR,  // a supervisor-only SPR read succeeded
+    CPU_PRIV_USER,        // the read trapped (Program exception) — ordinary user mode
+    CPU_PRIV_ERROR,       // probe could not run
+} CpuPrivStatus;
+
+// Probe whether this RPX can touch Espresso supervisor state.
+CpuPrivStatus cpu_privilege_probe_core(uint32_t core);
+
+void cpu_privilege_probe_all(void);

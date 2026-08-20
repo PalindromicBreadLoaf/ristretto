@@ -28,6 +28,7 @@
 #include "cpu/cpu_exec.h"
 #include "cpu/ppc_decode.h"
 #include "cpu/ppc_interp.h"
+#include "cpu/ppc_xlate.h"
 #include "disc/disc.h"
 #include "gpu/gx_fifo.h"
 #include "gpu/gx_state.h"
@@ -355,6 +356,8 @@ int main(int argc, char **argv) {
 
     WHBLogPrintf("cpu_xlate selftest: decoder %s", ppc_decode_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("cpu_xlate selftest: interp %s", ppc_interp_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("cpu_xlate selftest: identity-block %s", ppc_xlate_identity_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("cpu_xlate selftest: memblock %s", ppc_xlate_memblock_selftest() ? "PASS" : "FAIL");
 
     switch (ios_ipc_selftest()) {
         case IOS_IPC_SELFTEST_PASS: WHBLogPrint("ios_ipc selftest: PASS"); break;

@@ -18,6 +18,7 @@ add_executable(ristretto
     src/cpu/cpu_exec.c
     src/cpu/ppc_decode.c
     src/cpu/ppc_interp.c
+    src/cpu/ppc_xlate.c
     src/disc/aes.c
     src/disc/disc.c
     src/gpu/gx_fifo.c

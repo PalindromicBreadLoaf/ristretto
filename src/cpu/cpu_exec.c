@@ -218,3 +218,93 @@ void cpu_ps_probe_all(void) {
                  enabled == 3 ? "AVAILABLE" : enabled > 0 ? "PARTIAL" : "UNAVAILABLE",
                  enabled);
 }
+
+// A read-only supervisor SPR read (mfspr DBAT0U, SPR 536) as a raw opcode word.
+__asm__(
+    ".globl priv_probe_asm\n"
+    ".type priv_probe_asm, @function\n"
+    "priv_probe_asm:\n"
+    "  .long 0x7C7882A6\n"   // mfspr r3, DBAT0U (SPR 536)
+    "  blr\n"
+    ".size priv_probe_asm, .-priv_probe_asm\n"
+);
+extern uint32_t priv_probe_asm(void);
+
+static volatile bool     s_priv_trapped;
+static volatile uint32_t s_priv_srr1;
+
+// Program exception fires when the DBAT0U read is denied in user mode.
+static BOOL privProgramHandler(OSContext *ctx) {
+    s_priv_trapped = true;
+    s_priv_srr1    = ctx->srr1;
+    ctx->srr0 += 4;
+    return TRUE;
+}
+
+static CpuPrivStatus s_priv_status;
+static uint32_t      s_priv_value;
+
+static int privThreadEntry(int argc, const char **argv) {
+    (void)argc;
+    (void)argv;
+
+    s_priv_trapped = false;
+    OSExceptionCallbackFn prev =
+        OSSetExceptionCallback(OS_EXCEPTION_TYPE_PROGRAM, privProgramHandler);
+
+    s_priv_value = priv_probe_asm();
+
+    OSSetExceptionCallback(OS_EXCEPTION_TYPE_PROGRAM, prev);
+    s_priv_status = s_priv_trapped ? CPU_PRIV_USER : CPU_PRIV_SUPERVISOR;
+    return 0;
+}
+
+CpuPrivStatus cpu_privilege_probe_core(uint32_t core) {
+    s_priv_status = CPU_PRIV_ERROR;
+
+    static OSThread thread;
+    const uint32_t stackSize = 64u * 1024u;
+    uint8_t *stack = memalign(16, stackSize);
+    if (!stack) {
+        WHBLogPrint("cpu_exec: failed to allocate privilege-probe thread stack");
+        return CPU_PRIV_ERROR;
+    }
+
+    OSThreadAttributes affinity = (OSThreadAttributes)(1u << core);
+    if (!OSCreateThread(&thread, privThreadEntry, 0, NULL,
+                        stack + stackSize, stackSize, 16, affinity)) {
+        WHBLogPrint("cpu_exec: OSCreateThread failed for privilege probe");
+        free(stack);
+        return CPU_PRIV_ERROR;
+    }
+
+    OSResumeThread(&thread);
+    int ret = 0;
+    OSJoinThread(&thread, &ret);
+    free(stack);
+
+    return s_priv_status;
+}
+
+void cpu_privilege_probe_all(void) {
+    int user = 0, super = 0;
+    for (uint32_t core = 0; core < 3; ++core) {
+        CpuPrivStatus st = cpu_privilege_probe_core(core);
+        if (st == CPU_PRIV_USER) {
+            ++user;
+            WHBLogPrintf("cpu_exec: privilege core=%u user mode",
+                         core, s_priv_srr1);
+        } else if (st == CPU_PRIV_SUPERVISOR) {
+            ++super;
+            WHBLogPrintf("cpu_exec: privilege core=%u DBAT0U=0x%08X",
+                         core, s_priv_value);
+        } else {
+            WHBLogPrintf("cpu_exec: privilege core=%u probe error", core);
+        }
+    }
+    const char *verdict = (user == 3) ? "UNAVAILABLE"
+                        : (super > 0)  ? "AVAILABLE"
+                                       : "INCONCLUSIVE";
+    WHBLogPrintf("cpu_exec: Espresso supervisor access %s (%d/3 user-mode cores)",
+                 verdict, user);
+}

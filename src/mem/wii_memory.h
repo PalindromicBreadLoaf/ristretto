@@ -21,8 +21,16 @@
 #define WII_MEM2_PHYS         0x10000000u
 #define WII_MEM2_SIZE         0x04000000u
 
+// Masking a guest EA with this drops the cached/uncached/physical alias bits and
+// leaves the bank's physical offset (MEM1 at 0 MEM2 at 0x10000000).
+#define WII_FASTMEM_MASK      0x1FFFFFFFu
+#define WII_FASTMEM_WINDOW_SIZE (WII_MEM2_PHYS + WII_MEM2_SIZE)
+
 bool wii_mem_init(void);
 void wii_mem_shutdown(void);
+
+// Host base of the single contiguous window that backs both banks.
+void *wii_mem_fastmem_window(void);
 
 // Translate a guest effective address to a host pointer.
 void *wii_mem_ptr(uint32_t ea);
