@@ -21,6 +21,7 @@ add_executable(ristretto
     src/cpu/ppc_xlate.c
     src/disc/aes.c
     src/disc/disc.c
+    src/gpu/gx2_bind.c
     src/gpu/gx2_shader.c
     src/gpu/gx_fifo.c
     src/gpu/gx_state.c

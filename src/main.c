@@ -30,9 +30,11 @@
 #include "cpu/ppc_interp.h"
 #include "cpu/ppc_xlate.h"
 #include "disc/disc.h"
+#include "gpu/gx2_bind.h"
 #include "gpu/gx2_shader.h"
 #include "gpu/gx_fifo.h"
 #include "gpu/gx_state.h"
+#include "gpu/gx_tev.h"
 #include "gpu/gx_texture.h"
 #include "gpu/r700_emit.h"
 #include "gpu/shader_gen.h"
@@ -137,6 +139,22 @@ static bool makeAttributeBuffer(GX2RBuffer *buffer, const void *data,
     memcpy(dst, data, (size_t)elemSize * elemCount);
     GX2RUnlockBufferEx(buffer, 0);
     return true;
+}
+
+// Draw the modulate quad with the given shader trio.
+static void drawQuadPass(GX2FetchShader *fs, GX2VertexShader *vs, GX2PixelShader *ps,
+                         uint32_t samplerLoc, GX2Texture *tex, GX2Sampler *sampler,
+                         GX2RBuffer *pos, GX2RBuffer *col, GX2RBuffer *tc) {
+    GX2SetFetchShader(fs);
+    GX2SetVertexShader(vs);
+    GX2SetPixelShader(ps);
+    GX2SetVertexUniformReg(0, 16, sIdentity);
+    GX2SetPixelTexture(tex, samplerLoc);
+    GX2SetPixelSampler(sampler, samplerLoc);
+    GX2RSetAttributeBuffer(pos, 0, pos->elemSize, 0);
+    GX2RSetAttributeBuffer(col, 1, col->elemSize, 0);
+    GX2RSetAttributeBuffer(tc, 2, tc->elemSize, 0);
+    GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLE_STRIP, 4, 0, 1);
 }
 
 // Verify memory setup worked before relying on it.
@@ -377,6 +395,7 @@ int main(int argc, char **argv) {
     WHBLogPrintf("wii_vi selftest: %s", wii_vi_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_fifo selftest: %s", gx_fifo_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_state selftest: %s", gx_state_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("gx_tev selftest: %s", gx_tev_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_texture selftest: %s", gx_texture_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("r700_emit selftest: %s", r700_emit_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx2_shader selftest: %s", gx2_shader_selftest() ? "PASS" : "FAIL");
@@ -416,39 +435,54 @@ int main(int argc, char **argv) {
         goto exit;
     }
 
+    // Bind the runtime-generated modulate shaders into live GX2 objects.
+    const GX2AttribStream attribs[3] = {
+        {.location = 0, .buffer = 0, .offset = 0,
+         .format = GX2_ATTRIB_FORMAT_FLOAT_32_32,
+         .type = GX2_ATTRIB_INDEX_PER_VERTEX, .aluDivisor = 0,
+         .mask = GX2_SEL_MASK(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_0, GX2_SQ_SEL_1),
+         .endianSwap = GX2_ENDIAN_SWAP_DEFAULT},
+        {.location = 1, .buffer = 1, .offset = 0,
+         .format = GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32,
+         .type = GX2_ATTRIB_INDEX_PER_VERTEX, .aluDivisor = 0,
+         .mask = GX2_SEL_MASK(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z, GX2_SQ_SEL_W),
+         .endianSwap = GX2_ENDIAN_SWAP_DEFAULT},
+        {.location = 2, .buffer = 2, .offset = 0,
+         .format = GX2_ATTRIB_FORMAT_FLOAT_32_32,
+         .type = GX2_ATTRIB_INDEX_PER_VERTEX, .aluDivisor = 0,
+         .mask = GX2_SEL_MASK(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_0, GX2_SQ_SEL_1),
+         .endianSwap = GX2_ENDIAN_SWAP_DEFAULT},
+    };
+
+    Gx2BoundShader bound = {0};
+    bool useGenerated = gx2_bind_build_modulate(&bound, attribs, 3);
+    WHBLogPrintf("gx2_bind: modulate shader %s",
+                 useGenerated ? "GENERATED" : "FAILED, using built-in .gsh");
+
+    GX2FetchShader  *fs = useGenerated ? &bound.fs : &group.fetchShader;
+    GX2VertexShader *vs = useGenerated ? &bound.vs : group.vertexShader;
+    GX2PixelShader  *ps = useGenerated ? &bound.ps : group.pixelShader;
+    uint32_t samplerLoc = ps->samplerVars[0].location;
+
     while (WHBProcIsRunning()) {
         WHBGfxBeginRender();
 
         WHBGfxBeginRenderTV();
         WHBGfxClearColor(0.1f, 0.1f, 0.12f, 1.0f);
-        GX2SetFetchShader(&group.fetchShader);
-        GX2SetVertexShader(group.vertexShader);
-        GX2SetPixelShader(group.pixelShader);
-        GX2SetVertexUniformReg(0, 16, sIdentity);
-        GX2SetPixelTexture(&texture, group.pixelShader->samplerVars[0].location);
-        GX2SetPixelSampler(&sampler, group.pixelShader->samplerVars[0].location);
-        GX2RSetAttributeBuffer(&positionBuffer, 0, positionBuffer.elemSize, 0);
-        GX2RSetAttributeBuffer(&colourBuffer,   1, colourBuffer.elemSize, 0);
-        GX2RSetAttributeBuffer(&texCoordBuffer, 2, texCoordBuffer.elemSize, 0);
-        GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLE_STRIP, 4, 0, 1);
+        drawQuadPass(fs, vs, ps, samplerLoc, &texture, &sampler,
+                     &positionBuffer, &colourBuffer, &texCoordBuffer);
         WHBGfxFinishRenderTV();
 
         WHBGfxBeginRenderDRC();
         WHBGfxClearColor(0.1f, 0.1f, 0.12f, 1.0f);
-        GX2SetFetchShader(&group.fetchShader);
-        GX2SetVertexShader(group.vertexShader);
-        GX2SetPixelShader(group.pixelShader);
-        GX2SetVertexUniformReg(0, 16, sIdentity);
-        GX2SetPixelTexture(&texture, group.pixelShader->samplerVars[0].location);
-        GX2SetPixelSampler(&sampler, group.pixelShader->samplerVars[0].location);
-        GX2RSetAttributeBuffer(&positionBuffer, 0, positionBuffer.elemSize, 0);
-        GX2RSetAttributeBuffer(&colourBuffer,   1, colourBuffer.elemSize, 0);
-        GX2RSetAttributeBuffer(&texCoordBuffer, 2, texCoordBuffer.elemSize, 0);
-        GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLE_STRIP, 4, 0, 1);
+        drawQuadPass(fs, vs, ps, samplerLoc, &texture, &sampler,
+                     &positionBuffer, &colourBuffer, &texCoordBuffer);
         WHBGfxFinishRenderDRC();
 
         WHBGfxFinishRender();
     }
+
+    gx2_bind_free(&bound);
 
 exit:
     WHBLogPrint("Exiting...");
