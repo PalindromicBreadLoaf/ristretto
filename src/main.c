@@ -38,6 +38,7 @@
 #include "gpu/gx_texture.h"
 #include "gpu/r700_emit.h"
 #include "gpu/shader_gen.h"
+#include "gpu/tev_shader_gen.h"
 #include "gpu/tev_modulate_shader.h"
 #include "ios/ios_ipc.h"
 #include "mem/wii_memory.h"
@@ -400,6 +401,7 @@ int main(int argc, char **argv) {
     WHBLogPrintf("r700_emit selftest: %s", r700_emit_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx2_shader selftest: %s", gx2_shader_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("shader_gen selftest: %s", shader_gen_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("tev_shader_gen selftest: %s", tev_shader_gen_selftest() ? "PASS" : "FAIL");
 
     int result = 0;
     WHBGfxShaderGroup group = {0};
