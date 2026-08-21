@@ -46,6 +46,11 @@ enum {
     R700_OP2_MOV      = 0x019,
 };
 
+// ALU OP3 (three-source) opcodes.
+enum {
+    R700_OP3_MULADD   = 0x10,
+};
+
 // TEX instruction opcodes (TEX_INST field).
 enum {
     R700_TEX_SAMPLE = 0x10,
@@ -61,11 +66,15 @@ enum {
     R700_ALU_SRC_0_5     = 252,  // 0.5f
 };
 
+// A cfile (uniform register) constant is source-selected as 256 + register.
+#define R700_ALU_SRC_CFILE(reg) (256u + (uint32_t)(reg))
+
 // Channel / swizzle selects.
 enum { R700_CHAN_X = 0, R700_CHAN_Y = 1, R700_CHAN_Z = 2, R700_CHAN_W = 3 };
 
-// Coordinate config for a straight 2D texture sample (word2/word3).
-#define R700_TEX_WORD2_SAMPLE_2D 0x00000010u
+// TEX coordinate source selects (SRC_SEL_*): the channel enums plus constants.
+enum { R700_SEL_X = 0, R700_SEL_Y = 1, R700_SEL_Z = 2, R700_SEL_W = 3,
+       R700_SEL_0 = 4, R700_SEL_1 = 5 };
 
 // Instruction encoders
 
@@ -87,10 +96,23 @@ R700Inst64 r700_alu_op2(uint32_t op, uint32_t dst_gpr, uint32_t dst_chan,
                         uint32_t s1_sel, uint32_t s1_chan, bool s1_neg,
                         bool clamp, bool write_mask, bool last);
 
-// TEX SAMPLE from src_gpr into dst_gpr, with a destination swizzle.
+// ALU OP3 (three-source) instruction. OP3 forms always write the destination
+// (there is no write_mask bit; the field is taken by the third source).
+R700Inst64 r700_alu_op3(uint32_t op, uint32_t dst_gpr, uint32_t dst_chan,
+                        uint32_t s0_sel, uint32_t s0_chan, bool s0_neg,
+                        uint32_t s1_sel, uint32_t s1_chan, bool s1_neg,
+                        uint32_t s2_sel, uint32_t s2_chan, bool s2_neg,
+                        bool clamp, bool last);
+
+// A literal-constant slot (two float bit patterns) placed after the ALU group
+// that references R700_ALU_SRC_LITERAL. It carries no instruction fields.
+R700Inst64 r700_alu_literal(uint32_t x_bits, uint32_t y_bits);
+
+// TEX SAMPLE from src_gpr into dst_gpr, with a coordinate source swizzle and a
+// destination swizzle. All coordinates are treated as normalized.
 R700Inst128 r700_tex_sample(uint32_t resource_id, uint32_t sampler_id,
                             uint32_t src_gpr, uint32_t dst_gpr,
-                            const uint8_t dst_sel[4]);
+                            const uint8_t coord_sel[4], const uint8_t dst_sel[4]);
 
 // Program assembler
 
@@ -123,6 +145,10 @@ bool r700_prog_alu_clause(R700Program *p, const R700Inst64 *body, uint32_t slots
 // Append a TEX clause.
 bool r700_prog_tex_clause(R700Program *p, const R700Inst128 *body, uint32_t count,
                           bool valid_pixel_mode, bool barrier);
+
+// Append only a clause body and return its CF ADDR.
+uint32_t r700_prog_alu_body(R700Program *p, const R700Inst64 *body, uint32_t slots);
+uint32_t r700_prog_tex_body(R700Program *p, const R700Inst128 *body, uint32_t count);
 
 // Emit the CF section into buf and return the total program size in bytes.
 size_t r700_prog_finalize(R700Program *p);

@@ -73,9 +73,41 @@ R700Inst64 r700_alu_op2(uint32_t op, uint32_t dst_gpr, uint32_t dst_chan,
     return out;
 }
 
+R700Inst64 r700_alu_op3(uint32_t op, uint32_t dst_gpr, uint32_t dst_chan,
+                        uint32_t s0_sel, uint32_t s0_chan, bool s0_neg,
+                        uint32_t s1_sel, uint32_t s1_chan, bool s1_neg,
+                        uint32_t s2_sel, uint32_t s2_chan, bool s2_neg,
+                        bool clamp, bool last)
+{
+    R700Inst64 out;
+    out.w0 = (s0_sel & 0x1FFu)
+           | ((s0_chan & 0x3u) << 10)
+           | ((uint32_t)s0_neg << 12)
+           | ((s1_sel & 0x1FFu) << 13)
+           | ((s1_chan & 0x3u) << 23)
+           | ((uint32_t)s1_neg << 25)
+           | ((uint32_t)last << 31);
+    out.w1 = (s2_sel & 0x1FFu)
+           | ((s2_chan & 0x3u) << 10)
+           | ((uint32_t)s2_neg << 12)
+           | ((op & 0x1Fu) << 13)
+           | ((dst_gpr & 0x7Fu) << 21)
+           | ((dst_chan & 0x3u) << 29)
+           | ((uint32_t)clamp << 31);
+    return out;
+}
+
+R700Inst64 r700_alu_literal(uint32_t x_bits, uint32_t y_bits)
+{
+    R700Inst64 out;
+    out.w0 = x_bits;
+    out.w1 = y_bits;
+    return out;
+}
+
 R700Inst128 r700_tex_sample(uint32_t resource_id, uint32_t sampler_id,
                             uint32_t src_gpr, uint32_t dst_gpr,
-                            const uint8_t dst_sel[4])
+                            const uint8_t coord_sel[4], const uint8_t dst_sel[4])
 {
     R700Inst128 out;
     out.w[0] = (uint32_t)R700_TEX_SAMPLE
@@ -87,7 +119,12 @@ R700Inst128 r700_tex_sample(uint32_t resource_id, uint32_t sampler_id,
              | ((dst_sel[2] & 0x7u) << 15)
              | ((dst_sel[3] & 0x7u) << 18)
              | (0xFu << 28);  // all coords normalized
-    out.w[2] = R700_TEX_WORD2_SAMPLE_2D | ((sampler_id & 0x1Fu) << 15);
+    // WORD2: SAMPLER_ID[19:15], SRC_SEL_{X,Y,Z,W} at 20/23/26/29.
+    out.w[2] = ((sampler_id & 0x1Fu) << 15)
+             | ((coord_sel[0] & 0x7u) << 20)
+             | ((coord_sel[1] & 0x7u) << 23)
+             | ((coord_sel[2] & 0x7u) << 26)
+             | ((coord_sel[3] & 0x7u) << 29);
     out.w[3] = 0;
     return out;
 }
@@ -141,32 +178,44 @@ static uint32_t append_body(R700Program *p, const void *body, uint32_t bytes,
     return off;
 }
 
-bool r700_prog_alu_clause(R700Program *p, const R700Inst64 *body, uint32_t slots,
-                          bool barrier)
+uint32_t r700_prog_alu_body(R700Program *p, const R700Inst64 *body, uint32_t slots)
 {
     uint8_t words[R700_PROG_MAX_CLAUSE * 8];
-    if (slots * 8u > sizeof(words)) { p->overflow = true; return false; }
+    if (slots * 8u > sizeof(words)) { p->overflow = true; return UINT32_MAX; }
     for (uint32_t i = 0; i < slots; ++i) {
         put32(words + i * 8, body[i].w0);
         put32(words + i * 8 + 4, body[i].w1);
     }
     uint32_t off = append_body(p, words, slots * 8u, 16u);
-    if (off == UINT32_MAX) return false;
-    r700_prog_cf(p, r700_cf_alu(off / 8u, slots, barrier));
+    return off == UINT32_MAX ? UINT32_MAX : off / 8u;
+}
+
+uint32_t r700_prog_tex_body(R700Program *p, const R700Inst128 *body, uint32_t count)
+{
+    uint8_t words[R700_PROG_MAX_CLAUSE * 16];
+    if (count * 16u > sizeof(words)) { p->overflow = true; return UINT32_MAX; }
+    for (uint32_t i = 0; i < count; ++i)
+        for (uint32_t w = 0; w < 4; ++w)
+            put32(words + i * 16 + w * 4, body[i].w[w]);
+    uint32_t off = append_body(p, words, count * 16u, 16u);
+    return off == UINT32_MAX ? UINT32_MAX : off / 8u;
+}
+
+bool r700_prog_alu_clause(R700Program *p, const R700Inst64 *body, uint32_t slots,
+                          bool barrier)
+{
+    uint32_t addr = r700_prog_alu_body(p, body, slots);
+    if (addr == UINT32_MAX) return false;
+    r700_prog_cf(p, r700_cf_alu(addr, slots, barrier));
     return !p->overflow;
 }
 
 bool r700_prog_tex_clause(R700Program *p, const R700Inst128 *body, uint32_t count,
                           bool valid_pixel_mode, bool barrier)
 {
-    uint8_t words[R700_PROG_MAX_CLAUSE * 16];
-    if (count * 16u > sizeof(words)) { p->overflow = true; return false; }
-    for (uint32_t i = 0; i < count; ++i)
-        for (uint32_t w = 0; w < 4; ++w)
-            put32(words + i * 16 + w * 4, body[i].w[w]);
-    uint32_t off = append_body(p, words, count * 16u, 16u);
-    if (off == UINT32_MAX) return false;
-    r700_prog_cf(p, r700_cf(off / 8u, R700_CF_TEX, count, valid_pixel_mode,
+    uint32_t addr = r700_prog_tex_body(p, body, count);
+    if (addr == UINT32_MAX) return false;
+    r700_prog_cf(p, r700_cf(addr, R700_CF_TEX, count, valid_pixel_mode,
                             false, barrier));
     return !p->overflow;
 }
@@ -232,10 +281,27 @@ bool r700_emit_selftest(void)
             return false;
     }
 
+    // OP3 MULADD
+    // R1.x = R1.x * cfile[0].x + PV.x
+    static const uint8_t sel_xy0x[4] = {R700_SEL_X, R700_SEL_Y, R700_SEL_0, R700_SEL_X};
+    R700Inst64 madd = r700_alu_op3(R700_OP3_MULADD, 1, R700_CHAN_X,
+                                   1, R700_CHAN_X, false,
+                                   R700_ALU_SRC_CFILE(0), R700_CHAN_X, false,
+                                   R700_ALU_SRC_PV, R700_CHAN_X, false,
+                                   false, false);
+    if (!expect64(madd, 0x00200001, 0x002200fe)) return false;
+
+    // MUL R0.x = literal.x * cfile[3].x, write_mask 0.
+    R700Inst64 wterm = r700_alu_op2(R700_OP2_MUL, 0, R700_CHAN_X,
+                                    R700_ALU_SRC_LITERAL, R700_CHAN_X, false,
+                                    R700_ALU_SRC_CFILE(3), R700_CHAN_X, false,
+                                    false, false, false);
+    if (!expect64(wterm, 0x002060fd, 0x00000080)) return false;
+
     // TEX SAMPLE
-    R700Inst128 tex = r700_tex_sample(0, 1, 1, 1, sel_xyzw);
+    R700Inst128 tex = r700_tex_sample(0, 0, 1, 1, sel_xy0x, sel_xyzw);
     if (tex.w[0] != 0x00010010 || tex.w[1] != 0xf00d1001 ||
-        tex.w[2] != 0x00008010 || tex.w[3] != 0x00000000)
+        tex.w[2] != 0x10800000 || tex.w[3] != 0x00000000)
         return false;
 
     // Assemble a minimal pixel program and check clause addresses resolve.
