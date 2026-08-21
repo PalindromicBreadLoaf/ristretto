@@ -30,6 +30,7 @@
 #include "cpu/ppc_interp.h"
 #include "cpu/ppc_xlate.h"
 #include "disc/disc.h"
+#include "gpu/gx2_shader.h"
 #include "gpu/gx_fifo.h"
 #include "gpu/gx_state.h"
 #include "gpu/gx_texture.h"
@@ -375,6 +376,7 @@ int main(int argc, char **argv) {
     WHBLogPrintf("gx_state selftest: %s", gx_state_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_texture selftest: %s", gx_texture_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("r700_emit selftest: %s", r700_emit_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("gx2_shader selftest: %s", gx2_shader_selftest() ? "PASS" : "FAIL");
 
     int result = 0;
     WHBGfxShaderGroup group = {0};
