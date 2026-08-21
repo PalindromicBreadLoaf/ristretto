@@ -39,6 +39,7 @@
 #include "gpu/tev_modulate_shader.h"
 #include "ios/ios_ipc.h"
 #include "mem/wii_memory.h"
+#include "mem/wii_vi.h"
 
 // PoC for a fixed-function pipeline via GX2.
 
@@ -373,6 +374,7 @@ int main(int argc, char **argv) {
     WHBLogPrintf("disc selftest: %s", disc_selftest() ? "PASS" : "FAIL");
     tryMountDiscFromSd();
 
+    WHBLogPrintf("wii_vi selftest: %s", wii_vi_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_fifo selftest: %s", gx_fifo_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_state selftest: %s", gx_state_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_texture selftest: %s", gx_texture_selftest() ? "PASS" : "FAIL");

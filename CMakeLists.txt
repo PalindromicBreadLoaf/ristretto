@@ -30,6 +30,7 @@ add_executable(ristretto
     src/ios/ios_ipc.c
     src/mem/wii_memory.c
     src/mem/wii_mmio.c
+    src/mem/wii_vi.c
 )
 
 target_include_directories(ristretto PRIVATE src)
