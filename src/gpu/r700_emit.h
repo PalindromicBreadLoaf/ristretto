@@ -46,9 +46,13 @@ enum {
     R700_OP2_MOV      = 0x019,
 };
 
-// ALU OP3 (three-source) opcodes.
+// ALU OP3 opcodes.
 enum {
     R700_OP3_MULADD   = 0x10,
+    // Conditional selects
+    R700_OP3_CNDE     = 0x18,  // src0 == 0
+    R700_OP3_CNDGT    = 0x19,  // src0 > 0
+    R700_OP3_CNDGE    = 0x1A,  // src0 >= 0
 };
 
 // TEX instruction opcodes (TEX_INST field).

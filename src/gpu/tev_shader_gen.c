@@ -146,12 +146,10 @@ static float scale_value(uint8_t s)
 
 static float bias_value(uint8_t b)
 {
-    // TODO: GX_TB_COMPARE selects the comparison combiner, which this generator does
-    // not yet emit
     switch (b) {
         case GX_TB_ADDHALF: return 0.5f;
         case GX_TB_SUBHALF: return -0.5f;
-        default: return 0.0f;
+        default: return 0.0f;  // GX_TB_ZERO
     }
 }
 
@@ -219,16 +217,14 @@ static uint32_t emit_konst_group(const TevStage *st, const TevPsAlloc *a,
     return n;
 }
 
-// Emit one stage's combiner into the ALU body buffer.
-static uint32_t emit_stage(const TevConfig *cfg, uint32_t s, const TevPsAlloc *a,
-                           R700Inst64 *buf)
+// The arithmetic combiner over all four channels at once.
+static uint32_t emit_stage_arith(const TevConfig *cfg, uint32_t s,
+                                 const TevPsAlloc *a, R700Inst64 *buf)
 {
     const TevStage *st = &cfg->stage[s];
     const TevCombiner *cc = &st->color;
     const TevCombiner *ca = &st->alpha;
     uint32_t n = 0;
-
-    if (stage_uses_konst(st)) n += emit_konst_group(st, a, buf + n);
 
     // PV = b - a
     for (uint32_t ch = 0; ch < 4; ++ch) {
@@ -282,6 +278,225 @@ static uint32_t emit_stage(const TevConfig *cfg, uint32_t s, const TevPsAlloc *a
     }
     buf[n++] = r700_alu_literal(f32_bits(cscale), f32_bits(cbias));  // X, Y
     buf[n++] = r700_alu_literal(f32_bits(ascale), f32_bits(abias));  // Z, W
+    return n;
+}
+
+// The arithmetic combiner over the colour channels only (x/y/z).
+static uint32_t emit_color_arith(const TevConfig *cfg, uint32_t s,
+                                 const TevPsAlloc *a, R700Inst64 *buf)
+{
+    const TevCombiner *cc = &cfg->stage[s].color;
+    uint32_t n = 0;
+    for (uint32_t ch = 0; ch < 3; ++ch) {  // PV = b - a
+        AluSrc av = resolve_cc_full(cfg, a, s, cc->a, ch);
+        AluSrc bv = resolve_cc_full(cfg, a, s, cc->b, ch);
+        buf[n++] = r700_alu_op2(R700_OP2_ADD, TEV_PS_PV_GPR, ch,
+                                bv.sel, bv.chan, false, av.sel, av.chan, true,
+                                false, true, ch == 2);
+    }
+    for (uint32_t ch = 0; ch < 3; ++ch) {  // PV = c * (b - a) + a
+        AluSrc cv = resolve_cc_full(cfg, a, s, cc->c, ch);
+        AluSrc av = resolve_cc_full(cfg, a, s, cc->a, ch);
+        buf[n++] = r700_alu_op3(R700_OP3_MULADD, TEV_PS_PV_GPR, ch,
+                                cv.sel, cv.chan, false,
+                                R700_ALU_SRC_PV, ch, false,
+                                av.sel, av.chan, false, false, ch == 2);
+    }
+    for (uint32_t ch = 0; ch < 3; ++ch) {  // PV = d (op) lerp
+        AluSrc dv = resolve_cc_full(cfg, a, s, cc->d, ch);
+        buf[n++] = r700_alu_op2(R700_OP2_ADD, TEV_PS_PV_GPR, ch,
+                                dv.sel, dv.chan, false,
+                                R700_ALU_SRC_PV, ch, cc->op == GX_TEV_SUB,
+                                false, true, ch == 2);
+    }
+    float sc = scale_value(cc->scale);
+    float bi = bias_value(cc->bias) * sc;
+    uint32_t dst = a->reg[cc->dest];
+    for (uint32_t ch = 0; ch < 3; ++ch)  // dest = clamp(scale*PV + bias*scale)
+        buf[n++] = r700_alu_op3(R700_OP3_MULADD, dst, ch,
+                                R700_ALU_SRC_LITERAL, R700_CHAN_X, false,
+                                R700_ALU_SRC_PV, ch, false,
+                                R700_ALU_SRC_LITERAL, R700_CHAN_Y, false,
+                                cc->clamp, ch == 2);
+    buf[n++] = r700_alu_literal(f32_bits(sc), f32_bits(bi));
+    return n;
+}
+
+// The arithmetic combiner over the alpha channel only.
+static uint32_t emit_alpha_arith(const TevConfig *cfg, uint32_t s,
+                                 const TevPsAlloc *a, R700Inst64 *buf)
+{
+    const TevCombiner *ca = &cfg->stage[s].alpha;
+    uint32_t n = 0;
+    AluSrc av = resolve_ca(cfg, a, s, ca->a);
+    AluSrc bv = resolve_ca(cfg, a, s, ca->b);
+    buf[n++] = r700_alu_op2(R700_OP2_ADD, TEV_PS_PV_GPR, R700_CHAN_W,  // PV.w = b - a
+                            bv.sel, bv.chan, false, av.sel, av.chan, true,
+                            false, true, true);
+    AluSrc cv = resolve_ca(cfg, a, s, ca->c);
+    av = resolve_ca(cfg, a, s, ca->a);
+    buf[n++] = r700_alu_op3(R700_OP3_MULADD, TEV_PS_PV_GPR, R700_CHAN_W,  // c*(b-a)+a
+                            cv.sel, cv.chan, false,
+                            R700_ALU_SRC_PV, R700_CHAN_W, false,
+                            av.sel, av.chan, false, false, true);
+    AluSrc dv = resolve_ca(cfg, a, s, ca->d);
+    buf[n++] = r700_alu_op2(R700_OP2_ADD, TEV_PS_PV_GPR, R700_CHAN_W,  // d (op) lerp
+                            dv.sel, dv.chan, false,
+                            R700_ALU_SRC_PV, R700_CHAN_W, ca->op == GX_TEV_SUB,
+                            false, true, true);
+    float sc = scale_value(ca->scale);
+    float bi = bias_value(ca->bias) * sc;
+    buf[n++] = r700_alu_op3(R700_OP3_MULADD, a->reg[ca->dest], R700_CHAN_W,
+                            R700_ALU_SRC_LITERAL, R700_CHAN_X, false,
+                            R700_ALU_SRC_PV, R700_CHAN_W, false,
+                            R700_ALU_SRC_LITERAL, R700_CHAN_Y, false,
+                            ca->clamp, true);
+    buf[n++] = r700_alu_literal(f32_bits(sc), f32_bits(bi));
+    return n;
+}
+
+// Emit the comparison difference `a - b` that a CND select tests against zero.
+// GX comparison combiner works on 8-bit integers, but here is approximated in
+// the normalized float domain.
+static uint32_t emit_diff(R700Inst64 *buf, const AluSrc ta[3], const AluSrc tb[3],
+                          AluSrc ta_a, AluSrc tb_a, uint8_t mode, bool alpha_a8,
+                          bool *per_channel)
+{
+    uint32_t n = 0;
+    *per_channel = false;
+
+    if (alpha_a8) {  // A8
+        buf[n++] = r700_alu_op2(R700_OP2_ADD, TEV_PS_PV_GPR, R700_CHAN_X,
+                                ta_a.sel, ta_a.chan, false,
+                                tb_a.sel, tb_a.chan, true, false, true, true);
+        return n;
+    }
+    if (mode == 0) {  // R8
+        buf[n++] = r700_alu_op2(R700_OP2_ADD, TEV_PS_PV_GPR, R700_CHAN_X,
+                                ta[0].sel, ta[0].chan, false,
+                                tb[0].sel, tb[0].chan, true, false, true, true);
+        return n;
+    }
+    if (mode == 3) {  // RGB8
+        for (uint32_t ch = 0; ch < 3; ++ch)
+            buf[n++] = r700_alu_op2(R700_OP2_ADD, TEV_PS_PV_GPR, ch,
+                                    ta[ch].sel, ta[ch].chan, false,
+                                    tb[ch].sel, tb[ch].chan, true,
+                                    false, true, ch == 2);
+        *per_channel = true;
+        return n;
+    }
+    // GR16 / BGR24
+    buf[n++] = r700_alu_op3(R700_OP3_MULADD, TEV_PS_PV_GPR, R700_CHAN_X,
+                            ta[1].sel, ta[1].chan, false,
+                            R700_ALU_SRC_LITERAL, R700_CHAN_X, false,
+                            ta[0].sel, ta[0].chan, false, false, false);
+    buf[n++] = r700_alu_op3(R700_OP3_MULADD, TEV_PS_PV_GPR, R700_CHAN_Y,
+                            tb[1].sel, tb[1].chan, false,
+                            R700_ALU_SRC_LITERAL, R700_CHAN_X, false,
+                            tb[0].sel, tb[0].chan, false, false, true);
+    buf[n++] = r700_alu_literal(f32_bits(256.0f), f32_bits(256.0f));
+    if (mode == 2) {  // BGR24
+        buf[n++] = r700_alu_op3(R700_OP3_MULADD, TEV_PS_PV_GPR, R700_CHAN_X,
+                                ta[2].sel, ta[2].chan, false,
+                                R700_ALU_SRC_LITERAL, R700_CHAN_X, false,
+                                R700_ALU_SRC_PV, R700_CHAN_X, false, false, false);
+        buf[n++] = r700_alu_op3(R700_OP3_MULADD, TEV_PS_PV_GPR, R700_CHAN_Y,
+                                tb[2].sel, tb[2].chan, false,
+                                R700_ALU_SRC_LITERAL, R700_CHAN_X, false,
+                                R700_ALU_SRC_PV, R700_CHAN_Y, false, false, true);
+        buf[n++] = r700_alu_literal(f32_bits(65536.0f), f32_bits(65536.0f));
+    }
+    // PV.x = dot(a) - dot(b)
+    buf[n++] = r700_alu_op2(R700_OP2_ADD, TEV_PS_PV_GPR, R700_CHAN_X,
+                            R700_ALU_SRC_PV, R700_CHAN_X, false,
+                            R700_ALU_SRC_PV, R700_CHAN_Y, true, false, true, true);
+    return n;
+}
+
+// GX comparison combiner
+static uint32_t emit_color_compare(const TevConfig *cfg, uint32_t s,
+                                   const TevPsAlloc *a, R700Inst64 *buf)
+{
+    const TevCombiner *cc = &cfg->stage[s].color;
+    uint32_t cnd = (cc->op == GX_TEV_SUB) ? R700_OP3_CNDE : R700_OP3_CNDGT;
+    AluSrc ta[3], tb[3];
+    for (uint32_t ch = 0; ch < 3; ++ch) {
+        ta[ch] = resolve_cc_full(cfg, a, s, cc->a, ch);
+        tb[ch] = resolve_cc_full(cfg, a, s, cc->b, ch);
+    }
+    AluSrc unused = {R700_ALU_SRC_0, 0};
+    bool per_channel;
+    uint32_t n = emit_diff(buf, ta, tb, unused, unused, cc->scale, false,
+                           &per_channel);
+    for (uint32_t ch = 0; ch < 3; ++ch) {  // sel.ch = compare ? c.ch : 0
+        AluSrc cv = resolve_cc_full(cfg, a, s, cc->c, ch);
+        uint32_t dchan = per_channel ? ch : R700_CHAN_X;
+        buf[n++] = r700_alu_op3(cnd, TEV_PS_PV_GPR, ch,
+                                R700_ALU_SRC_PV, dchan, false,
+                                cv.sel, cv.chan, false,
+                                R700_ALU_SRC_0, 0, false, false, ch == 2);
+    }
+    uint32_t dst = a->reg[cc->dest];
+    for (uint32_t ch = 0; ch < 3; ++ch) {  // dest.ch = d.ch + sel.ch
+        AluSrc dv = resolve_cc_full(cfg, a, s, cc->d, ch);
+        buf[n++] = r700_alu_op2(R700_OP2_ADD, dst, ch,
+                                R700_ALU_SRC_PV, ch, false,
+                                dv.sel, dv.chan, false, cc->clamp, true, ch == 2);
+    }
+    return n;
+}
+
+// GX comparison combiner for alpha
+static uint32_t emit_alpha_compare(const TevConfig *cfg, uint32_t s,
+                                   const TevPsAlloc *a, R700Inst64 *buf)
+{
+    const TevCombiner *cc = &cfg->stage[s].color;
+    const TevCombiner *ca = &cfg->stage[s].alpha;
+    uint32_t cnd = (ca->op == GX_TEV_SUB) ? R700_OP3_CNDE : R700_OP3_CNDGT;
+    bool a8 = ca->scale == 3;
+    AluSrc ta[3], tb[3];
+    for (uint32_t ch = 0; ch < 3; ++ch) {
+        ta[ch] = resolve_cc_full(cfg, a, s, cc->a, ch);
+        tb[ch] = resolve_cc_full(cfg, a, s, cc->b, ch);
+    }
+    AluSrc ta_a = resolve_ca(cfg, a, s, ca->a);
+    AluSrc tb_a = resolve_ca(cfg, a, s, ca->b);
+    bool per_channel;
+    uint32_t n = emit_diff(buf, ta, tb, ta_a, tb_a, ca->scale, a8, &per_channel);
+
+    AluSrc cv = resolve_ca(cfg, a, s, ca->c);  // sel.w = compare ? c.a : 0
+    buf[n++] = r700_alu_op3(cnd, TEV_PS_PV_GPR, R700_CHAN_W,
+                            R700_ALU_SRC_PV, R700_CHAN_X, false,
+                            cv.sel, cv.chan, false,
+                            R700_ALU_SRC_0, 0, false, false, true);
+    AluSrc dv = resolve_ca(cfg, a, s, ca->d);  // dest.w = d.a + sel.w
+    buf[n++] = r700_alu_op2(R700_OP2_ADD, a->reg[ca->dest], R700_CHAN_W,
+                            R700_ALU_SRC_PV, R700_CHAN_W, false,
+                            dv.sel, dv.chan, false, ca->clamp, true, true);
+    return n;
+}
+
+// Emit one stage's combiner into the ALU body buffer.
+static uint32_t emit_stage(const TevConfig *cfg, uint32_t s, const TevPsAlloc *a,
+                           R700Inst64 *buf)
+{
+    const TevStage *st = &cfg->stage[s];
+    uint32_t n = 0;
+
+    if (stage_uses_konst(st)) n += emit_konst_group(st, a, buf + n);
+
+    bool ccmp = st->color.bias == GX_TB_COMPARE;
+    bool acmp = st->alpha.bias == GX_TB_COMPARE;
+
+    if (!ccmp && !acmp) {
+        n += emit_stage_arith(cfg, s, a, buf + n);
+    } else {
+        n += ccmp ? emit_color_compare(cfg, s, a, buf + n)
+                  : emit_color_arith(cfg, s, a, buf + n);
+        n += acmp ? emit_alpha_compare(cfg, s, a, buf + n)
+                  : emit_alpha_arith(cfg, s, a, buf + n);
+    }
     return n;
 }
 
@@ -454,6 +669,28 @@ bool tev_shader_gen_selftest(void)
     if (exp_gpr != 3) return false;               // PREV at R3
     if (shape.num_gprs != 9) return false;        // 3 interpolants + 4 regs + 2 scratch
     if (!gx2_ps_regs(&pr, &shape)) return false;
+
+    gx_tev_reset(&cfg);
+    cfg.num_stages = 1;
+    TevStage *sc = &cfg.stage[0];
+    sc->color = (TevCombiner){.a = GX_CC_TEXC, .b = GX_CC_CPREV, .c = GX_CC_C0,
+                              .d = GX_CC_CPREV, .bias = GX_TB_COMPARE,
+                              .op = GX_TEV_ADD /*GT*/, .clamp = true,
+                              .scale = 1 /*GR16*/, .dest = GX_TEVOUT_PREV};
+    sc->alpha = (TevCombiner){.a = GX_CA_TEXA, .b = GX_CA_APREV, .c = GX_CA_A0,
+                              .d = GX_CA_APREV, .bias = GX_TB_COMPARE,
+                              .op = GX_TEV_SUB /*EQ*/, .clamp = true,
+                              .scale = 3 /*A8*/, .dest = GX_TEVOUT_PREV};
+    sc->tex_enable = true;
+    sc->texmap = 0;
+    sc->texcoord = 0;
+    sc->colorchan = GX_RAS_COLOR0;
+
+    n = tev_shader_gen_ps(ps, sizeof(ps), &cfg);
+    if (n == 0) return false;
+    if (!walk_cf(ps, n, &tex_c, &alu_c, &exp_gpr)) return false;
+    if (tex_c != 1 || alu_c != 2) return false;   // reg-init + one compare stage
+    if (exp_gpr != 2) return false;               // PREV at R2
 
     return true;
 }
