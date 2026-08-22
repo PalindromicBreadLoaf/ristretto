@@ -40,8 +40,10 @@
 #include "gpu/shader_gen.h"
 #include "gpu/tev_shader_gen.h"
 #include "gpu/tev_modulate_shader.h"
+#include "gpu/xfb_present.h"
 #include "ios/ios_ipc.h"
 #include "mem/wii_memory.h"
+#include "mem/wii_mmio.h"
 #include "mem/wii_vi.h"
 
 // PoC for a fixed-function pipeline via GX2.
@@ -74,6 +76,21 @@ static const float sIdentity[16] = {
     0.0f, 1.0f, 0.0f, 0.0f,
     0.0f, 0.0f, 1.0f, 0.0f,
     0.0f, 0.0f, 0.0f, 1.0f,
+};
+
+// A screen-filling quad with white vertex colours.
+static const float sFullscreenPos[] = {
+    -1.0f, -1.0f,
+     1.0f, -1.0f,
+    -1.0f,  1.0f,
+     1.0f,  1.0f,
+};
+
+static const float sWhite[] = {
+    1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f,
 };
 
 static void fillCheckerboard(GX2Texture *texture) {
@@ -255,10 +272,14 @@ static bool selfTestBoot(void) {
     return ok;
 }
 
-// Load proper Wii DOL from SD Card.
+// A boot.dol read from SD and kept until we run it.
+static uint8_t *g_dol_buf = NULL;
+static long     g_dol_len = 0;
+
+// Read boot.dol off SD into g_dol_buf.
 static void tryLoadDolFromSd(void) {
     if (!WHBMountSdCard()) {
-        WHBLogPrint("boot: SD mount failed. Skipping real DOL smoke test");
+        WHBLogPrint("boot: SD mount failed. Skipping DOL boot");
         return;
     }
 
@@ -268,7 +289,7 @@ static void tryLoadDolFromSd(void) {
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        WHBLogPrintf("boot: no %s (optional). Skipping real DOL smoke test", path);
+        WHBLogPrintf("boot: no %s (optional). No DOL to boot", path);
         WHBUnmountSdCard();
         return;
     }
@@ -285,18 +306,107 @@ static void tryLoadDolFromSd(void) {
 
     uint8_t *buf = malloc((size_t)len);
     if (buf && fread(buf, 1, (size_t)len, f) == (size_t)len) {
-        DolLoadResult r;
-        WHBLogPrintf("boot: loading real DOL from SD (%ld bytes)", len);
-        if (boot_dol_from_buffer(buf, (uint32_t)len, NULL, &r))
-            WHBLogPrint("boot: real DOL loaded OK");
-        else
-            WHBLogPrint("boot: real DOL failed to load");
+        g_dol_buf = buf;
+        g_dol_len = len;
+        WHBLogPrintf("boot: found boot.dol on SD (%ld bytes)", len);
     } else {
         WHBLogPrint("boot: failed to read boot.dol");
+        free(buf);
     }
-    free(buf);
     fclose(f);
     WHBUnmountSdCard();
+}
+
+// Guest XFB to present.
+static uint32_t g_guest_xfb = 0;
+
+// Wii NTSC/PAL 640x480 is the common XFB geometry.
+#define XFB_WIDTH  640u
+#define XFB_HEIGHT 480u
+#define GUEST_MAX_BLOCKS 200000u
+
+// Parse the retained boot.dol into guest RAM and run it through the translator to
+// a block budget, then read whatever XFB the guest pointed the VI at.
+static void loadAndRunGuestDol(void) {
+    if (!g_dol_buf)
+        return;
+
+    DolLoadResult r;
+    if (!boot_dol_from_buffer(g_dol_buf, (uint32_t)g_dol_len, NULL, &r)) {
+        WHBLogPrint("boot: real DOL failed to load into guest memory");
+        return;
+    }
+    WHBLogPrintf("boot: real DOL loaded OK entry=0x%08X image=0x%08X..0x%08X (%s)",
+                 r.entry_point, r.image_lo, r.image_hi, r.is_wii ? "Wii" : "GC");
+
+    if (!wii_mem_fastmem_window()) {
+        WHBLogPrint("guest: fastmem window unavailable, cannot run DOL");
+        return;
+    }
+
+    // Fresh VI / IPC / write-gather state for the guest run.
+    wii_mmio_reset();
+
+    PpcContext ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.pc     = r.entry_point;
+    ctx.gpr[1] = 0x817E8000u;   // provisional stack near the MEM1 arena top
+    ctx.lr     = 0;
+
+    PpcXlateSession s;
+    PpcXlateResult xr = ppc_xlate_run(&ctx, r.entry_point, 1u, GUEST_MAX_BLOCKS, &s);
+    WHBLogPrintf("guest: entry=0x%08X xlate=%d stop=%d blocks=%u hits=%u misses=%u",
+                 r.entry_point, (int)xr, (int)s.stop,
+                 s.blocks_run, s.cache_hits, s.cache_misses);
+    if (s.stop == PPC_XSTOP_FAULT)
+        WHBLogPrintf("guest: faulted @0x%08X class=%u (translator/HLE coverage gap)",
+                     s.last_pc, s.last_class);
+
+    uint32_t xfb = wii_vi_current_xfb();
+    if (xfb) {
+        g_guest_xfb = xfb;
+        WHBLogPrintf("guest: VI scan-out XFB @0x%08X (physical MEM1)", xfb);
+    } else {
+        WHBLogPrint("guest: VI configured no XFB; showing test shader instead");
+    }
+}
+
+// A linear RGBA8 texture to receive the converted XFB.
+static bool createXfbTexture(GX2Texture *texture) {
+    memset(texture, 0, sizeof(*texture));
+    texture->surface.dim       = GX2_SURFACE_DIM_TEXTURE_2D;
+    texture->surface.width     = XFB_WIDTH;
+    texture->surface.height    = XFB_HEIGHT;
+    texture->surface.depth     = 1;
+    texture->surface.mipLevels = 1;
+    texture->surface.format    = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+    texture->surface.aa        = GX2_AA_MODE1X;
+    texture->surface.use       = GX2_SURFACE_USE_TEXTURE;
+    texture->surface.tileMode  = GX2_TILE_MODE_LINEAR_ALIGNED;
+    texture->surface.swizzle   = 0;
+    texture->viewNumMips       = 1;
+    texture->viewNumSlices     = 1;
+    texture->compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+
+    GX2CalcSurfaceSizeAndAlignment(&texture->surface);
+    GX2InitTextureRegs(texture);
+
+    texture->surface.image = memalign(texture->surface.alignment, texture->surface.imageSize);
+    return texture->surface.image != NULL;
+}
+
+// Expand the guest XFB into the texture.
+static bool updateXfbTexture(GX2Texture *texture, uint32_t xfb_ea) {
+    const uint8_t *src = wii_mem_range(xfb_ea, XFB_WIDTH * XFB_HEIGHT * 2u);
+    if (!src) {
+        WHBLogPrintf("guest: XFB @0x%08X outside guest memory", xfb_ea);
+        return false;
+    }
+    xfb_yuv422_to_rgba(src, XFB_WIDTH, XFB_HEIGHT, XFB_WIDTH * 2u,
+                       (uint8_t *)texture->surface.image, texture->surface.pitch * 4u);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE,
+                  texture->surface.image, texture->surface.imageSize);
+    return true;
 }
 
 // A disc image kept mounted for the app's lifetime.
@@ -404,14 +514,21 @@ int main(int argc, char **argv) {
     WHBLogPrintf("gx2_shader selftest: %s", gx2_shader_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("shader_gen selftest: %s", shader_gen_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("tev_shader_gen selftest: %s", tev_shader_gen_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("xfb_present selftest: %s", xfb_present_selftest() ? "PASS" : "FAIL");
+
+    loadAndRunGuestDol();
 
     int result = 0;
     WHBGfxShaderGroup group = {0};
     GX2RBuffer positionBuffer = {0};
     GX2RBuffer colourBuffer   = {0};
     GX2RBuffer texCoordBuffer = {0};
+    GX2RBuffer fsPosBuffer    = {0};
+    GX2RBuffer whiteBuffer    = {0};
     GX2Texture texture = {0};
+    GX2Texture xfbTexture = {0};
     GX2Sampler sampler;
+    GX2Sampler linearSampler;
 
     if (!WHBGfxLoadGFDShaderGroup(&group, 0, g_tevModulateShaderGsh)) {
         WHBLogPrint("Failed to load TEV shader group");
@@ -487,19 +604,40 @@ int main(int argc, char **argv) {
     GX2PixelShader  *ps = useGenerated ? &bound.ps : group.pixelShader;
     uint32_t samplerLoc = ps->samplerVars[0].location;
 
+    // Present XFB instead of the test shader.
+    bool presentGuest = false;
+    if (g_guest_xfb &&
+        makeAttributeBuffer(&fsPosBuffer, sFullscreenPos, 2 * sizeof(float), 4) &&
+        makeAttributeBuffer(&whiteBuffer, sWhite,         4 * sizeof(float), 4) &&
+        createXfbTexture(&xfbTexture)) {
+        GX2InitSampler(&linearSampler, GX2_TEX_CLAMP_MODE_CLAMP,
+                       GX2_TEX_XY_FILTER_MODE_LINEAR);
+        presentGuest = updateXfbTexture(&xfbTexture, g_guest_xfb);
+        WHBLogPrintf("present: %s", presentGuest ? "showing guest XFB"
+                                                 : "XFB unmapped");
+    }
+
     while (WHBProcIsRunning()) {
         WHBGfxBeginRender();
 
         WHBGfxBeginRenderTV();
         WHBGfxClearColor(0.1f, 0.1f, 0.12f, 1.0f);
-        drawQuadPass(fs, vs, ps, samplerLoc, &texture, &sampler,
-                     &positionBuffer, &colourBuffer, &texCoordBuffer, tevUniforms);
+        if (presentGuest)
+            drawQuadPass(fs, vs, ps, samplerLoc, &xfbTexture, &linearSampler,
+                         &fsPosBuffer, &whiteBuffer, &texCoordBuffer, tevUniforms);
+        else
+            drawQuadPass(fs, vs, ps, samplerLoc, &texture, &sampler,
+                         &positionBuffer, &colourBuffer, &texCoordBuffer, tevUniforms);
         WHBGfxFinishRenderTV();
 
         WHBGfxBeginRenderDRC();
         WHBGfxClearColor(0.1f, 0.1f, 0.12f, 1.0f);
-        drawQuadPass(fs, vs, ps, samplerLoc, &texture, &sampler,
-                     &positionBuffer, &colourBuffer, &texCoordBuffer, tevUniforms);
+        if (presentGuest)
+            drawQuadPass(fs, vs, ps, samplerLoc, &xfbTexture, &linearSampler,
+                         &fsPosBuffer, &whiteBuffer, &texCoordBuffer, tevUniforms);
+        else
+            drawQuadPass(fs, vs, ps, samplerLoc, &texture, &sampler,
+                         &positionBuffer, &colourBuffer, &texCoordBuffer, tevUniforms);
         WHBGfxFinishRenderDRC();
 
         WHBGfxFinishRender();
@@ -512,10 +650,16 @@ exit:
     if (texture.surface.image) {
         free(texture.surface.image);
     }
+    if (xfbTexture.surface.image) {
+        free(xfbTexture.surface.image);
+    }
     GX2RDestroyBufferEx(&positionBuffer, 0);
     GX2RDestroyBufferEx(&colourBuffer, 0);
     GX2RDestroyBufferEx(&texCoordBuffer, 0);
+    GX2RDestroyBufferEx(&fsPosBuffer, 0);
+    GX2RDestroyBufferEx(&whiteBuffer, 0);
     WHBGfxFreeShaderGroup(&group);
+    free(g_dol_buf);
 
     if (g_disc_mounted) {
         ios_ipc_mount_disc(NULL);

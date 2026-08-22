@@ -30,6 +30,7 @@ add_executable(ristretto
     src/gpu/r700_emit.c
     src/gpu/shader_gen.c
     src/gpu/tev_shader_gen.c
+    src/gpu/xfb_present.c
     src/ios/ios_ipc.c
     src/mem/wii_memory.c
     src/mem/wii_mmio.c
