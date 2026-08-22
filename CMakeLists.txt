@@ -5,6 +5,9 @@ cmake_minimum_required(VERSION 3.13)
 
 project(ristretto C CXX)
 
+option(RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO
+       "Submit the experimental live GX draw pipeline instead of the proven quad path" OFF)
+
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
     message(FATAL_ERROR
         "Please configure with the devkitPro Wii U wrapper:\n"
@@ -23,10 +26,12 @@ add_executable(ristretto
     src/disc/disc.c
     src/gpu/gx2_bind.c
     src/gpu/gx2_shader.c
+    src/gpu/gx_draw.c
     src/gpu/gx_fifo.c
     src/gpu/gx_state.c
     src/gpu/gx_tev.c
     src/gpu/gx_texture.c
+    src/gpu/gx_vertex.c
     src/gpu/gx_xf.c
     src/gpu/r700_emit.c
     src/gpu/shader_gen.c
@@ -39,6 +44,10 @@ add_executable(ristretto
 )
 
 target_include_directories(ristretto PRIVATE src)
+
+if(RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO)
+    target_compile_definitions(ristretto PRIVATE RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO=1)
+endif()
 
 target_link_libraries(ristretto PRIVATE wut)
 

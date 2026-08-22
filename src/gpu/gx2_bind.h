@@ -54,6 +54,10 @@ bool gx2_bind_build_modulate(Gx2BoundShader *out,
 bool gx2_bind_build_tev(Gx2BoundShader *out, const TevConfig *cfg,
                         const GX2AttribStream *attribs, uint32_t attrib_count);
 
+bool gx2_bind_build_tev_ex(Gx2BoundShader *out, const TevConfig *cfg,
+                           bool transform_position,
+                           const GX2AttribStream *attribs, uint32_t attrib_count);
+
 // Upload the TEV colour/konst registers as the pixel-shader uniform cfile.
 void gx2_bind_set_tev_uniforms(const TevConfig *cfg);
 

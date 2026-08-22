@@ -32,10 +32,12 @@
 #include "disc/disc.h"
 #include "gpu/gx2_bind.h"
 #include "gpu/gx2_shader.h"
+#include "gpu/gx_draw.h"
 #include "gpu/gx_fifo.h"
 #include "gpu/gx_state.h"
 #include "gpu/gx_tev.h"
 #include "gpu/gx_texture.h"
+#include "gpu/gx_vertex.h"
 #include "gpu/gx_xf.h"
 #include "gpu/r700_emit.h"
 #include "gpu/shader_gen.h"
@@ -50,6 +52,10 @@
 // PoC for a fixed-function pipeline via GX2.
 
 #define TEX_SIZE 64
+
+#ifndef RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO
+#define RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO 0
+#endif
 
 static const float sPositions[] = {
     -0.8f, -0.8f,
@@ -464,6 +470,82 @@ static void tryMountDiscFromSd(void) {
                  (unsigned long long)part, id);
 }
 
+typedef struct {
+    GX2Texture *tex;
+    GX2Sampler *smp;
+} DemoTexCtx;
+
+static GX2Texture *demoGetTexture(void *u, uint8_t map) {
+    (void)map;
+    return ((DemoTexCtx *)u)->tex;
+}
+static GX2Sampler *demoGetSampler(void *u, uint8_t map) {
+    (void)map;
+    return ((DemoTexCtx *)u)->smp;
+}
+static const uint8_t *demoReadGuest(void *u, uint32_t ea, uint32_t len) {
+    (void)u;
+    return wii_mem_range(ea, len);
+}
+
+static void demoPushCp(uint8_t *f, size_t *n, uint8_t sub, uint32_t val) {
+    f[(*n)++] = GX_OPCODE_LOAD_CP_REG;
+    f[(*n)++] = sub;
+    putBe32(&f[*n], val);
+    *n += 4;
+}
+static void demoPutF(uint8_t *f, size_t *n, float v) {
+    uint32_t u;
+    memcpy(&u, &v, sizeof u);
+    putBe32(&f[*n], u);
+    *n += 4;
+}
+static void demoPushBp(uint8_t *f, size_t *n, uint8_t reg, uint32_t val24) {
+    f[(*n)++] = GX_OPCODE_LOAD_BP_REG;
+    f[(*n)++] = reg;
+    f[(*n)++] = (uint8_t)(val24 >> 16);
+    f[(*n)++] = (uint8_t)(val24 >> 8);
+    f[(*n)++] = (uint8_t)val24;
+}
+
+static size_t buildDemoFifo(uint8_t *f) {
+    size_t n = 0;
+    demoPushCp(f, &n, GX_CP_VCD_LO, (1u << 9) | (1u << 13));
+    demoPushCp(f, &n, GX_CP_VCD_HI, 0x00000001);
+    demoPushCp(f, &n, GX_CP_VAT_A, 0x01216009);
+
+    f[n++] = GX_OPCODE_LOAD_XF_REG;
+    putBe32(&f[n], ((7u - 1u) << 16) | XF_SETPROJECTION);
+    n += 4;
+    static const float proj[6] = {1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < 6; ++i) demoPutF(f, &n, proj[i]);
+    putBe32(&f[n], GX_XF_ORTHOGRAPHIC);
+    n += 4;
+
+    demoPushBp(f, &n, GX_BP_BLENDMODE, (1u << 3) | (1u << 4));
+
+    static const float pos[4][3] = {
+        {-0.8f, -0.8f, 0.0f}, {0.8f, -0.8f, 0.0f},
+        {-0.8f, 0.8f, 0.0f},  {0.8f, 0.8f, 0.0f}};
+    static const uint8_t col[4][4] = {
+        {0xFF, 0x33, 0x33, 0xFF}, {0x33, 0xFF, 0x33, 0xFF},
+        {0x33, 0x33, 0xFF, 0xFF}, {0xFF, 0xFF, 0xFF, 0xFF}};
+    static const float uv[4][2] = {
+        {0.0f, 1.0f}, {1.0f, 1.0f}, {0.0f, 0.0f}, {1.0f, 0.0f}};
+    f[n++] = 0x98;  // GX_PRIM_TRIANGLE_STRIP, VAT 0
+    f[n++] = 0x00;
+    f[n++] = 4;
+    for (int v = 0; v < 4; ++v) {
+        demoPutF(f, &n, pos[v][0]);
+        demoPutF(f, &n, pos[v][1]);
+        demoPutF(f, &n, pos[v][2]);
+        f[n++] = col[v][0]; f[n++] = col[v][1]; f[n++] = col[v][2]; f[n++] = col[v][3];
+        demoPutF(f, &n, uv[v][0]);
+        demoPutF(f, &n, uv[v][1]);
+    }
+    return n;
+}
+
 int main(int argc, char **argv) {
     WHBProcInit();
     WHBLogUdpInit();
@@ -476,12 +558,12 @@ int main(int argc, char **argv) {
         WHBProcShutdown();
         return -1;
     }
+
     wii_mem_setup_lowmem();
     wii_mem_log_layout();
     WHBLogPrintf("wii_mem selftest: %s", selfTestWiiMemory() ? "PASS" : "FAIL");
     WHBLogPrintf("boot selftest: %s", selfTestBoot() ? "PASS" : "FAIL");
     tryLoadDolFromSd();
-
     switch (cpu_exec_selftest()) {
         case CPU_EXEC_PASS:        WHBLogPrint("cpu_exec selftest: PASS"); break;
         case CPU_EXEC_UNAVAILABLE: WHBLogPrint("cpu_exec selftest: UNAVAILABLE"); break;
@@ -489,7 +571,6 @@ int main(int argc, char **argv) {
     }
     cpu_ps_probe_all();
     cpu_privilege_probe_all();
-
     WHBLogPrintf("cpu_xlate selftest: decoder %s", ppc_decode_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("cpu_xlate selftest: interp %s", ppc_interp_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("cpu_xlate selftest: identity-block %s", ppc_xlate_identity_selftest() ? "PASS" : "FAIL");
@@ -497,27 +578,25 @@ int main(int argc, char **argv) {
     WHBLogPrintf("cpu_xlate selftest: branches %s", ppc_xlate_branch_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("cpu_xlate selftest: mmio %s", ppc_xlate_mmio_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("cpu_xlate selftest: entry %s", ppc_xlate_entry_selftest() ? "PASS" : "FAIL");
-
     switch (ios_ipc_selftest()) {
         case IOS_IPC_SELFTEST_PASS: WHBLogPrint("ios_ipc selftest: PASS"); break;
         case IOS_IPC_SELFTEST_FAIL: WHBLogPrint("ios_ipc selftest: FAIL"); break;
     }
-
     WHBLogPrintf("disc selftest: %s", disc_selftest() ? "PASS" : "FAIL");
     tryMountDiscFromSd();
-
     WHBLogPrintf("wii_vi selftest: %s", wii_vi_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_fifo selftest: %s", gx_fifo_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_state selftest: %s", gx_state_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_tev selftest: %s", gx_tev_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_texture selftest: %s", gx_texture_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_xf selftest: %s", gx_xf_selftest() ? "PASS" : "FAIL");
+    (void)gx_vertex_selftest();
+    (void)gx_draw_selftest();
     WHBLogPrintf("r700_emit selftest: %s", r700_emit_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx2_shader selftest: %s", gx2_shader_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("shader_gen selftest: %s", shader_gen_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("tev_shader_gen selftest: %s", tev_shader_gen_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("xfb_present selftest: %s", xfb_present_selftest() ? "PASS" : "FAIL");
-
     loadAndRunGuestDol();
 
     int result = 0;
@@ -606,6 +685,24 @@ int main(int argc, char **argv) {
     GX2PixelShader  *ps = useGenerated ? &bound.ps : group.pixelShader;
     uint32_t samplerLoc = ps->samplerVars[0].location;
 
+#if RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO
+    static GXDrawPipeline pipeline;
+    DemoTexCtx demoCtx = {&texture, &sampler};
+    GXDrawCallbacks dcb = {.get_texture = demoGetTexture, .get_sampler = demoGetSampler,
+                           .read_guest = demoReadGuest, .user = &demoCtx};
+    uint8_t demoFifo[256];
+
+    bool useDrawPipeline = gx_draw_init(&pipeline, &dcb);
+    if (useDrawPipeline) {
+        gx_draw_reset_state(&pipeline);
+        pipeline.tev = modulateTev;  // configure the TEV modulate stage directly
+        size_t demoFifoLen = buildDemoFifo(demoFifo);
+
+        uint32_t recorded = gx_draw_execute(&pipeline, demoFifo, demoFifoLen);
+        useDrawPipeline = recorded > 0;
+    }
+#endif
+
     // Present XFB instead of the test shader.
     bool presentGuest = false;
     if (g_guest_xfb &&
@@ -627,6 +724,11 @@ int main(int argc, char **argv) {
         if (presentGuest)
             drawQuadPass(fs, vs, ps, samplerLoc, &xfbTexture, &linearSampler,
                          &fsPosBuffer, &whiteBuffer, &texCoordBuffer, tevUniforms);
+#if RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO
+        else if (useDrawPipeline) {
+            gx_draw_replay(&pipeline);
+        }
+#endif
         else
             drawQuadPass(fs, vs, ps, samplerLoc, &texture, &sampler,
                          &positionBuffer, &colourBuffer, &texCoordBuffer, tevUniforms);
@@ -637,6 +739,11 @@ int main(int argc, char **argv) {
         if (presentGuest)
             drawQuadPass(fs, vs, ps, samplerLoc, &xfbTexture, &linearSampler,
                          &fsPosBuffer, &whiteBuffer, &texCoordBuffer, tevUniforms);
+#if RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO
+        else if (useDrawPipeline) {
+            gx_draw_replay(&pipeline);
+        }
+#endif
         else
             drawQuadPass(fs, vs, ps, samplerLoc, &texture, &sampler,
                          &positionBuffer, &colourBuffer, &texCoordBuffer, tevUniforms);
@@ -645,6 +752,9 @@ int main(int argc, char **argv) {
         WHBGfxFinishRender();
     }
 
+#if RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO
+    if (useDrawPipeline) gx_draw_shutdown(&pipeline);
+#endif
     gx2_bind_free(&bound);
 
 exit:
