@@ -8,8 +8,10 @@
 
 #include <gx2/enum.h>
 #include <gx2/mem.h>
+#include <gx2/shaders.h>
 
 #include "gpu/shader_gen.h"
+#include "gpu/tev_shader_gen.h"
 
 _Static_assert(sizeof(Gx2VsRegs) == sizeof(((GX2VertexShader *)0)->regs),
                "Gx2VsRegs must mirror GX2VertexShader::regs");
@@ -25,13 +27,35 @@ static void *alloc_program(const uint8_t *prog, size_t size) {
     return buf;
 }
 
+// Persistent sampler-var names.
+static const char *const kSamplerNames[GX2_BIND_MAX_SAMPLERS] = {
+    "s_tex0", "s_tex1", "s_tex2", "s_tex3",
+    "s_tex4", "s_tex5", "s_tex6", "s_tex7",
+};
+
+static void setup_samplers(Gx2BoundShader *out, const uint8_t *locs,
+                           uint32_t count) {
+    if (count > GX2_BIND_MAX_SAMPLERS) count = GX2_BIND_MAX_SAMPLERS;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint8_t loc = locs[i] & (GX2_BIND_MAX_SAMPLERS - 1);
+        out->ps_samplers[i].name     = kSamplerNames[loc];
+        out->ps_samplers[i].type     = GX2_SAMPLER_VAR_TYPE_SAMPLER_2D;
+        out->ps_samplers[i].location = loc;
+    }
+    out->ps_sampler_count = count;
+    if (count) {
+        out->ps.samplerVars     = out->ps_samplers;
+        out->ps.samplerVarCount = count;
+    }
+}
+
 bool gx2_bind_build(Gx2BoundShader *out,
                     const uint8_t *vs_prog, size_t vs_size, const Gx2VsRegs *vs_regs,
                     const uint8_t *ps_prog, size_t ps_size, const Gx2PsRegs *ps_regs,
                     const GX2AttribStream *attribs, uint32_t attrib_count,
-                    bool sampler_2d) {
+                    const uint8_t *sampler_locs, uint32_t sampler_count) {
     if (!out || !vs_prog || !ps_prog || !vs_regs || !ps_regs ||
-        (attrib_count && !attribs)) {
+        (attrib_count && !attribs) || (sampler_count && !sampler_locs)) {
         return false;
     }
 
@@ -56,13 +80,7 @@ bool gx2_bind_build(Gx2BoundShader *out,
     out->ps.program = out->ps_program;
     out->ps.mode    = GX2_SHADER_MODE_UNIFORM_REGISTER;
 
-    if (sampler_2d) {
-        out->ps_sampler.name     = "s_texture";
-        out->ps_sampler.type     = GX2_SAMPLER_VAR_TYPE_SAMPLER_2D;
-        out->ps_sampler.location = 0;
-        out->ps.samplerVars      = &out->ps_sampler;
-        out->ps.samplerVarCount  = 1;
-    }
+    setup_samplers(out, sampler_locs, sampler_count);
 
     // Fetch shader
     uint32_t fs_size = GX2CalcFetchShaderSizeEx(attrib_count,
@@ -89,7 +107,7 @@ bool gx2_bind_build_modulate(Gx2BoundShader *out,
     static uint8_t vs_buf[512];
     static uint8_t ps_buf[512];
 
-    ShaderGenVs vs_cfg = {.has_color = true, .has_texcoord = true};
+    ShaderGenVs vs_cfg = {.has_color = true, .num_texcoords = 1};
     ShaderGenPs ps_cfg = {.sample_texture = true, .modulate_color = true};
 
     size_t vs_size = shader_gen_vs(vs_buf, sizeof(vs_buf), &vs_cfg);
@@ -105,8 +123,58 @@ bool gx2_bind_build_modulate(Gx2BoundShader *out,
     Gx2PsRegs pregs;
     if (!gx2_vs_regs(&vregs, &vshape) || !gx2_ps_regs(&pregs, &pshape)) return false;
 
+    static const uint8_t modulate_loc[1] = {0};
     return gx2_bind_build(out, vs_buf, vs_size, &vregs, ps_buf, ps_size, &pregs,
-                          attribs, attrib_count, /*sampler_2d=*/true);
+                          attribs, attrib_count, modulate_loc, 1);
+}
+
+bool gx2_bind_build_tev(Gx2BoundShader *out, const TevConfig *cfg,
+                        const GX2AttribStream *attribs, uint32_t attrib_count) {
+    if (!out || !cfg) return false;
+
+    static uint8_t ps_buf[8192];
+    size_t ps_size = tev_shader_gen_ps(ps_buf, sizeof(ps_buf), cfg);
+    if (ps_size == 0) return false;
+
+    Gx2PsShape pshape;
+    tev_shader_gen_ps_shape(cfg, &pshape);
+    Gx2PsRegs pregs;
+    if (!gx2_ps_regs(&pregs, &pshape)) return false;
+
+    // One sampler per distinct texmap the config samples.
+    uint8_t  locs[GX2_BIND_MAX_SAMPLERS];
+    uint32_t nloc = 0;
+    bool     seen_map[GX2_BIND_MAX_SAMPLERS] = {false};
+    uint32_t ntexcoord = 0;
+    bool     seen_coord[GX2_BIND_MAX_SAMPLERS] = {false};
+    for (uint32_t s = 0; s < cfg->num_stages; ++s) {
+        const TevStage *st = &cfg->stage[s];
+        if (!st->tex_enable) continue;
+        uint8_t m = st->texmap & (GX2_BIND_MAX_SAMPLERS - 1);
+        if (!seen_map[m]) { seen_map[m] = true; locs[nloc++] = m; }
+        uint8_t tc = st->texcoord & (GX2_BIND_MAX_SAMPLERS - 1);
+        if (!seen_coord[tc]) { seen_coord[tc] = true; ++ntexcoord; }
+    }
+
+    // Generate the matching passthrough vertex shader.
+    static uint8_t vs_buf[512];
+    ShaderGenVs vs_cfg = {.has_color = true, .num_texcoords = ntexcoord};
+    size_t vs_size = shader_gen_vs(vs_buf, sizeof(vs_buf), &vs_cfg);
+    if (vs_size == 0) return false;
+    Gx2VsShape vshape;
+    shader_gen_vs_shape(&vs_cfg, &vshape);
+    Gx2VsRegs vregs;
+    if (!gx2_vs_regs(&vregs, &vshape)) return false;
+
+    return gx2_bind_build(out, vs_buf, vs_size, &vregs, ps_buf, ps_size, &pregs,
+                          attribs, attrib_count, locs, nloc);
+}
+
+void gx2_bind_set_tev_uniforms(const TevConfig *cfg) {
+    if (!cfg) return;
+    float cfile[8][4];
+    gx_tev_build_ps_cfile(cfg, cfile);
+    GX2SetPixelUniformReg(0, 8 * 4, &cfile[0][0]);
 }
 
 void gx2_bind_free(Gx2BoundShader *out) {

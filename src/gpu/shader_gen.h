@@ -18,8 +18,8 @@ extern "C" {
 
 // Vertex program shape.
 typedef struct {
-    bool has_color;     // pass a_color through as param 0
-    bool has_texcoord;  // pass a_texcoord through as the next param
+    bool     has_color;      // pass a_color through as param 0
+    uint32_t num_texcoords;  // pass this many texcoords through as the next params
 } ShaderGenVs;
 
 // Pixel program shape

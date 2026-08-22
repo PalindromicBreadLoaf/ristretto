@@ -63,22 +63,28 @@ size_t shader_gen_vs(uint8_t *buf, size_t cap, const ShaderGenVs *cfg)
 
     if (!r700_prog_alu_clause(&p, alu, n, true)) return 0;
 
-    uint32_t nparam = (cfg->has_color ? 1u : 0u) + (cfg->has_texcoord ? 1u : 0u);
+    uint32_t nparam = (cfg->has_color ? 1u : 0u) + cfg->num_texcoords;
     r700_prog_cf(&p, r700_cf_export(R700_EXPORT_POS, R700_EXPORT_POS0, 1, kSelXYZW,
                                     nparam == 0, true, R700_CF_EXPORT_DONE));
 
-    uint32_t base = 0, gpr = 2;
+    uint32_t base = 0, gpr = 2, emitted = 0;
     if (cfg->has_color) {
-        bool last = !cfg->has_texcoord;
+        bool last = emitted + 1 == nparam;
         r700_prog_cf(&p, r700_cf_export(R700_EXPORT_PARAM, base, gpr, kSelXYZW,
                                         last, false,
                                         last ? R700_CF_EXPORT_DONE : R700_CF_EXPORT));
         ++base;
         ++gpr;
+        ++emitted;
     }
-    if (cfg->has_texcoord) {
+    for (uint32_t k = 0; k < cfg->num_texcoords; ++k) {
+        bool last = emitted + 1 == nparam;
         r700_prog_cf(&p, r700_cf_export(R700_EXPORT_PARAM, base, gpr, kSelXY00,
-                                        true, false, R700_CF_EXPORT_DONE));
+                                        last, false,
+                                        last ? R700_CF_EXPORT_DONE : R700_CF_EXPORT));
+        ++base;
+        ++gpr;
+        ++emitted;
     }
 
     return r700_prog_finalize(&p);
@@ -131,15 +137,19 @@ void shader_gen_vs_shape(const ShaderGenVs *cfg, Gx2VsShape *out)
     memset(out, 0, sizeof(*out));
     uint32_t inputs = 1;  // position
     out->input_semantics[0] = 0;
-    if (cfg->has_color)    out->input_semantics[inputs++] = 1;
-    if (cfg->has_texcoord) out->input_semantics[inputs++] = 2;
+    if (cfg->has_color) out->input_semantics[inputs++] = 1;
+    for (uint32_t k = 0; k < cfg->num_texcoords; ++k)
+        out->input_semantics[inputs++] = (uint8_t)(2 + k);
     out->num_inputs = inputs;
     out->num_gprs = inputs + 1;  // R0 plus one GPR per attribute
     out->stack_size = 1;
 
+    // Param semantics are consecutive so they line up with the pixel shader's
+    // interpolant contract.
     uint32_t exports = 0;
-    if (cfg->has_color)    out->export_semantics[exports++] = 0;
-    if (cfg->has_texcoord) out->export_semantics[exports++] = 1;
+    if (cfg->has_color) out->export_semantics[exports++] = 0;
+    for (uint32_t k = 0; k < cfg->num_texcoords; ++k)
+        out->export_semantics[exports++] = (uint8_t)((cfg->has_color ? 1u : 0u) + k);
     out->num_exports = exports;
 }
 
@@ -255,6 +265,23 @@ static bool equivalent(const uint8_t *golden, uint32_t gsize,
     return na != 0 && na == nb && memcmp(ca, cb, na) == 0;
 }
 
+// Count PARAM exports in a finalized program.
+static uint32_t count_param_exports(const uint8_t *prog, size_t size)
+{
+    uint32_t n = 0;
+    for (size_t i = 0;; ++i) {
+        if ((i + 1) * 8 > size) return n;
+        uint32_t w0 = rd_le32(prog + i * 8);
+        uint32_t w1 = rd_le32(prog + i * 8 + 4);
+        if (w1 & (1u << 29)) continue;  // CF_ALU
+        uint32_t inst = (w1 >> 23) & 0x7Fu;
+        if ((inst == R700_CF_EXPORT || inst == R700_CF_EXPORT_DONE) &&
+            ((w0 >> 13) & 3u) == R700_EXPORT_PARAM)
+            ++n;
+        if (w1 & (1u << 21)) return n;  // END_OF_PROGRAM
+    }
+}
+
 bool shader_gen_selftest(void)
 {
     const uint8_t *gsh = g_tevModulateShaderGsh;
@@ -269,7 +296,7 @@ bool shader_gen_selftest(void)
     static uint8_t vs_buf[SHADER_GEN_MAX_PROGRAM_CHECK];
     static uint8_t ps_buf[SHADER_GEN_MAX_PROGRAM_CHECK];
 
-    ShaderGenVs vs_cfg = {.has_color = true, .has_texcoord = true};
+    ShaderGenVs vs_cfg = {.has_color = true, .num_texcoords = 1};
     ShaderGenPs ps_cfg = {.sample_texture = true, .modulate_color = true};
 
     size_t vs_size = shader_gen_vs(vs_buf, sizeof(vs_buf), &vs_cfg);
@@ -293,6 +320,22 @@ bool shader_gen_selftest(void)
         return false;
     if (pshape.num_gprs != 2 || pshape.num_inputs != 2)
         return false;
+
+    // A multi-texcoord passthrough VS exports colour + one param per texcoord,
+    // with consecutive semantics that line up with the TEV PS interpolants.
+    ShaderGenVs multi_cfg = {.has_color = true, .num_texcoords = 3};
+    size_t multi_size = shader_gen_vs(vs_buf, sizeof(vs_buf), &multi_cfg);
+    if (multi_size == 0) return false;
+    if (count_param_exports(vs_buf, multi_size) != 4) return false;
+
+    Gx2VsShape multi_shape;
+    shader_gen_vs_shape(&multi_cfg, &multi_shape);
+    if (multi_shape.num_exports != 4 || multi_shape.num_inputs != 5) return false;
+    if (multi_shape.export_semantics[0] != 0 || multi_shape.export_semantics[1] != 1 ||
+        multi_shape.export_semantics[2] != 2 || multi_shape.export_semantics[3] != 3)
+        return false;
+    Gx2VsRegs multi_regs;
+    if (!gx2_vs_regs(&multi_regs, &multi_shape)) return false;
 
     return true;
 }

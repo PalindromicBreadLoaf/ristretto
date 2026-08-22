@@ -145,11 +145,13 @@ static bool makeAttributeBuffer(GX2RBuffer *buffer, const void *data,
 // Draw the modulate quad with the given shader trio.
 static void drawQuadPass(GX2FetchShader *fs, GX2VertexShader *vs, GX2PixelShader *ps,
                          uint32_t samplerLoc, GX2Texture *tex, GX2Sampler *sampler,
-                         GX2RBuffer *pos, GX2RBuffer *col, GX2RBuffer *tc) {
+                         GX2RBuffer *pos, GX2RBuffer *col, GX2RBuffer *tc,
+                         const TevConfig *tev) {
     GX2SetFetchShader(fs);
     GX2SetVertexShader(vs);
     GX2SetPixelShader(ps);
     GX2SetVertexUniformReg(0, 16, sIdentity);
+    if (tev) gx2_bind_set_tev_uniforms(tev);
     GX2SetPixelTexture(tex, samplerLoc);
     GX2SetPixelSampler(sampler, samplerLoc);
     GX2RSetAttributeBuffer(pos, 0, pos->elemSize, 0);
@@ -456,11 +458,30 @@ int main(int argc, char **argv) {
          .endianSwap = GX2_ENDIAN_SWAP_DEFAULT},
     };
 
-    Gx2BoundShader bound = {0};
-    bool useGenerated = gx2_bind_build_modulate(&bound, attribs, 3);
-    WHBLogPrintf("gx2_bind: modulate shader %s",
-                 useGenerated ? "GENERATED" : "FAILED, using built-in .gsh");
+    // Prefer the multi-stage TEV generator, then the direct modulate generator.
+    TevConfig modulateTev;
+    gx_tev_reset(&modulateTev);
+    modulateTev.num_stages = 1;
+    modulateTev.stage[0].color = (TevCombiner){
+        .a = GX_CC_ZERO, .b = GX_CC_RASC, .c = GX_CC_TEXC, .d = GX_CC_ZERO,
+        .bias = GX_TB_ZERO, .op = GX_TEV_ADD, .clamp = true, .scale = GX_TS_1,
+        .dest = GX_TEVOUT_PREV};
+    modulateTev.stage[0].alpha = (TevCombiner){
+        .a = GX_CA_ZERO, .b = GX_CA_RASA, .c = GX_CA_TEXA, .d = GX_CA_ZERO,
+        .bias = GX_TB_ZERO, .op = GX_TEV_ADD, .clamp = true, .scale = GX_TS_1,
+        .dest = GX_TEVOUT_PREV};
+    modulateTev.stage[0].tex_enable = true;
+    modulateTev.stage[0].colorchan  = GX_RAS_COLOR0;
 
+    Gx2BoundShader bound = {0};
+    bool useTev = gx2_bind_build_tev(&bound, &modulateTev, attribs, 3);
+    bool useGenerated = useTev || gx2_bind_build_modulate(&bound, attribs, 3);
+    WHBLogPrintf("gx2_bind: modulate shader %s",
+                 useTev ? "GENERATED (multi-stage TEV)"
+                        : useGenerated ? "GENERATED (direct modulate)"
+                                       : "FAILED, using built-in .gsh");
+
+    const TevConfig *tevUniforms = useTev ? &modulateTev : NULL;
     GX2FetchShader  *fs = useGenerated ? &bound.fs : &group.fetchShader;
     GX2VertexShader *vs = useGenerated ? &bound.vs : group.vertexShader;
     GX2PixelShader  *ps = useGenerated ? &bound.ps : group.pixelShader;
@@ -472,13 +493,13 @@ int main(int argc, char **argv) {
         WHBGfxBeginRenderTV();
         WHBGfxClearColor(0.1f, 0.1f, 0.12f, 1.0f);
         drawQuadPass(fs, vs, ps, samplerLoc, &texture, &sampler,
-                     &positionBuffer, &colourBuffer, &texCoordBuffer);
+                     &positionBuffer, &colourBuffer, &texCoordBuffer, tevUniforms);
         WHBGfxFinishRenderTV();
 
         WHBGfxBeginRenderDRC();
         WHBGfxClearColor(0.1f, 0.1f, 0.12f, 1.0f);
         drawQuadPass(fs, vs, ps, samplerLoc, &texture, &sampler,
-                     &positionBuffer, &colourBuffer, &texCoordBuffer);
+                     &positionBuffer, &colourBuffer, &texCoordBuffer, tevUniforms);
         WHBGfxFinishRenderDRC();
 
         WHBGfxFinishRender();

@@ -67,6 +67,10 @@ typedef struct {
     uint8_t  num_stages;  // 1..16 (GENMODE numtevstages + 1)
     TevStage stage[GX_TEV_MAX_STAGES];
     uint8_t  swap[4][4];
+    // TEV colour registers (index 0 = PREV, 1..3 = C0..C2) and konst colours
+    // (K0..K3), each RGBA normalised to 0..1.
+    float    color[4][4];
+    float    konst[4][4];
 } TevConfig;
 
 // Reset to a defined identity.
@@ -74,6 +78,10 @@ void gx_tev_reset(TevConfig *cfg);
 
 // Fold one BP register load into the config.
 void gx_tev_apply_bp(TevConfig *cfg, uint8_t reg, uint32_t value);
+
+// Lay the colour/konst registers into the pixel-shader uniform cfile the
+// generated multi-stage TEV program expects.
+void gx_tev_build_ps_cfile(const TevConfig *cfg, float out[8][4]);
 
 int gx_tev_selftest(void);
 

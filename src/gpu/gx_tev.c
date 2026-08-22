@@ -14,10 +14,17 @@ enum {
     BP_COMB_LAST  = 0xDF,
     BP_KSEL_BASE  = 0xF6,  // 0xF6..0xFD: konst selects + swap tables, two stages each
     BP_KSEL_LAST  = 0xFD,
+    BP_TEVREG_BASE = 0xE0, // 0xE0..0xE7: four TEV colour/konst register pairs (RA/BG)
+    BP_TEVREG_LAST = 0xE7,
 };
 
 static inline uint32_t bits(uint32_t v, unsigned lo, unsigned n) {
     return (v >> lo) & ((1u << n) - 1u);
+}
+
+// Sign-extend an 11-bit TEV colour register field.
+static inline int32_t sx11(uint32_t v) {
+    return (int32_t)(v << 21) >> 21;
 }
 
 // Colour combiner
@@ -89,6 +96,21 @@ void gx_tev_apply_bp(TevConfig *cfg, uint8_t reg, uint32_t value) {
             decode_color(&st->color, value);
         return;
     }
+    if (reg >= BP_TEVREG_BASE && reg <= BP_TEVREG_LAST) {
+        // 0xE0/E2/E4/E6 = RA (red+alpha), 0xE1/E3/E5/E7 = BG (blue+green).
+        uint32_t num  = (reg >> 1) & 3u;
+        bool     is_bg = reg & 1u;
+        bool     is_konst = bits(value, 23, 1);
+        float   *dst = is_konst ? cfg->konst[num] : cfg->color[num];
+        if (is_bg) {
+            dst[2] = (float)sx11(bits(value, 0, 11)) / 255.0f;   // blue
+            dst[1] = (float)sx11(bits(value, 12, 11)) / 255.0f;  // green
+        } else {
+            dst[0] = (float)sx11(bits(value, 0, 11)) / 255.0f;   // red
+            dst[3] = (float)sx11(bits(value, 12, 11)) / 255.0f;  // alpha
+        }
+        return;
+    }
     if (reg >= BP_KSEL_BASE && reg <= BP_KSEL_LAST) {
         uint32_t i = reg - BP_KSEL_BASE;
         cfg->stage[i * 2].kcsel     = (uint8_t)bits(value, 4, 5);
@@ -108,6 +130,13 @@ void gx_tev_apply_bp(TevConfig *cfg, uint8_t reg, uint32_t value) {
         }
         return;
     }
+}
+
+void gx_tev_build_ps_cfile(const TevConfig *cfg, float out[8][4]) {
+    for (int i = 0; i < 4; ++i)
+        for (int ch = 0; ch < 4; ++ch) out[i][ch] = cfg->color[i][ch];
+    for (int i = 0; i < 4; ++i)
+        for (int ch = 0; ch < 4; ++ch) out[4 + i][ch] = cfg->konst[i][ch];
 }
 
 // Self test
@@ -200,6 +229,32 @@ int gx_tev_selftest(void) {
                         (uint32_t)0u << 2;   // swap_ga -> Alpha source = Red(0)
     gx_tev_apply_bp(&cfg, BP_KSEL_BASE + 1, ksel_odd);
     if (cfg.swap[0][2] != 1 || cfg.swap[0][3] != 0) return 0;
+
+    // Colour register 1
+    gx_tev_apply_bp(&cfg, BP_TEVREG_BASE + 2,
+                    (uint32_t)128u << 0 | (uint32_t)64u << 12);   // red=128, alpha=64
+    gx_tev_apply_bp(&cfg, BP_TEVREG_BASE + 3,
+                    (uint32_t)32u << 0 | (uint32_t)200u << 12);   // blue=32, green=200
+    if (cfg.color[1][0] != 128.0f / 255.0f || cfg.color[1][3] != 64.0f / 255.0f)
+        return 0;
+    if (cfg.color[1][2] != 32.0f / 255.0f || cfg.color[1][1] != 200.0f / 255.0f)
+        return 0;
+
+    // Konst register 2
+    gx_tev_apply_bp(&cfg, BP_TEVREG_BASE + 4,
+                    (1u << 23) | (uint32_t)255u << 0 | (uint32_t)10u << 12);
+    if (cfg.konst[2][0] != 1.0f || cfg.konst[2][3] != 10.0f / 255.0f) return 0;
+    if (cfg.color[2][0] != 0.0f) return 0;  // color slot 2 stayed untouched
+
+    // A negative 11-bit field sign-extends.
+    gx_tev_apply_bp(&cfg, BP_TEVREG_BASE + 0, (uint32_t)0x7FFu << 0);  // red = -1
+    if (cfg.color[0][0] != -1.0f / 255.0f) return 0;
+
+    // cfile packs PREV/C0/C1/C2 then K0..K3.
+    float cfile[8][4];
+    gx_tev_build_ps_cfile(&cfg, cfile);
+    if (cfile[1][0] != cfg.color[1][0] || cfile[1][1] != cfg.color[1][1]) return 0;
+    if (cfile[6][0] != cfg.konst[2][0] || cfile[6][3] != cfg.konst[2][3]) return 0;
 
     return 1;
 }
