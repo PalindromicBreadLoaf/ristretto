@@ -36,6 +36,7 @@
 #include "gpu/gx_state.h"
 #include "gpu/gx_tev.h"
 #include "gpu/gx_texture.h"
+#include "gpu/gx_xf.h"
 #include "gpu/r700_emit.h"
 #include "gpu/shader_gen.h"
 #include "gpu/tev_shader_gen.h"
@@ -510,6 +511,7 @@ int main(int argc, char **argv) {
     WHBLogPrintf("gx_state selftest: %s", gx_state_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_tev selftest: %s", gx_tev_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_texture selftest: %s", gx_texture_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("gx_xf selftest: %s", gx_xf_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("r700_emit selftest: %s", r700_emit_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx2_shader selftest: %s", gx2_shader_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("shader_gen selftest: %s", shader_gen_selftest() ? "PASS" : "FAIL");
