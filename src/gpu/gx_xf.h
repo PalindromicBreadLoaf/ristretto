@@ -81,6 +81,9 @@ void gx_xf_projection_matrix(const XfConfig *cfg, float out[16]);
 // Expand the selected 3x4 position matrix to a 4x4.
 void gx_xf_position_matrix(const XfConfig *cfg, uint32_t mtx_index, float out[16]);
 
+// Build the transform VS's uniform matrix.
+void gx_xf_build_vs_cfile(const XfConfig *cfg, uint32_t mtx_index, float out[16]);
+
 int gx_xf_selftest(void);
 
 #ifdef __cplusplus

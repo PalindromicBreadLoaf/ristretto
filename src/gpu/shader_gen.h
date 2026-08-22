@@ -20,6 +20,7 @@ extern "C" {
 typedef struct {
     bool     has_color;      // pass a_color through as param 0
     uint32_t num_texcoords;  // pass this many texcoords through as the next params
+    bool     transform_position;
 } ShaderGenVs;
 
 // Pixel program shape

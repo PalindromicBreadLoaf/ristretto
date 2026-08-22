@@ -117,6 +117,28 @@ void gx_xf_position_matrix(const XfConfig *cfg, uint32_t mtx_index, float out[16
     out[15] = 1.0f;  // last row 0 0 0 1
 }
 
+// out = a * b
+static void mat4_mul(const float a[16], const float b[16], float out[16]) {
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) {
+            float s = 0.0f;
+            for (int k = 0; k < 4; ++k)
+                s += a[r * 4 + k] * b[k * 4 + c];
+            out[r * 4 + c] = s;
+        }
+}
+
+void gx_xf_build_vs_cfile(const XfConfig *cfg, uint32_t mtx_index, float out[16]) {
+    float proj[16], pos[16], clip[16];
+    gx_xf_projection_matrix(cfg, proj);
+    gx_xf_position_matrix(cfg, mtx_index, pos);
+    mat4_mul(proj, pos, clip);  // clip = P * M
+
+    for (int i = 0; i < 4; ++i)
+        for (int c = 0; c < 4; ++c)
+            out[i * 4 + c] = clip[c * 4 + i];
+}
+
 // Self test
 static void put_f(uint8_t *p, float f) {
     uint32_t u;
@@ -236,6 +258,53 @@ int gx_xf_selftest(void) {
         put_u(d, 1);
         gx_xf_apply_xf(&cfg, XF_SETNUMCHAN, 1, d);
         if (cfg.num_color_chans != 1) return 0;
+    }
+
+    // Transform VS uniform
+    {
+        XfConfig t;
+        gx_xf_reset(&t);
+
+        // Orthographic projection
+        uint8_t pd[7 * 4];
+        float raw[6] = {0.5f, 0.0f, -0.25f, 0.0f, -0.001f, -1.0f};
+        for (int i = 0; i < 6; ++i) put_f(&pd[i * 4], raw[i]);
+        put_u(&pd[6 * 4], GX_XF_ORTHOGRAPHIC);
+        gx_xf_apply_xf(&t, XF_SETPROJECTION, 7, pd);
+
+        uint8_t md[12 * 4];
+        float pm[12] = {
+            1, 0, 0, 4,
+            0, 1, 0, 5,
+            0, 0, 1, 6,
+        };
+        for (int i = 0; i < 12; ++i) put_f(&md[i * 4], pm[i]);
+        gx_xf_apply_xf(&t, XF_POSMATRICES + 3 * 4, 12, md);
+
+        float cfile[16];
+        gx_xf_build_vs_cfile(&t, 3, cfile);
+
+        float proj[16], pos[16];
+        gx_xf_projection_matrix(&t, proj);
+        gx_xf_position_matrix(&t, 3, pos);
+        const float v[4] = {2.0f, -3.0f, 7.0f, 1.0f};
+        float eye[4], want[4];
+        for (int r = 0; r < 4; ++r) {
+            eye[r] = 0.0f;
+            for (int k = 0; k < 4; ++k) eye[r] += pos[r * 4 + k] * v[k];
+        }
+        for (int r = 0; r < 4; ++r) {
+            want[r] = 0.0f;
+            for (int k = 0; k < 4; ++k) want[r] += proj[r * 4 + k] * eye[k];
+        }
+
+        // out[c] = sum_i v[i] * cfile[i][c].
+        for (int c = 0; c < 4; ++c) {
+            float got = 0.0f;
+            for (int i = 0; i < 4; ++i) got += v[i] * cfile[i * 4 + c];
+            float diff = got - want[c];
+            if (diff < -1e-4f || diff > 1e-4f) return 0;
+        }
     }
 
     return 1;
