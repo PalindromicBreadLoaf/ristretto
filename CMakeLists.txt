@@ -35,6 +35,7 @@ add_executable(ristretto
     src/gpu/tev_shader_gen.c
     src/gpu/xfb_present.c
     src/ios/ios_ipc.c
+    src/ios/mocha.c
     src/mem/wii_memory.c
     src/mem/wii_mmio.c
     src/mem/wii_vi.c

@@ -23,24 +23,18 @@ typedef struct {
     uint32_t num_texcoords;  // pass this many texcoords through as the next params
     bool     transform_position;
     bool     texgen[8];
-    // Per-vertex diffuse lighting for colour channel 0 (rgb). When enabled the
-    // colour param is computed from the material/ambient/light uniforms instead
-    // of passed through. Requires has_color and has_normal.
+    // Per-vertex diffuse lighting for colour channel 0.
     struct {
         bool     enable;
-        uint32_t num_lights;      // directional lights, code emitted per light
-        bool     diffuse;         // diffusefunc != None (multiply by N.L)
-        bool     clamp;           // diffusefunc == Clamp (max(0, N.L))
+        uint32_t num_lights;      // directional lights
+        bool     diffuse;         // diffusefunc != None
+        bool     clamp;           // diffusefunc == Clamp
         bool     mat_from_vertex; // material colour from vertex vs register
         bool     amb_from_vertex; // ambient colour from vertex vs register
     } light;
 } ShaderGenVs;
 
-// Lighting VS uniform block, in vec4 (cfile) registers, uploaded at this base
-// with GX2SetVertexUniformReg. Layout (relative register, filled by
-// gx_xf_build_light_cfile): 0..2 = normal matrix rows (n' = n * NRk),
-// 3 = material rgba, 4 = ambient rgba, 5+2j = light j direction (xyz),
-// 6+2j = light j colour (rgb).
+// Lighting VS uniform block
 #define SHADER_GEN_LIGHT_CFILE_BASE 32
 #define SHADER_GEN_MAX_VS_LIGHTS    8
 

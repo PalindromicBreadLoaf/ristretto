@@ -6,9 +6,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <coreinit/filesystem_fsa.h>
 #include <whb/log.h>
 
 #include "disc/disc.h"
+#include "ios/mocha.h"
 #include "mem/wii_memory.h"
 
 // Starlet ABI
@@ -74,6 +76,81 @@ static Disc *s_disc = NULL;
 
 void ios_ipc_mount_disc(Disc *disc) {
     s_disc = disc;
+}
+
+#define VWII_NAND_DEVICE "/dev/slccmpt01"
+#define VWII_NAND_MOUNT  "/vol/storage_slccmpt01"
+
+void ios_ipc_vwii_nand_spike(void) {
+    FSError init = FSAInit();
+    if (init != FS_ERROR_OK) {
+        WHBLogPrintf("vwii nand: NO ACCESS (FSAInit=%d)", (int)init);
+        return;
+    }
+
+    FSAClientHandle client = FSAAddClient(NULL);
+    if (client < 0) {
+        WHBLogPrintf("vwii nand: NO ACCESS (FSAAddClient=%d)", (int)client);
+        FSAShutdown();
+        return;
+    }
+
+    MochaStatus mocha = mocha_init();
+    if (mocha == MOCHA_OK) {
+        mocha = mocha_unlock_fsa_client(client);
+        if (mocha == MOCHA_OK)
+            WHBLogPrint("vwii nand: FSA client elevated via mocha");
+        else
+            WHBLogPrintf("vwii nand: mocha unlock failed (%d)", (int)mocha);
+    } else {
+        WHBLogPrintf("vwii nand: no CFW FSA elevation (mocha=%d)", (int)mocha);
+    }
+
+    FSError mount = FSAMount(client, VWII_NAND_DEVICE, VWII_NAND_MOUNT,
+                             FSA_MOUNT_FLAG_GLOBAL_MOUNT, NULL, 0);
+    if (mount != FS_ERROR_OK) {
+        WHBLogPrintf("vwii nand: NO ACCESS (FSAMount %s=%d)",
+                     VWII_NAND_DEVICE, (int)mount);
+        mocha_deinit();
+        FSADelClient(client);
+        FSAShutdown();
+        return;
+    }
+
+    static const char *const probe_paths[] = {
+        VWII_NAND_MOUNT "/shared1/content.map",
+        VWII_NAND_MOUNT "/shared2/sys/SYSCONF",
+    };
+    static uint8_t read_buf[512] __attribute__((aligned(0x40)));
+
+    int32_t bytes_read = -1;
+    const char *read_path = NULL;
+    FSError read_error = FS_ERROR_NOT_FOUND;
+    for (uint32_t i = 0; i < sizeof(probe_paths) / sizeof(probe_paths[0]); ++i) {
+        FSAFileHandle file = 0;
+        read_error = FSAOpenFileEx(client, probe_paths[i], "r", (FSMode)0,
+                                    FS_OPEN_FLAG_NONE, 0, &file);
+        if (read_error != FS_ERROR_OK)
+            continue;
+
+        read_error = FSAReadFile(client, read_buf, 1, sizeof(read_buf), file, 0);
+        FSACloseFile(client, file);
+        if (read_error >= 0) {
+            bytes_read = read_error;
+            read_path = probe_paths[i];
+            break;
+        }
+    }
+
+    if (bytes_read >= 0)
+        WHBLogPrintf("vwii nand: MOUNTED read=%d bytes (%s)", bytes_read, read_path);
+    else
+        WHBLogPrintf("vwii nand: NO ACCESS (FSAOpenFile/ReadFile=%d)", (int)read_error);
+
+    FSAUnmount(client, VWII_NAND_MOUNT, FSA_UNMOUNT_FLAG_FORCE);
+    mocha_deinit();
+    FSADelClient(client);
+    FSAShutdown();
 }
 
 static int32_t di_ioctl(int32_t fd, uint32_t request,
@@ -336,7 +413,7 @@ static void build_open(uint32_t path_ea, int32_t mode) {
 static int32_t open_dev(const char *path) {
     uint32_t path_ea = ST_BUF;
     wii_mem_write(path_ea, path, (uint32_t)strlen(path) + 1);
-    build_open(path_ea, IOS_OPEN_NONE);
+    build_open(path_ea, IOS_GUEST_OPEN_NONE);
     return ios_ipc_dispatch(ST_BLOCK);
 }
 

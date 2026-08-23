@@ -24,12 +24,12 @@ enum {
     IOS_REPLY      = 8,
 };
 
-// IOS_Open mode
+// Guest IOS_Open modes
 enum {
-    IOS_OPEN_NONE  = 0,
-    IOS_OPEN_READ  = 1,
-    IOS_OPEN_WRITE = 2,
-    IOS_OPEN_RW    = 3,
+    IOS_GUEST_OPEN_NONE  = 0,
+    IOS_GUEST_OPEN_READ  = 1,
+    IOS_GUEST_OPEN_WRITE = 2,
+    IOS_GUEST_OPEN_RW    = 3,
 };
 
 // IOS return codes
@@ -69,6 +69,9 @@ void ios_ipc_init(void);
 
 // Attach a disc image for /dev/di to loop its reads back over.
 void ios_ipc_mount_disc(Disc *disc);
+
+// Attempt a read-only mount of SLCCMPT.
+void ios_ipc_vwii_nand_spike(void);
 
 // Service one guest-resident IPC command block at effective address `cmd_block_ea`.
 int32_t ios_ipc_dispatch(uint32_t cmd_block_ea);

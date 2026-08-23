@@ -582,6 +582,7 @@ int main(int argc, char **argv) {
         case IOS_IPC_SELFTEST_PASS: WHBLogPrint("ios_ipc selftest: PASS"); break;
         case IOS_IPC_SELFTEST_FAIL: WHBLogPrint("ios_ipc selftest: FAIL"); break;
     }
+    ios_ipc_vwii_nand_spike();
     WHBLogPrintf("disc selftest: %s", disc_selftest() ? "PASS" : "FAIL");
     tryMountDiscFromSd();
     WHBLogPrintf("wii_vi selftest: %s", wii_vi_selftest() ? "PASS" : "FAIL");
