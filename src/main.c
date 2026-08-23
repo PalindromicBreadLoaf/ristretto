@@ -597,7 +597,7 @@ int main(int argc, char **argv) {
     WHBLogPrintf("gx_texture selftest: %s", gx_texture_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_xf selftest: %s", gx_xf_selftest() ? "PASS" : "FAIL");
     (void)gx_vertex_selftest();
-    (void)gx_draw_selftest();
+    WHBLogPrintf("gx_draw selftest: %s", gx_draw_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("r700_emit selftest: %s", r700_emit_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx2_shader selftest: %s", gx2_shader_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("shader_gen selftest: %s", shader_gen_selftest() ? "PASS" : "FAIL");

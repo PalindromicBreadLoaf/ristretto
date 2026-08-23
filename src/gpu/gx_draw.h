@@ -46,18 +46,8 @@ typedef struct {
 // Maximum primitives recorded per prepared stream.
 #define GX_DRAW_MAX_RECORDS 64
 
-// One prepared draw
-typedef struct {
-    GX2PrimitiveMode mode;
-    uint32_t         count;
-    uint32_t         ntc;
-    uint8_t          slots[8];   // distinct sampled texcoord slots, ascending
-    float            vs_cfile[16 + 12 * 8];
-    uint32_t         vs_cfile_count;   // floats to upload
-    GXDepthState     depth;
-    GXBlendState     blend;
-    GXCullState      cull;
-} GXDrawRecord;
+// Generated shader trios retained by a draw pipeline.
+#define GX_DRAW_SHADER_CACHE_CAP 64
 
 // The shader-structure signature a bound shader was built for.
 typedef struct {
@@ -72,6 +62,34 @@ typedef struct {
 } GXDrawShaderSig;
 
 typedef struct {
+    Gx2BoundShader bound;
+    GXDrawShaderSig sig;
+    uint32_t        last_used;
+} GXDrawShaderCacheEntry;
+
+typedef struct {
+    uint32_t hits;
+    uint32_t misses;
+    uint32_t evictions;
+    uint32_t entries;
+} GXDrawShaderCacheStats;
+
+// One prepared draw
+typedef struct {
+    GX2PrimitiveMode mode;
+    uint32_t         count;
+    uint32_t         ntc;
+    uint8_t          shader_cache_index;
+    uint8_t          slots[8];   // distinct sampled texcoord slots, ascending
+    float            vs_cfile[16 + 12 * 8];
+    uint32_t         vs_cfile_count;   // floats to upload
+    float            ps_cfile[8][4];
+    GXDepthState     depth;
+    GXBlendState     blend;
+    GXCullState      cull;
+} GXDrawRecord;
+
+typedef struct {
     GXDrawCallbacks cb;
 
     // Accumulated GX state
@@ -83,9 +101,11 @@ typedef struct {
     uint32_t      geom_mtx_index;   // MATINDEX_A position/normal matrix index
     uint8_t       tex_mtx_index[8]; // MATINDEX_A/B per-texcoord texture matrix index
 
-    // The currently bound shader trio and what it was built for.
-    Gx2BoundShader  bound;
-    GXDrawShaderSig sig;
+    GXDrawShaderCacheEntry shader_cache[GX_DRAW_SHADER_CACHE_CAP];
+    uint32_t               shader_cache_clock;
+    uint32_t               shader_cache_hits;
+    uint32_t               shader_cache_misses;
+    uint32_t               shader_cache_evictions;
 
     // Growable per-attribute GX2R vertex buffers.
     GX2RBuffer buffer[GX_DRAW_BUF_COUNT];
@@ -113,6 +133,8 @@ uint32_t gx_draw_execute(GXDrawPipeline *p, const uint8_t *fifo, size_t len);
 
 // Re-issue the draws recorded by the last gx_draw_execute.
 void gx_draw_replay(GXDrawPipeline *p);
+
+GXDrawShaderCacheStats gx_draw_shader_cache_stats(const GXDrawPipeline *p);
 
 int gx_draw_selftest(void);
 

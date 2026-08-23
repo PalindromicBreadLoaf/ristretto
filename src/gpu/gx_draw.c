@@ -7,6 +7,7 @@
 
 #include <gx2/draw.h>
 #include <gx2/enum.h>
+#include <gx2/event.h>
 #include <gx2/registers.h>
 #include <gx2/sampler.h>
 #include <gx2/shaders.h>
@@ -85,11 +86,98 @@ static void build_sig(const GXDrawPipeline *p, bool transform, GXDrawShaderSig *
     out->valid = true;
     out->transform = transform;
     out->num_stages = p->tev.num_stages;
-    memcpy(out->stage, p->tev.stage, sizeof(out->stage));
+    memcpy(out->stage, p->tev.stage, (size_t)out->num_stages * sizeof(out->stage[0]));
     memcpy(out->swap, p->tev.swap, sizeof(out->swap));
     out->num_texcoords = distinct_texcoords(&p->tev, out->tex_slot);
     for (uint32_t k = 0; k < out->num_texcoords; ++k)
         out->texgen[k] = gx_xf_texgen_is_regular(&p->xf, out->tex_slot[k]);
+}
+
+static bool sig_equal(const GXDrawShaderSig *a, const GXDrawShaderSig *b) {
+    if (!a->valid || !b->valid || a->transform != b->transform ||
+        a->num_stages != b->num_stages || a->num_texcoords != b->num_texcoords) {
+        return false;
+    }
+    return memcmp(a->stage, b->stage, (size_t)a->num_stages * sizeof(a->stage[0])) == 0 &&
+           memcmp(a->swap, b->swap, sizeof(a->swap)) == 0 &&
+           memcmp(a->tex_slot, b->tex_slot, a->num_texcoords) == 0 &&
+           memcmp(a->texgen, b->texgen, a->num_texcoords * sizeof(a->texgen[0])) == 0;
+}
+
+static bool cache_entry_in_use(const GXDrawPipeline *p, uint32_t index) {
+    for (uint32_t i = 0; i < p->nrecords; ++i)
+        if (p->record[i].shader_cache_index == index) return true;
+    return false;
+}
+
+static int cache_slot_for(GXDrawPipeline *p, const GXDrawShaderSig *sig) {
+    for (uint32_t i = 0; i < GX_DRAW_SHADER_CACHE_CAP; ++i) {
+        GXDrawShaderCacheEntry *entry = &p->shader_cache[i];
+        if (!entry->sig.valid || !sig_equal(&entry->sig, sig)) continue;
+        entry->last_used = ++p->shader_cache_clock;
+        p->shader_cache_hits++;
+        return (int)i;
+    }
+
+    p->shader_cache_misses++;
+    int slot = -1;
+    uint32_t oldest = UINT32_MAX;
+    for (uint32_t i = 0; i < GX_DRAW_SHADER_CACHE_CAP; ++i) {
+        GXDrawShaderCacheEntry *entry = &p->shader_cache[i];
+        if (!entry->sig.valid) {
+            slot = (int)i;
+            break;
+        }
+        if (!cache_entry_in_use(p, i) && entry->last_used < oldest) {
+            oldest = entry->last_used;
+            slot = (int)i;
+        }
+    }
+    if (slot < 0) return -1;
+
+    GXDrawShaderCacheEntry *entry = &p->shader_cache[slot];
+    if (entry->sig.valid) {
+        GX2DrawDone();
+        gx2_bind_free(&entry->bound);
+        p->shader_cache_evictions++;
+    }
+    entry->sig = *sig;
+    entry->last_used = ++p->shader_cache_clock;
+    return slot;
+}
+
+static bool build_cached_shader(GXDrawPipeline *p, const GXDrawShaderSig *sig,
+                                uint32_t ntc, int slot) {
+    GX2AttribStream attribs[2 + 8];
+    uint32_t na = 0;
+    attribs[na++] = (GX2AttribStream){
+        .location = 0, .buffer = GX_DRAW_BUF_POS, .offset = 0,
+        .format = GX2_ATTRIB_FORMAT_FLOAT_32_32_32,
+        .type = GX2_ATTRIB_INDEX_PER_VERTEX, .aluDivisor = 0,
+        .mask = GX2_SEL_MASK(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z, GX2_SQ_SEL_1),
+        .endianSwap = GX2_ENDIAN_SWAP_DEFAULT};
+    attribs[na++] = (GX2AttribStream){
+        .location = 1, .buffer = GX_DRAW_BUF_COL0, .offset = 0,
+        .format = GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32,
+        .type = GX2_ATTRIB_INDEX_PER_VERTEX, .aluDivisor = 0,
+        .mask = GX2_SEL_MASK(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z, GX2_SQ_SEL_W),
+        .endianSwap = GX2_ENDIAN_SWAP_DEFAULT};
+    for (uint32_t k = 0; k < ntc; ++k) {
+        attribs[na++] = (GX2AttribStream){
+            .location = 2 + k, .buffer = 2 + k, .offset = 0,
+            .format = GX2_ATTRIB_FORMAT_FLOAT_32_32,
+            .type = GX2_ATTRIB_INDEX_PER_VERTEX, .aluDivisor = 0,
+            .mask = GX2_SEL_MASK(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_0, GX2_SQ_SEL_1),
+            .endianSwap = GX2_ENDIAN_SWAP_DEFAULT};
+    }
+
+    GXDrawShaderCacheEntry *entry = &p->shader_cache[slot];
+    if (!gx2_bind_build_tev_ex(&entry->bound, &p->tev, sig->transform, sig->texgen,
+                               attribs, na)) {
+        memset(entry, 0, sizeof(*entry));
+        return false;
+    }
+    return true;
 }
 
 // GX2 helpers
@@ -137,6 +225,7 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
                            uint16_t num_vertices, const uint8_t *vertex_data,
                            uint32_t vertex_size) {
     if (num_vertices == 0) return;
+    if (!p->dry_run && p->nrecords >= GX_DRAW_MAX_RECORDS) return;
 
     GXVertexLayout layout;
     gx_vertex_layout(&p->fifo, vat, &layout);
@@ -208,46 +297,17 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
 
     if (used == 0) return;
 
-    if (!p->sig.valid || memcmp(&p->sig, &sig, sizeof(sig)) != 0) {
-        // location 0 position, 1 colour, 2+k the k-th texcoord.
-        GX2AttribStream attribs[2 + 8];
-        uint32_t na = 0;
-        attribs[na++] = (GX2AttribStream){
-            .location = 0, .buffer = GX_DRAW_BUF_POS, .offset = 0,
-            .format = GX2_ATTRIB_FORMAT_FLOAT_32_32_32,
-            .type = GX2_ATTRIB_INDEX_PER_VERTEX, .aluDivisor = 0,
-            .mask = GX2_SEL_MASK(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z, GX2_SQ_SEL_1),
-            .endianSwap = GX2_ENDIAN_SWAP_DEFAULT};
-        attribs[na++] = (GX2AttribStream){
-            .location = 1, .buffer = GX_DRAW_BUF_COL0, .offset = 0,
-            .format = GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32,
-            .type = GX2_ATTRIB_INDEX_PER_VERTEX, .aluDivisor = 0,
-            .mask = GX2_SEL_MASK(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z, GX2_SQ_SEL_W),
-            .endianSwap = GX2_ENDIAN_SWAP_DEFAULT};
-        for (uint32_t k = 0; k < ntc; ++k) {
-            attribs[na++] = (GX2AttribStream){
-                .location = 2 + k, .buffer = 2 + k, .offset = 0,
-                .format = GX2_ATTRIB_FORMAT_FLOAT_32_32,
-                .type = GX2_ATTRIB_INDEX_PER_VERTEX, .aluDivisor = 0,
-                .mask = GX2_SEL_MASK(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_0, GX2_SQ_SEL_1),
-                .endianSwap = GX2_ENDIAN_SWAP_DEFAULT};
-        }
-
-        if (p->sig.valid) gx2_bind_free(&p->bound);
-        if (!gx2_bind_build_tev_ex(&p->bound, &p->tev, transform, sig.texgen,
-                                   attribs, na)) {
-            p->sig.valid = false;
-            return;
-        }
-        p->sig = sig;
-    }
+    int shader_slot = cache_slot_for(p, &sig);
+    if (shader_slot < 0) return;
+    if (!p->shader_cache[shader_slot].bound.valid &&
+        !build_cached_shader(p, &sig, ntc, shader_slot)) return;
 
     // Record the draw for replay inside the render pass.
-    if (p->nrecords >= GX_DRAW_MAX_RECORDS) return;
     GXDrawRecord *rec = &p->record[p->nrecords++];
     rec->mode  = prim_mode(prim);
     rec->count = num_vertices;
     rec->ntc   = ntc;
+    rec->shader_cache_index = (uint8_t)shader_slot;
     memcpy(rec->slots, slots, sizeof(rec->slots));
     if (transform)
         gx_xf_build_vs_cfile(&p->xf, p->geom_mtx_index, rec->vs_cfile);
@@ -262,6 +322,7 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
                                  rec->vs_cfile + 16 + 12 * k);
     }
     rec->vs_cfile_count = 16 + 12 * ntc;
+    gx_tev_build_ps_cfile(&p->tev, rec->ps_cfile);
     gx_state_depth(&p->render, &rec->depth);
     gx_state_blend(&p->render, &rec->blend);
     gx_state_cull(&p->render, &rec->cull);
@@ -287,25 +348,25 @@ static void apply_state(const GXDrawRecord *rec) {
 }
 
 void gx_draw_replay(GXDrawPipeline *p) {
-    if (!p || !p->sig.valid) return;
-
-    GX2SetFetchShader(&p->bound.fs);
-    GX2SetVertexShader(&p->bound.vs);
-    GX2SetPixelShader(&p->bound.ps);
-    gx2_bind_set_tev_uniforms(&p->tev);
-
-    for (uint32_t i = 0; i < p->bound.ps_sampler_count; ++i) {
-        uint32_t loc = p->bound.ps_samplers[i].location;
-        GX2Texture *t = p->cb.get_texture ? p->cb.get_texture(p->cb.user, (uint8_t)loc)
-                                          : NULL;
-        GX2Sampler *s = p->cb.get_sampler ? p->cb.get_sampler(p->cb.user, (uint8_t)loc)
-                                          : NULL;
-        if (t) GX2SetPixelTexture(t, loc);
-        if (s) GX2SetPixelSampler(s, loc);
-    }
+    if (!p || p->nrecords == 0) return;
 
     for (uint32_t r = 0; r < p->nrecords; ++r) {
         const GXDrawRecord *rec = &p->record[r];
+        const GXDrawShaderCacheEntry *entry = &p->shader_cache[rec->shader_cache_index];
+        if (!entry->bound.valid) continue;
+        GX2SetFetchShader(&entry->bound.fs);
+        GX2SetVertexShader(&entry->bound.vs);
+        GX2SetPixelShader(&entry->bound.ps);
+        GX2SetPixelUniformReg(0, 8 * 4, (void *)&rec->ps_cfile[0][0]);
+        for (uint32_t i = 0; i < entry->bound.ps_sampler_count; ++i) {
+            uint32_t loc = entry->bound.ps_samplers[i].location;
+            GX2Texture *t = p->cb.get_texture ? p->cb.get_texture(p->cb.user, (uint8_t)loc)
+                                              : NULL;
+            GX2Sampler *s = p->cb.get_sampler ? p->cb.get_sampler(p->cb.user, (uint8_t)loc)
+                                              : NULL;
+            if (t) GX2SetPixelTexture(t, loc);
+            if (s) GX2SetPixelSampler(s, loc);
+        }
         GX2SetVertexUniformReg(0, rec->vs_cfile_count, (void *)rec->vs_cfile);
         apply_state(rec);
         GX2RSetAttributeBuffer(&p->buffer[GX_DRAW_BUF_POS], 0,
@@ -339,7 +400,9 @@ bool gx_draw_init(GXDrawPipeline *p, const GXDrawCallbacks *cb) {
 
 void gx_draw_shutdown(GXDrawPipeline *p) {
     if (!p) return;
-    if (p->sig.valid) gx2_bind_free(&p->bound);
+    for (uint32_t i = 0; i < GX_DRAW_SHADER_CACHE_CAP; ++i)
+        if (p->shader_cache[i].sig.valid)
+            gx2_bind_free(&p->shader_cache[i].bound);
     for (int i = 0; i < GX_DRAW_BUF_COUNT; ++i)
         if (p->buffer_cap[i]) {
             GX2RDestroyBufferEx(&p->buffer[i], 0);
@@ -357,7 +420,6 @@ void gx_draw_reset_state(GXDrawPipeline *p) {
     memset(&p->arr, 0, sizeof(p->arr));
     p->geom_mtx_index = 0;
     memset(p->tex_mtx_index, 0, sizeof(p->tex_mtx_index));
-    p->sig.valid = false;
 }
 
 uint32_t gx_draw_execute(GXDrawPipeline *p, const uint8_t *fifo, size_t len) {
@@ -374,6 +436,17 @@ uint32_t gx_draw_execute(GXDrawPipeline *p, const uint8_t *fifo, size_t len) {
     };
     gx_fifo_run(&p->fifo, fifo, len, &sink, p);
     return p->prims;
+}
+
+GXDrawShaderCacheStats gx_draw_shader_cache_stats(const GXDrawPipeline *p) {
+    GXDrawShaderCacheStats stats = {0};
+    if (!p) return stats;
+    stats.hits = p->shader_cache_hits;
+    stats.misses = p->shader_cache_misses;
+    stats.evictions = p->shader_cache_evictions;
+    for (uint32_t i = 0; i < GX_DRAW_SHADER_CACHE_CAP; ++i)
+        if (p->shader_cache[i].sig.valid) stats.entries++;
+    return stats;
 }
 
 // self test
@@ -441,6 +514,25 @@ int gx_draw_selftest(void) {
 
     // The folded position of vertex 3 must survive decode.
     if (g_dry_pos[3 * 3 + 0] != 0.8f || g_dry_pos[3 * 3 + 1] != 0.8f) ok = 0;
+
+    GXDrawShaderSig sig0;
+    GXDrawShaderSig sig1;
+    build_sig(&p, true, &sig0);
+    p.tev.color[0][0] = 0.5f;
+    build_sig(&p, true, &sig1);
+    if (!sig_equal(&sig0, &sig1)) ok = 0;
+    p.tev.stage[0].texmap = 1;
+    build_sig(&p, true, &sig1);
+    if (sig_equal(&sig0, &sig1)) ok = 0;
+
+    p.shader_cache[0].sig = sig0;
+    p.shader_cache[0].bound.valid = true;
+    p.shader_cache[0].last_used = 1;
+    if (cache_slot_for(&p, &sig0) != 0) ok = 0;
+    if (cache_slot_for(&p, &sig1) != 1) ok = 0;
+    GXDrawShaderCacheStats cache_stats = gx_draw_shader_cache_stats(&p);
+    if (cache_stats.entries != 2 || cache_stats.hits != 1 || cache_stats.misses != 1)
+        ok = 0;
 
     gx_draw_shutdown(&p);
     return ok;
