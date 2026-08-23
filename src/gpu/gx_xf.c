@@ -3,6 +3,7 @@
 
 #include "gpu/gx_xf.h"
 
+#include <math.h>
 #include <string.h>
 
 static inline uint32_t bits(uint32_t v, unsigned lo, unsigned n) {
@@ -30,6 +31,18 @@ static void decode_texmtx(XfTexMtxInfo *tm, uint32_t v) {
     tm->emboss_light  = (uint8_t)bits(v, 15, 3);
 }
 
+// LitChannel bit layout (Dolphin XFMemory.h)
+static void decode_litchan(XfLitChannel *lc, uint32_t v) {
+    lc->matsource      = (uint8_t)bits(v, 0, 1);
+    lc->enablelighting = (uint8_t)bits(v, 1, 1);
+    lc->ambsource      = (uint8_t)bits(v, 6, 1);
+    lc->diffusefunc    = (uint8_t)bits(v, 7, 2);
+    lc->attnfunc       = (uint8_t)bits(v, 9, 2);
+    uint32_t m0_3 = bits(v, 2, 4);
+    uint32_t m4_7 = bits(v, 11, 4);
+    lc->light_mask = lc->enablelighting ? (uint8_t)(m0_3 | (m4_7 << 4)) : 0;
+}
+
 void gx_xf_reset(XfConfig *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->projection_type = GX_XF_PERSPECTIVE;
@@ -55,6 +68,17 @@ static void write_reg(XfConfig *cfg, uint16_t addr, uint32_t word) {
         cfg->post_matrices[addr - XF_POSTMATRICES] = u32_to_f(word);
         return;
     }
+    if (addr >= XF_LIGHTS && addr < XF_LIGHTS_END) {
+        uint32_t rel = (uint32_t)addr - XF_LIGHTS;
+        XfLight *L = &cfg->lights[rel >> 4];
+        uint32_t off = rel & 0x0Fu;
+        if (off == 3)                    L->color = word;
+        else if (off >= 4 && off <= 6)   L->cosatt[off - 4]  = u32_to_f(word);
+        else if (off >= 7 && off <= 9)   L->distatt[off - 7] = u32_to_f(word);
+        else if (off >= 10 && off <= 12) L->pos[off - 10]    = u32_to_f(word);
+        else if (off >= 13 && off <= 15) L->dir[off - 13]    = u32_to_f(word);
+        return;
+    }
     if (addr >= XF_SETVIEWPORT && addr < XF_SETVIEWPORT + 6) {
         cfg->viewport[addr - XF_SETVIEWPORT] = u32_to_f(word);
         return;
@@ -70,6 +94,14 @@ static void write_reg(XfConfig *cfg, uint16_t addr, uint32_t word) {
         case XF_SETNUMCHAN:
             cfg->num_color_chans = bits(word, 0, 2);
             return;
+        case XF_SETCHAN0_AMBCOLOR: cfg->amb_color[0] = word; return;
+        case XF_SETCHAN1_AMBCOLOR: cfg->amb_color[1] = word; return;
+        case XF_SETCHAN0_MATCOLOR: cfg->mat_color[0] = word; return;
+        case XF_SETCHAN1_MATCOLOR: cfg->mat_color[1] = word; return;
+        case XF_SETCHAN0_COLOR: decode_litchan(&cfg->color_chan[0], word); return;
+        case XF_SETCHAN1_COLOR: decode_litchan(&cfg->color_chan[1], word); return;
+        case XF_SETCHAN0_ALPHA: decode_litchan(&cfg->alpha_chan[0], word); return;
+        case XF_SETCHAN1_ALPHA: decode_litchan(&cfg->alpha_chan[1], word); return;
         case XF_SETNUMTEXGENS:
             cfg->num_texgens = bits(word, 0, 4);
             return;
@@ -165,6 +197,78 @@ void gx_xf_build_texmtx_cfile(const XfConfig *cfg, uint32_t texmtx_index, bool s
     out[0] = m0[0];            out[1] = m1[0];            out[2]  = stq ? m2[0] : 0.0f;            out[3]  = 0.0f;
     out[4] = m0[1];            out[5] = m1[1];            out[6]  = stq ? m2[1] : 0.0f;            out[7]  = 0.0f;
     out[8] = m0[2] + m0[3];    out[9] = m1[2] + m1[3];    out[10] = stq ? (m2[2] + m2[3]) : 1.0f;  out[11] = 0.0f;
+}
+
+static uint8_t popcount8(uint8_t v) {
+    uint8_t n = 0;
+    while (v) { n += (uint8_t)(v & 1u); v >>= 1; }
+    return n;
+}
+
+bool gx_xf_lighting_desc(const XfConfig *cfg, uint32_t chan, XfLightDesc *out) {
+    memset(out, 0, sizeof(*out));
+    if (chan >= 2) return false;
+    const XfLitChannel *cc = &cfg->color_chan[chan];
+    out->enable = cc->enablelighting != 0;
+    if (!out->enable) return true;
+    out->num_lights      = popcount8(cc->light_mask);
+    out->diffuse         = cc->diffusefunc != GX_XF_DF_NONE;
+    out->clamp           = cc->diffusefunc == GX_XF_DF_CLAMP;
+    out->mat_from_vertex = cc->matsource == GX_XF_MATSRC_VTX;
+    out->amb_from_vertex = cc->ambsource == GX_XF_AMBSRC_VTX;
+    return true;
+}
+
+static void rgba8_to_f(uint32_t w, float out[4]) {
+    out[0] = (float)((w >> 24) & 0xFFu) / 255.0f;
+    out[1] = (float)((w >> 16) & 0xFFu) / 255.0f;
+    out[2] = (float)((w >> 8)  & 0xFFu) / 255.0f;
+    out[3] = (float)(w & 0xFFu) / 255.0f;
+}
+
+int gx_xf_build_light_cfile(const XfConfig *cfg, uint32_t chan, uint32_t pos_mtx_index,
+                            float *out, int cap) {
+    if (chan >= 2) return 0;
+    const XfLitChannel *cc = &cfg->color_chan[chan];
+    if (!cc->enablelighting) return 0;
+    uint8_t nlights = popcount8(cc->light_mask);
+    if (nlights > GX_XF_NUM_LIGHTS) nlights = GX_XF_NUM_LIGHTS;
+
+    int regs = 5 + 2 * (int)nlights;
+    if (cap < regs * 4) return 0;
+    memset(out, 0, (size_t)regs * 4 * sizeof(float));
+
+    float pos[16];
+    gx_xf_position_matrix(cfg, pos_mtx_index, pos);
+    for (int i = 0; i < 3; ++i)          // input component
+        for (int c = 0; c < 3; ++c)      // output channel
+            out[i * 4 + c] = pos[c * 4 + i];
+
+    // reg 3
+    rgba8_to_f(cfg->mat_color[chan], &out[3 * 4]);
+    // reg 4
+    rgba8_to_f(cfg->amb_color[chan], &out[4 * 4]);
+
+    // regs 5+2j / 6+2j
+    int j = 0;
+    for (int li = 0; li < GX_XF_NUM_LIGHTS && j < nlights; ++li) {
+        if (!(cc->light_mask & (1u << li))) continue;
+        const XfLight *L = &cfg->lights[li];
+        float *dir = &out[(5 + 2 * j) * 4];
+        float len = sqrtf(L->pos[0] * L->pos[0] + L->pos[1] * L->pos[1] +
+                          L->pos[2] * L->pos[2]);
+        if (len > 1e-8f) {
+            dir[0] = L->pos[0] / len;
+            dir[1] = L->pos[1] / len;
+            dir[2] = L->pos[2] / len;
+        }
+        float col[4];
+        rgba8_to_f(L->color, col);
+        float *cout = &out[(6 + 2 * j) * 4];
+        cout[0] = col[0]; cout[1] = col[1]; cout[2] = col[2];
+        ++j;
+    }
+    return regs * 4;
 }
 
 // Self test
@@ -396,6 +500,130 @@ int gx_xf_selftest(void) {
             gx_xf_apply_xf(&t, XF_SETTEXMTXINFO + 3, 1, td);
             if (gx_xf_texgen_is_regular(&t, 3)) return 0;
         }
+    }
+
+    // Lighting: ambient/material colours, channel control, and a light object.
+    {
+        XfConfig t;
+        gx_xf_reset(&t);
+
+        uint8_t d[4];
+        put_u(d, 0x11223344u);
+        gx_xf_apply_xf(&t, XF_SETCHAN0_AMBCOLOR, 1, d);
+        put_u(d, 0xAABBCCDDu);
+        gx_xf_apply_xf(&t, XF_SETCHAN0_MATCOLOR, 1, d);
+        if (t.amb_color[0] != 0x11223344u || t.mat_color[0] != 0xAABBCCDDu) return 0;
+
+        // Colour channel control: matsource=vtx(1), enablelighting=1,
+        // lightMask0_3=0b0101 (lights 0 and 2), ambsource=reg(0),
+        // diffusefunc=Clamp(2), attnfunc=Spot(3), lightMask4_7=0b0001 (light 4).
+        uint32_t lc = (uint32_t)GX_XF_MATSRC_VTX << 0 |
+                      (uint32_t)1u << 1 |
+                      (uint32_t)0x5u << 2 |
+                      (uint32_t)GX_XF_AMBSRC_REG << 6 |
+                      (uint32_t)GX_XF_DF_CLAMP << 7 |
+                      (uint32_t)GX_XF_AF_SPOT << 9 |
+                      (uint32_t)0x1u << 11;
+        put_u(d, lc);
+        gx_xf_apply_xf(&t, XF_SETCHAN0_COLOR, 1, d);
+        const XfLitChannel *cc = &t.color_chan[0];
+        if (cc->matsource != GX_XF_MATSRC_VTX || cc->enablelighting != 1) return 0;
+        if (cc->ambsource != GX_XF_AMBSRC_REG || cc->diffusefunc != GX_XF_DF_CLAMP) return 0;
+        if (cc->attnfunc != GX_XF_AF_SPOT) return 0;
+        if (cc->light_mask != (uint8_t)(0x5u | (0x1u << 4))) return 0;  // 0x15
+
+        uint32_t lc_off = (uint32_t)0xFu << 2 | (uint32_t)0xFu << 11;
+        put_u(d, lc_off);
+        gx_xf_apply_xf(&t, XF_SETCHAN0_ALPHA, 1, d);
+        if (t.alpha_chan[0].enablelighting != 0 || t.alpha_chan[0].light_mask != 0) return 0;
+
+        uint8_t ld[13 * 4];
+        put_u(&ld[0], 0xDEADBEEFu);
+        float cos[3] = {1.0f, 0.0f, 0.0f};
+        float dist[3] = {1.0f, 0.5f, 0.25f};
+        float pos[3] = {10.0f, 20.0f, 30.0f};
+        float dir[3] = {-1.0f, 0.0f, 0.0f};
+        for (int i = 0; i < 3; ++i) put_f(&ld[(1 + i) * 4], cos[i]);   // off 4..6
+        for (int i = 0; i < 3; ++i) put_f(&ld[(4 + i) * 4], dist[i]);  // off 7..9
+        for (int i = 0; i < 3; ++i) put_f(&ld[(7 + i) * 4], pos[i]);   // off 10..12
+        for (int i = 0; i < 3; ++i) put_f(&ld[(10 + i) * 4], dir[i]);  // off 13..15
+        gx_xf_apply_xf(&t, XF_LIGHTS + 16 + 3, 13, ld);
+        const XfLight *L = &t.lights[1];
+        if (L->color != 0xDEADBEEFu) return 0;
+        if (L->cosatt[0] != 1.0f || L->distatt[1] != 0.5f || L->distatt[2] != 0.25f) return 0;
+        if (L->pos[0] != 10.0f || L->pos[2] != 30.0f || L->dir[0] != -1.0f) return 0;
+        if (t.lights[0].color != 0 || t.lights[0].pos[0] != 0.0f) return 0;
+    }
+
+    // VS uniform cfile builder.
+    {
+        XfConfig t;
+        gx_xf_reset(&t);
+
+        uint8_t d[4];
+        uint32_t lc = (uint32_t)GX_XF_MATSRC_REG << 0 |
+                      (uint32_t)1u << 1 |
+                      (uint32_t)0x1u << 2 |
+                      (uint32_t)GX_XF_AMBSRC_REG << 6 |
+                      (uint32_t)GX_XF_DF_CLAMP << 7;
+        put_u(d, lc);
+        gx_xf_apply_xf(&t, XF_SETCHAN0_COLOR, 1, d);
+        put_u(d, 0x80402010u);
+        gx_xf_apply_xf(&t, XF_SETCHAN0_MATCOLOR, 1, d);
+        put_u(d, 0x20304000u);
+        gx_xf_apply_xf(&t, XF_SETCHAN0_AMBCOLOR, 1, d);
+
+        XfLightDesc desc;
+        if (!gx_xf_lighting_desc(&t, 0, &desc)) return 0;
+        if (!desc.enable || desc.num_lights != 1 || !desc.diffuse || !desc.clamp) return 0;
+        if (desc.mat_from_vertex || desc.amb_from_vertex) return 0;
+
+        uint8_t ld[13 * 4];
+        float cosa[3] = {1, 0, 0}, dist[3] = {1, 0, 0};
+        float lpos[3] = {0, 0, -2}, ldir[3] = {0, 0, 0};
+        put_u(&ld[0], 0xFFFFFF00u);
+        for (int i = 0; i < 3; ++i) put_f(&ld[(1 + i) * 4], cosa[i]);
+        for (int i = 0; i < 3; ++i) put_f(&ld[(4 + i) * 4], dist[i]);
+        for (int i = 0; i < 3; ++i) put_f(&ld[(7 + i) * 4], lpos[i]);
+        for (int i = 0; i < 3; ++i) put_f(&ld[(10 + i) * 4], ldir[i]);
+        gx_xf_apply_xf(&t, XF_LIGHTS + 3, 13, ld);  // light 0, from word 3
+
+        float cf[64];
+        int nf = gx_xf_build_light_cfile(&t, 0, 0, cf, 64);
+        if (nf != (5 + 2) * 4) return 0;
+
+        if (cf[0 * 4 + 0] != 1.0f || cf[1 * 4 + 1] != 1.0f || cf[2 * 4 + 2] != 1.0f) return 0;
+        if (cf[0 * 4 + 1] != 0.0f || cf[0 * 4 + 2] != 0.0f) return 0;
+        // Material / ambient reg3 / reg4
+        if (fabsf(cf[3 * 4 + 0] - 128.0f / 255.0f) > 1e-4f) return 0;
+        if (fabsf(cf[3 * 4 + 2] - 32.0f / 255.0f) > 1e-4f) return 0;
+        if (fabsf(cf[4 * 4 + 2] - 64.0f / 255.0f) > 1e-4f) return 0;
+        // Light dir reg5 normalised, colour reg6 white
+        if (cf[5 * 4 + 0] != 0.0f || fabsf(cf[5 * 4 + 2] + 1.0f) > 1e-4f) return 0;
+        if (fabsf(cf[6 * 4 + 0] - 1.0f) > 1e-4f) return 0;
+
+        float N[3] = {0, 0, -1};
+        float np[3];
+        for (int c = 0; c < 3; ++c)
+            np[c] = N[0] * cf[0 * 4 + c] + N[1] * cf[1 * 4 + c] + N[2] * cf[2 * 4 + c];
+        float ndotl = np[0] * cf[5 * 4 + 0] + np[1] * cf[5 * 4 + 1] + np[2] * cf[5 * 4 + 2];
+        if (ndotl < 0.0f) ndotl = 0.0f;
+        float res[3];
+        for (int c = 0; c < 3; ++c) {
+            float lacc = cf[4 * 4 + c] + ndotl * cf[6 * 4 + c];
+            if (lacc < 0.0f) lacc = 0.0f;
+            if (lacc > 1.0f) lacc = 1.0f;
+            res[c] = cf[3 * 4 + c] * lacc;
+        }
+        if (fabsf(res[0] - 128.0f / 255.0f) > 1e-4f) return 0;
+        if (fabsf(res[1] - 64.0f / 255.0f) > 1e-4f) return 0;
+        if (fabsf(res[2] - 32.0f / 255.0f) > 1e-4f) return 0;
+
+        XfConfig u;
+        gx_xf_reset(&u);
+        XfLightDesc off;
+        if (!gx_xf_lighting_desc(&u, 0, &off) || off.enable) return 0;
+        if (gx_xf_build_light_cfile(&u, 0, 0, cf, 64) != 0) return 0;
     }
 
     return 1;

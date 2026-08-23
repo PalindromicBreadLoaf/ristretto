@@ -24,6 +24,15 @@ static const uint8_t kCoord2D[4] = {R700_SEL_X, R700_SEL_Y, R700_SEL_0, R700_SEL
 
 #define R700_EXPORT_POS0 60
 
+// Lighting VS uniform (cfile) registers
+#define LIGHT_NRM0  (SHADER_GEN_LIGHT_CFILE_BASE + 0)
+#define LIGHT_NRM1  (SHADER_GEN_LIGHT_CFILE_BASE + 1)
+#define LIGHT_NRM2  (SHADER_GEN_LIGHT_CFILE_BASE + 2)
+#define LIGHT_MAT   (SHADER_GEN_LIGHT_CFILE_BASE + 3)
+#define LIGHT_AMB   (SHADER_GEN_LIGHT_CFILE_BASE + 4)
+#define LIGHT_DIR(j) (SHADER_GEN_LIGHT_CFILE_BASE + 5 + 2u * (j))
+#define LIGHT_COL(j) (SHADER_GEN_LIGHT_CFILE_BASE + 6 + 2u * (j))
+
 size_t shader_gen_vs(uint8_t *buf, size_t cap, const ShaderGenVs *cfg)
 {
     if (!buf || !cfg) return 0;
@@ -35,7 +44,7 @@ size_t shader_gen_vs(uint8_t *buf, size_t cap, const ShaderGenVs *cfg)
     r700_prog_cf(&p, r700_cf(0, R700_CF_CALL_FS, 0, false, false, false));
 
     // ALU
-    R700Inst64 alu[128];
+    R700Inst64 alu[256];
     uint32_t n = 0;
 
     // PV = 1.0 * col3
@@ -69,10 +78,101 @@ size_t shader_gen_vs(uint8_t *buf, size_t cap, const ShaderGenVs *cfg)
                                 R700_ALU_SRC_PV, c, false,
                                 false, c == 3);
 
+    // Per-vertex diffuse lighting for colour channel 0.
+    if (cfg->light.enable) {
+        uint32_t norm_gpr = 2u + (cfg->has_color ? 1u : 0u);
+        uint32_t in_count = 1u + (cfg->has_color ? 1u : 0u) +
+                            (cfg->has_normal ? 1u : 0u) + cfg->num_texcoords;
+        uint32_t ntN  = in_count + 1u;  // transformed normal scratch
+        uint32_t lacc = in_count + 2u;  // light accumulator scratch
+
+        for (uint32_t c = 0; c < 3; ++c)
+            alu[n++] = r700_alu_op2(R700_OP2_MUL, 0, c,
+                                    norm_gpr, R700_CHAN_X, false,
+                                    R700_ALU_SRC_CFILE(LIGHT_NRM0), c, false,
+                                    false, false, c == 2);
+        for (uint32_t c = 0; c < 3; ++c)
+            alu[n++] = r700_alu_op3(R700_OP3_MULADD, 127, c,
+                                    norm_gpr, R700_CHAN_Y, false,
+                                    R700_ALU_SRC_CFILE(LIGHT_NRM1), c, false,
+                                    R700_ALU_SRC_PV, c, false,
+                                    false, c == 2);
+        for (uint32_t c = 0; c < 3; ++c)
+            alu[n++] = r700_alu_op3(R700_OP3_MULADD, ntN, c,
+                                    norm_gpr, R700_CHAN_Z, false,
+                                    R700_ALU_SRC_CFILE(LIGHT_NRM2), c, false,
+                                    R700_ALU_SRC_PV, c, false,
+                                    false, c == 2);
+
+        // lacc.rgb = ambient
+        for (uint32_t c = 0; c < 3; ++c) {
+            uint32_t asel = cfg->light.amb_from_vertex
+                                ? 2u : R700_ALU_SRC_CFILE(LIGHT_AMB);
+            alu[n++] = r700_alu_op2(R700_OP2_MOV, lacc, c,
+                                    asel, c, false, R700_ALU_SRC_0, 0, false,
+                                    false, true, c == 2);
+        }
+
+        // Accumulate each directional light
+        for (uint32_t j = 0; j < cfg->light.num_lights; ++j) {
+            if (cfg->light.diffuse) {
+                alu[n++] = r700_alu_op2(R700_OP2_MUL, 0, R700_CHAN_X,
+                                        ntN, R700_CHAN_X, false,
+                                        R700_ALU_SRC_CFILE(LIGHT_DIR(j)), R700_CHAN_X, false,
+                                        false, false, true);
+                alu[n++] = r700_alu_op3(R700_OP3_MULADD, 127, R700_CHAN_X,
+                                        ntN, R700_CHAN_Y, false,
+                                        R700_ALU_SRC_CFILE(LIGHT_DIR(j)), R700_CHAN_Y, false,
+                                        R700_ALU_SRC_PV, R700_CHAN_X, false,
+                                        false, true);
+                alu[n++] = r700_alu_op3(R700_OP3_MULADD, 127, R700_CHAN_X,
+                                        ntN, R700_CHAN_Z, false,
+                                        R700_ALU_SRC_CFILE(LIGHT_DIR(j)), R700_CHAN_Z, false,
+                                        R700_ALU_SRC_PV, R700_CHAN_X, false,
+                                        false, true);
+                if (cfg->light.clamp)  // max(0, N.L)
+                    alu[n++] = r700_alu_op2(R700_OP2_MAX, 0, R700_CHAN_X,
+                                            R700_ALU_SRC_PV, R700_CHAN_X, false,
+                                            R700_ALU_SRC_0, 0, false,
+                                            false, false, true);
+                for (uint32_t c = 0; c < 3; ++c)
+                    alu[n++] = r700_alu_op3(R700_OP3_MULADD, lacc, c,
+                                            R700_ALU_SRC_PV, R700_CHAN_X, false,
+                                            R700_ALU_SRC_CFILE(LIGHT_COL(j)), c, false,
+                                            lacc, c, false,
+                                            false, c == 2);
+            } else {
+                for (uint32_t c = 0; c < 3; ++c)
+                    alu[n++] = r700_alu_op2(R700_OP2_ADD, lacc, c,
+                                            lacc, c, false,
+                                            R700_ALU_SRC_CFILE(LIGHT_COL(j)), c, false,
+                                            false, true, c == 2);
+            }
+        }
+
+        for (uint32_t c = 0; c < 3; ++c)
+            alu[n++] = r700_alu_op2(R700_OP2_MAX, lacc, c,
+                                    lacc, c, false, R700_ALU_SRC_0, 0, false,
+                                    false, true, c == 2);
+        for (uint32_t c = 0; c < 3; ++c)
+            alu[n++] = r700_alu_op2(R700_OP2_MIN, lacc, c,
+                                    lacc, c, false, R700_ALU_SRC_1, 0, false,
+                                    false, true, c == 2);
+
+        for (uint32_t c = 0; c < 3; ++c) {
+            uint32_t msel = cfg->light.mat_from_vertex
+                                ? 2u : R700_ALU_SRC_CFILE(LIGHT_MAT);
+            alu[n++] = r700_alu_op2(R700_OP2_MUL, 2, c,
+                                    msel, c, false, lacc, c, false,
+                                    false, true, c == 2);
+        }
+    }
+
     // Regular matrix texgen
     for (uint32_t k = 0; k < cfg->num_texcoords; ++k) {
         if (!cfg->texgen[k]) continue;
-        uint32_t g = 2u + (cfg->has_color ? 1u : 0u) + k;
+        uint32_t g = 2u + (cfg->has_color ? 1u : 0u) +
+                     (cfg->has_normal ? 1u : 0u) + k;
         uint32_t b = 4u + 3u * k;
         // PV = coord.x * row0
         for (uint32_t c = 0; c < 3; ++c)
@@ -96,29 +196,29 @@ size_t shader_gen_vs(uint8_t *buf, size_t cap, const ShaderGenVs *cfg)
                                     false, c == 2);
     }
 
+    if (n > 128) return 0;
     if (!r700_prog_alu_clause(&p, alu, n, true)) return 0;
 
     uint32_t nparam = (cfg->has_color ? 1u : 0u) + cfg->num_texcoords;
     r700_prog_cf(&p, r700_cf_export(R700_EXPORT_POS, R700_EXPORT_POS0, 1, kSelXYZW,
                                     nparam == 0, true, R700_CF_EXPORT_DONE));
 
-    uint32_t base = 0, gpr = 2, emitted = 0;
+    uint32_t tc_gpr0 = 2u + (cfg->has_color ? 1u : 0u) + (cfg->has_normal ? 1u : 0u);
+    uint32_t base = 0, emitted = 0;
     if (cfg->has_color) {
         bool last = emitted + 1 == nparam;
-        r700_prog_cf(&p, r700_cf_export(R700_EXPORT_PARAM, base, gpr, kSelXYZW,
+        r700_prog_cf(&p, r700_cf_export(R700_EXPORT_PARAM, base, 2, kSelXYZW,
                                         last, false,
                                         last ? R700_CF_EXPORT_DONE : R700_CF_EXPORT));
         ++base;
-        ++gpr;
         ++emitted;
     }
     for (uint32_t k = 0; k < cfg->num_texcoords; ++k) {
         bool last = emitted + 1 == nparam;
-        r700_prog_cf(&p, r700_cf_export(R700_EXPORT_PARAM, base, gpr, kSelXY00,
+        r700_prog_cf(&p, r700_cf_export(R700_EXPORT_PARAM, base, tc_gpr0 + k, kSelXY00,
                                         last, false,
                                         last ? R700_CF_EXPORT_DONE : R700_CF_EXPORT));
         ++base;
-        ++gpr;
         ++emitted;
     }
 
@@ -172,11 +272,12 @@ void shader_gen_vs_shape(const ShaderGenVs *cfg, Gx2VsShape *out)
     memset(out, 0, sizeof(*out));
     uint32_t inputs = 1;  // position
     out->input_semantics[0] = 0;
-    if (cfg->has_color) out->input_semantics[inputs++] = 1;
+    if (cfg->has_color)  out->input_semantics[inputs] = (uint8_t)inputs, ++inputs;
+    if (cfg->has_normal) out->input_semantics[inputs] = (uint8_t)inputs, ++inputs;
     for (uint32_t k = 0; k < cfg->num_texcoords; ++k)
-        out->input_semantics[inputs++] = (uint8_t)(2 + k);
+        out->input_semantics[inputs] = (uint8_t)inputs, ++inputs;
     out->num_inputs = inputs;
-    out->num_gprs = inputs + 1;  // R0 plus one GPR per attribute
+    out->num_gprs = inputs + 1 + (cfg->light.enable ? 2u : 0u);
     out->stack_size = 1;
 
     // Param semantics are consecutive so they line up with the pixel shader's
@@ -402,6 +503,28 @@ bool shader_gen_selftest(void)
     ShaderGenVs pass2_cfg = {.has_color = true, .num_texcoords = 2};
     size_t pass2_size = shader_gen_vs(vs_buf, sizeof(vs_buf), &pass2_cfg);
     if (pass2_size == 0 || tg2_size != pass2_size + 72) return false;
+
+    // Per-vertex diffuse lighting VS
+    ShaderGenVs lit_cfg = {.has_color = true, .has_normal = true,
+                           .transform_position = true, .num_texcoords = 0,
+                           .light = {.enable = true, .num_lights = 1,
+                                     .diffuse = true, .clamp = true}};
+    size_t lit_size = shader_gen_vs(vs_buf, sizeof(vs_buf), &lit_cfg);
+    if (lit_size == 0) return false;
+    if (count_param_exports(vs_buf, lit_size) != 1) return false;
+
+    Gx2VsShape lit_shape;
+    shader_gen_vs_shape(&lit_cfg, &lit_shape);
+    if (lit_shape.num_inputs != 3 || lit_shape.num_exports != 1 ||
+        lit_shape.num_gprs != 6)
+        return false;
+    Gx2VsRegs lit_regs;
+    if (!gx2_vs_regs(&lit_regs, &lit_shape)) return false;
+
+    ShaderGenVs lit2_cfg = lit_cfg;
+    lit2_cfg.light.num_lights = 2;
+    size_t lit2_size = shader_gen_vs(vs_buf, sizeof(vs_buf), &lit2_cfg);
+    if (lit2_size == 0 || lit2_size != lit_size + 7 * 8) return false;
 
     return true;
 }
