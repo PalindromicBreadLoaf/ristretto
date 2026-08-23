@@ -44,6 +44,7 @@
 #include "gpu/tev_shader_gen.h"
 #include "gpu/tev_modulate_shader.h"
 #include "gpu/xfb_present.h"
+#include "ios/es_formats.h"
 #include "ios/ios_ipc.h"
 #include "mem/wii_memory.h"
 #include "mem/wii_mmio.h"
@@ -583,6 +584,10 @@ int main(int argc, char **argv) {
         case IOS_IPC_SELFTEST_FAIL: WHBLogPrint("ios_ipc selftest: FAIL"); break;
     }
     ios_ipc_vwii_nand_spike();
+    if (ios_ipc_vwii_nand_available())
+        WHBLogPrintf("vwii nand backing selftest: %s",
+                     ios_ipc_vwii_nand_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("es_formats selftest: %s", es_formats_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("disc selftest: %s", disc_selftest() ? "PASS" : "FAIL");
     tryMountDiscFromSd();
     WHBLogPrintf("wii_vi selftest: %s", wii_vi_selftest() ? "PASS" : "FAIL");
@@ -779,6 +784,7 @@ exit:
         disc_close(&g_disc);
         WHBUnmountSdCard();
     }
+    ios_ipc_shutdown();
     wii_mem_shutdown();
     WHBGfxShutdown();
     WHBLogUdpDeinit();
