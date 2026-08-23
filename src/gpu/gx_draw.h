@@ -52,7 +52,8 @@ typedef struct {
     uint32_t         count;
     uint32_t         ntc;
     uint8_t          slots[8];   // distinct sampled texcoord slots, ascending
-    float            vs_cfile[16];
+    float            vs_cfile[16 + 12 * 8];
+    uint32_t         vs_cfile_count;   // floats to upload
     GXDepthState     depth;
     GXBlendState     blend;
     GXCullState      cull;
@@ -67,6 +68,7 @@ typedef struct {
     TevStage stage[GX_TEV_MAX_STAGES];
     uint8_t  swap[4][4];
     uint8_t  tex_slot[8];   // distinct sampled texcoord slots
+    bool     texgen[8];
 } GXDrawShaderSig;
 
 typedef struct {
@@ -79,6 +81,7 @@ typedef struct {
     GXRenderState render;    // fixed-function render-state BP registers
     GXArrayTable  arr;       // CP array bases/strides for indexed attributes
     uint32_t      geom_mtx_index;   // MATINDEX_A position/normal matrix index
+    uint8_t       tex_mtx_index[8]; // MATINDEX_A/B per-texcoord texture matrix index
 
     // The currently bound shader trio and what it was built for.
     Gx2BoundShader  bound;

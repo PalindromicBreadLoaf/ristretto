@@ -84,6 +84,14 @@ void gx_xf_position_matrix(const XfConfig *cfg, uint32_t mtx_index, float out[16
 // Build the transform VS's uniform matrix.
 void gx_xf_build_vs_cfile(const XfConfig *cfg, uint32_t mtx_index, float out[16]);
 
+// Build the 3 cfile rows (12 floats) a regular matrix texgen consumes in the VS.
+void gx_xf_build_texmtx_cfile(const XfConfig *cfg, uint32_t texmtx_index, bool stq,
+                              float out[12]);
+
+// True when texgen slot `tc` is a regular matrix texgen sourced from its own
+// texcoord input.
+bool gx_xf_texgen_is_regular(const XfConfig *cfg, uint32_t tc);
+
 int gx_xf_selftest(void);
 
 #ifdef __cplusplus

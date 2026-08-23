@@ -139,6 +139,34 @@ void gx_xf_build_vs_cfile(const XfConfig *cfg, uint32_t mtx_index, float out[16]
             out[i * 4 + c] = clip[c * 4 + i];
 }
 
+// SourceRow (Dolphin XFMemory.h)
+enum { GX_XF_SRCROW_TEX0 = 5 };
+
+bool gx_xf_texgen_is_regular(const XfConfig *cfg, uint32_t tc) {
+    if (tc >= GX_XF_MAX_TEXGENS) return false;
+    const XfTexMtxInfo *tm = &cfg->texmtx[tc];
+    return tm->texgentype == GX_XF_TG_REGULAR &&
+           tm->sourcerow == (uint8_t)(GX_XF_SRCROW_TEX0 + tc);
+}
+
+void gx_xf_build_texmtx_cfile(const XfConfig *cfg, uint32_t texmtx_index, bool stq,
+                              float out[12]) {
+    uint32_t base = texmtx_index * 4u;
+    float m0[4] = {0}, m1[4] = {0}, m2[4] = {0};
+    if (base + 12u <= 256u) {
+        for (int c = 0; c < 4; ++c) {
+            m0[c] = cfg->pos_matrices[base + 0 + c];
+            m1[c] = cfg->pos_matrices[base + 4 + c];
+            m2[c] = cfg->pos_matrices[base + 8 + c];
+        }
+    }
+    // row0 = coord.x coefficients, row1 = coord.y, row2 = folded constant term
+    // (columns 2 and 3, since coord.z = coord.w = 1).
+    out[0] = m0[0];            out[1] = m1[0];            out[2]  = stq ? m2[0] : 0.0f;            out[3]  = 0.0f;
+    out[4] = m0[1];            out[5] = m1[1];            out[6]  = stq ? m2[1] : 0.0f;            out[7]  = 0.0f;
+    out[8] = m0[2] + m0[3];    out[9] = m1[2] + m1[3];    out[10] = stq ? (m2[2] + m2[3]) : 1.0f;  out[11] = 0.0f;
+}
+
 // Self test
 static void put_f(uint8_t *p, float f) {
     uint32_t u;
@@ -304,6 +332,69 @@ int gx_xf_selftest(void) {
             for (int i = 0; i < 4; ++i) got += v[i] * cfile[i * 4 + c];
             float diff = got - want[c];
             if (diff < -1e-4f || diff > 1e-4f) return 0;
+        }
+    }
+
+    // Regular matrix texgen cfile.
+    {
+        XfConfig t;
+        gx_xf_reset(&t);
+
+        float tm[12] = {
+            2.0f, 0.0f, 0.0f, 0.25f,
+            0.0f, 3.0f, 0.0f, -0.5f,
+            0.0f, 0.0f, 1.0f, 0.75f,
+        };
+        uint8_t d[12 * 4];
+        for (int i = 0; i < 12; ++i) put_f(&d[i * 4], tm[i]);
+        gx_xf_apply_xf(&t, XF_POSMATRICES + 6 * 4, 12, d);
+
+        const float s = 0.4f, tt = 0.6f;  // input coord (s, t, 1, 1)
+        const float coord[4] = {s, tt, 1.0f, 1.0f};
+
+        // STQ
+        float cf[12];
+        gx_xf_build_texmtx_cfile(&t, 6, true, cf);
+        for (int c = 0; c < 3; ++c) {
+            float got = s * cf[0 + c] + tt * cf[4 + c] + 1.0f * cf[8 + c];
+            float want = 0.0f;
+            for (int i = 0; i < 4; ++i) want += tm[c * 4 + i] * coord[i];
+            float diff = got - want;
+            if (diff < -1e-4f || diff > 1e-4f) return 0;
+        }
+
+        // ST
+        gx_xf_build_texmtx_cfile(&t, 6, false, cf);
+        {
+            float qs = s * cf[0 + 0] + tt * cf[4 + 0] + cf[8 + 0];
+            float qt = s * cf[0 + 1] + tt * cf[4 + 1] + cf[8 + 1];
+            float qq = s * cf[0 + 2] + tt * cf[4 + 2] + cf[8 + 2];
+            if (qs - (2.0f * s + 0.25f) < -1e-4f || qs - (2.0f * s + 0.25f) > 1e-4f) return 0;
+            if (qt - (3.0f * tt - 0.5f) < -1e-4f || qt - (3.0f * tt - 0.5f) > 1e-4f) return 0;
+            if (qq - 1.0f < -1e-4f || qq - 1.0f > 1e-4f) return 0;
+        }
+
+        // Default identity matrix
+        gx_xf_build_texmtx_cfile(&t, 0, false, cf);
+        {
+            float qs = s * cf[0 + 0] + tt * cf[4 + 0] + cf[8 + 0];
+            float qt = s * cf[0 + 1] + tt * cf[4 + 1] + cf[8 + 1];
+            if (qs - s < -1e-4f || qs - s > 1e-4f) return 0;
+            if (qt - tt < -1e-4f || qt - tt > 1e-4f) return 0;
+        }
+
+        // texgen classification
+        {
+            uint8_t td[4];
+            uint32_t tmi = (uint32_t)GX_XF_TG_REGULAR << 4 |
+                           (uint32_t)(5u + 2u) << 7;  // sourcerow = Tex2
+            put_u(td, tmi);
+            gx_xf_apply_xf(&t, XF_SETTEXMTXINFO + 2, 1, td);
+            if (!gx_xf_texgen_is_regular(&t, 2)) return 0;
+            uint32_t cmi = (uint32_t)GX_XF_TG_COLOR0 << 4 | (uint32_t)2u << 7;
+            put_u(td, cmi);
+            gx_xf_apply_xf(&t, XF_SETTEXMTXINFO + 3, 1, td);
+            if (gx_xf_texgen_is_regular(&t, 3)) return 0;
         }
     }
 

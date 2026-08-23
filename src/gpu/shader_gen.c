@@ -35,7 +35,7 @@ size_t shader_gen_vs(uint8_t *buf, size_t cap, const ShaderGenVs *cfg)
     r700_prog_cf(&p, r700_cf(0, R700_CF_CALL_FS, 0, false, false, false));
 
     // ALU
-    R700Inst64 alu[20];
+    R700Inst64 alu[128];
     uint32_t n = 0;
 
     // PV = 1.0 * col3
@@ -68,6 +68,33 @@ size_t shader_gen_vs(uint8_t *buf, size_t cap, const ShaderGenVs *cfg)
                                 R700_ALU_SRC_CFILE(0), c, false,
                                 R700_ALU_SRC_PV, c, false,
                                 false, c == 3);
+
+    // Regular matrix texgen
+    for (uint32_t k = 0; k < cfg->num_texcoords; ++k) {
+        if (!cfg->texgen[k]) continue;
+        uint32_t g = 2u + (cfg->has_color ? 1u : 0u) + k;
+        uint32_t b = 4u + 3u * k;
+        // PV = coord.x * row0
+        for (uint32_t c = 0; c < 3; ++c)
+            alu[n++] = r700_alu_op2(R700_OP2_MUL, 0, c,
+                                    g, R700_CHAN_X, false,
+                                    R700_ALU_SRC_CFILE(b + 0), c, false,
+                                    false, false, c == 2);
+        // PV = coord.y * row1 + PV
+        for (uint32_t c = 0; c < 3; ++c)
+            alu[n++] = r700_alu_op3(R700_OP3_MULADD, 127, c,
+                                    g, R700_CHAN_Y, false,
+                                    R700_ALU_SRC_CFILE(b + 1), c, false,
+                                    R700_ALU_SRC_PV, c, false,
+                                    false, c == 2);
+        // Rg = coord.w(=1) * row2 + PV
+        for (uint32_t c = 0; c < 3; ++c)
+            alu[n++] = r700_alu_op3(R700_OP3_MULADD, g, c,
+                                    g, R700_CHAN_W, false,
+                                    R700_ALU_SRC_CFILE(b + 2), c, false,
+                                    R700_ALU_SRC_PV, c, false,
+                                    false, c == 2);
+    }
 
     if (!r700_prog_alu_clause(&p, alu, n, true)) return 0;
 
@@ -356,6 +383,25 @@ bool shader_gen_selftest(void)
     if (xf_shape.num_inputs != 3 || xf_shape.num_exports != 2) return false;
     Gx2VsRegs xf_regs;
     if (!gx2_vs_regs(&xf_regs, &xf_shape)) return false;
+
+    ShaderGenVs tg_cfg = {.has_color = true, .num_texcoords = 1, .texgen = {true}};
+    size_t tg_size = shader_gen_vs(vs_buf, sizeof(vs_buf), &tg_cfg);
+    if (tg_size == 0 || tg_size != gvs_size + 72) return false;
+    if (count_param_exports(vs_buf, tg_size) != 2) return false;
+
+    Gx2VsShape tg_shape;
+    shader_gen_vs_shape(&tg_cfg, &tg_shape);
+    if (tg_shape.num_inputs != 3 || tg_shape.num_exports != 2) return false;
+    Gx2VsRegs tg_regs;
+    if (!gx2_vs_regs(&tg_regs, &tg_shape)) return false;
+
+    ShaderGenVs tg2_cfg = {.has_color = true, .num_texcoords = 2,
+                           .texgen = {false, true}};
+    size_t tg2_size = shader_gen_vs(vs_buf, sizeof(vs_buf), &tg2_cfg);
+    if (tg2_size == 0) return false;
+    ShaderGenVs pass2_cfg = {.has_color = true, .num_texcoords = 2};
+    size_t pass2_size = shader_gen_vs(vs_buf, sizeof(vs_buf), &pass2_cfg);
+    if (pass2_size == 0 || tg2_size != pass2_size + 72) return false;
 
     return true;
 }

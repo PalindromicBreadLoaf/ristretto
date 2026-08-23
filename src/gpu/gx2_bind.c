@@ -130,11 +130,11 @@ bool gx2_bind_build_modulate(Gx2BoundShader *out,
 
 bool gx2_bind_build_tev(Gx2BoundShader *out, const TevConfig *cfg,
                         const GX2AttribStream *attribs, uint32_t attrib_count) {
-    return gx2_bind_build_tev_ex(out, cfg, false, attribs, attrib_count);
+    return gx2_bind_build_tev_ex(out, cfg, false, NULL, attribs, attrib_count);
 }
 
 bool gx2_bind_build_tev_ex(Gx2BoundShader *out, const TevConfig *cfg,
-                           bool transform_position,
+                           bool transform_position, const bool *texgen,
                            const GX2AttribStream *attribs, uint32_t attrib_count) {
     if (!out || !cfg) return false;
 
@@ -166,6 +166,8 @@ bool gx2_bind_build_tev_ex(Gx2BoundShader *out, const TevConfig *cfg,
     static uint8_t vs_buf[512];
     ShaderGenVs vs_cfg = {.has_color = true, .num_texcoords = ntexcoord,
                           .transform_position = transform_position};
+    if (texgen)
+        for (uint32_t k = 0; k < ntexcoord && k < 8; ++k) vs_cfg.texgen[k] = texgen[k];
     size_t vs_size = shader_gen_vs(vs_buf, sizeof(vs_buf), &vs_cfg);
     if (vs_size == 0) return false;
     Gx2VsShape vshape;

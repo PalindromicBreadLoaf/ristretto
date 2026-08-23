@@ -23,8 +23,19 @@ static void on_cp(void *user, uint8_t sub, uint32_t value) {
     const uint8_t idx = sub & 0x0F;
     switch (group) {
     case GX_CP_MATINDEX_A:
-        // Low 6 bits are the position/normal geometry matrix row index.
-        p->geom_mtx_index = value & 0x3F;
+        // PosNormal[0:6], Tex0[6:6], Tex1[12:6], Tex2[18:6], Tex3[24:6].
+        p->geom_mtx_index    = value & 0x3F;
+        p->tex_mtx_index[0]  = (value >> 6)  & 0x3F;
+        p->tex_mtx_index[1]  = (value >> 12) & 0x3F;
+        p->tex_mtx_index[2]  = (value >> 18) & 0x3F;
+        p->tex_mtx_index[3]  = (value >> 24) & 0x3F;
+        break;
+    case GX_CP_MATINDEX_B:
+        // Tex4[0:6], Tex5[6:6], Tex6[12:6], Tex7[18:6].
+        p->tex_mtx_index[4]  = value & 0x3F;
+        p->tex_mtx_index[5]  = (value >> 6)  & 0x3F;
+        p->tex_mtx_index[6]  = (value >> 12) & 0x3F;
+        p->tex_mtx_index[7]  = (value >> 18) & 0x3F;
         break;
     case GX_CP_ARRAY_BASE:
         p->arr.base[idx] = value;
@@ -77,6 +88,8 @@ static void build_sig(const GXDrawPipeline *p, bool transform, GXDrawShaderSig *
     memcpy(out->stage, p->tev.stage, sizeof(out->stage));
     memcpy(out->swap, p->tev.swap, sizeof(out->swap));
     out->num_texcoords = distinct_texcoords(&p->tev, out->tex_slot);
+    for (uint32_t k = 0; k < out->num_texcoords; ++k)
+        out->texgen[k] = gx_xf_texgen_is_regular(&p->xf, out->tex_slot[k]);
 }
 
 // GX2 helpers
@@ -221,7 +234,8 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
         }
 
         if (p->sig.valid) gx2_bind_free(&p->bound);
-        if (!gx2_bind_build_tev_ex(&p->bound, &p->tev, transform, attribs, na)) {
+        if (!gx2_bind_build_tev_ex(&p->bound, &p->tev, transform, sig.texgen,
+                                   attribs, na)) {
             p->sig.valid = false;
             return;
         }
@@ -239,6 +253,15 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
         gx_xf_build_vs_cfile(&p->xf, p->geom_mtx_index, rec->vs_cfile);
     else
         gx_xf_build_vs_cfile(&p->xf, 0, rec->vs_cfile);  // 2D passthrough
+    memset(rec->vs_cfile + 16, 0, sizeof(float) * 12 * ntc);
+    for (uint32_t k = 0; k < ntc; ++k) {
+        if (!sig.texgen[k]) continue;
+        uint8_t tc = slots[k];
+        bool stq = p->xf.texmtx[tc].projection == GX_XF_TEX_STQ;
+        gx_xf_build_texmtx_cfile(&p->xf, p->tex_mtx_index[tc], stq,
+                                 rec->vs_cfile + 16 + 12 * k);
+    }
+    rec->vs_cfile_count = 16 + 12 * ntc;
     gx_state_depth(&p->render, &rec->depth);
     gx_state_blend(&p->render, &rec->blend);
     gx_state_cull(&p->render, &rec->cull);
@@ -283,7 +306,7 @@ void gx_draw_replay(GXDrawPipeline *p) {
 
     for (uint32_t r = 0; r < p->nrecords; ++r) {
         const GXDrawRecord *rec = &p->record[r];
-        GX2SetVertexUniformReg(0, 16, (void *)rec->vs_cfile);
+        GX2SetVertexUniformReg(0, rec->vs_cfile_count, (void *)rec->vs_cfile);
         apply_state(rec);
         GX2RSetAttributeBuffer(&p->buffer[GX_DRAW_BUF_POS], 0,
                                p->buffer[GX_DRAW_BUF_POS].elemSize, 0);
@@ -333,6 +356,7 @@ void gx_draw_reset_state(GXDrawPipeline *p) {
     gx_state_reset(&p->render);
     memset(&p->arr, 0, sizeof(p->arr));
     p->geom_mtx_index = 0;
+    memset(p->tex_mtx_index, 0, sizeof(p->tex_mtx_index));
     p->sig.valid = false;
 }
 
