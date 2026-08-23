@@ -596,7 +596,7 @@ int main(int argc, char **argv) {
     WHBLogPrintf("gx_tev selftest: %s", gx_tev_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_texture selftest: %s", gx_texture_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_xf selftest: %s", gx_xf_selftest() ? "PASS" : "FAIL");
-    (void)gx_vertex_selftest();
+    WHBLogPrintf("gx_vertex selftest: %s", gx_vertex_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_draw selftest: %s", gx_draw_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_submit selftest: %s", gx_submit_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("r700_emit selftest: %s", r700_emit_selftest() ? "PASS" : "FAIL");

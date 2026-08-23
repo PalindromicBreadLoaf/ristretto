@@ -122,16 +122,6 @@ static void tex_vat(uint32_t g0, uint32_t g1, uint32_t g2, unsigned i, uint32_t 
     }
 }
 
-// Bytes one normal component group occupies in the vertex payload.
-static uint32_t normal_payload_bytes(uint32_t vcf, uint32_t fmt, uint32_t nbt, uint32_t index3) {
-    switch (vcf) {
-    case VCF_DIRECT:  return comp_bytes(fmt) * (nbt ? 9u : 3u);
-    case VCF_INDEX8:  return nbt ? (index3 ? 3u : 1u) : 1u;
-    case VCF_INDEX16: return nbt ? (index3 ? 6u : 2u) : 2u;
-    default: return 0;
-    }
-}
-
 void gx_vertex_layout(const GXFifoState *st, uint8_t vat, GXVertexLayout *out) {
     memset(out, 0, sizeof(*out));
     const uint32_t lo = st->desc_lo;
@@ -142,7 +132,9 @@ void gx_vertex_layout(const GXFifoState *st, uint8_t vat, GXVertexLayout *out) {
     out->pos_3d          = g0 & 1u;
     out->has_color0      = ((lo >> 13) & 3) != VCF_NONE;
     out->has_color1      = ((lo >> 15) & 3) != VCF_NONE;
+    out->has_normal      = ((lo >> 11) & 3) != VCF_NONE;
     for (unsigned i = 0; i < 8; ++i) {
+        out->has_tex_mtx_idx[i] = ((lo >> (1 + i)) & 1u) != 0;
         if (((hi >> (2 * i)) & 3) != VCF_NONE) {
             out->tex_present[i] = true;
             out->num_texcoords++;
@@ -193,10 +185,41 @@ static const uint8_t *resolve_component(Cursor *c, uint32_t vcf, uint32_t data_b
     return p;
 }
 
+static bool load_normals(Cursor *c, uint32_t vcf, uint32_t fmt, uint32_t frac,
+                         bool byte_dequant, uint32_t nbt, uint32_t index3,
+                         const GXArrayTable *arr, GXGuestRead read, void *user,
+                         float *out) {
+    if (vcf == VCF_NONE) return true;
+    const uint32_t cb = comp_bytes(fmt);
+    const uint32_t groups = nbt ? 3u : 1u;
+    if (nbt && index3) {
+        for (uint32_t g = 0; g < groups; ++g) {
+            const uint8_t *p = resolve_component(c, vcf, 3u * cb, GX_ARRAY_NORMAL,
+                                                 arr, read, user);
+            if (!p) return false;
+            if (!out) continue;
+            for (uint32_t e = 0; e < 3; ++e)
+                out[g * 3u + e] = read_scalar(p + e * cb, fmt, frac, byte_dequant);
+        }
+        return true;
+    }
+
+    const uint8_t *p = resolve_component(c, vcf, groups * 3u * cb, GX_ARRAY_NORMAL,
+                                         arr, read, user);
+    if (!p) return false;
+    if (!out) return true;
+    for (uint32_t g = 0; g < groups; ++g)
+        for (uint32_t e = 0; e < 3; ++e)
+            out[g * 3u + e] = read_scalar(p + (g * 3u + e) * cb, fmt, frac,
+                                           byte_dequant);
+    return true;
+}
+
 size_t gx_vertex_load(const GXFifoState *st, uint8_t vat, const GXArrayTable *arr,
                       GXGuestRead read, void *user, const uint8_t *src, size_t avail,
                       uint32_t num_vertices, float *pos_out, float *col0_out,
-                      float *col1_out, float *tex_out[8], uint8_t *pmi_out) {
+                      float *col1_out, float *normal_out, float *tex_out[8],
+                      uint8_t *pmi_out, uint8_t *tex_mtx_out[8]) {
     if (!st || !arr || !src) return 0;
 
     const uint32_t lo = st->desc_lo;
@@ -232,7 +255,11 @@ size_t gx_vertex_load(const GXFifoState *st, uint8_t vat, const GXArrayTable *ar
         }
         for (unsigned t = 0; t < 8; ++t) {
             if ((lo >> (1 + t)) & 1u) {
-                if (!cur_take(&c, 1)) return 0;
+                const uint8_t *p = cur_take(&c, 1);
+                if (!p) return 0;
+                if (tex_mtx_out && tex_mtx_out[t]) tex_mtx_out[t][v] = p[0];
+            } else if (tex_mtx_out && tex_mtx_out[t]) {
+                tex_mtx_out[t][v] = 0;
             }
         }
 
@@ -250,10 +277,10 @@ size_t gx_vertex_load(const GXFifoState *st, uint8_t vat, const GXArrayTable *ar
             }
         }
 
-        if (nrm_vcf != VCF_NONE) {
-            if (!cur_take(&c, normal_payload_bytes(nrm_vcf, nrm_fmt, nrm_nbt, nrm_idx3)))
-                return 0;
-        }
+        if (!load_normals(&c, nrm_vcf, nrm_fmt, 0, byte_dequant, nrm_nbt, nrm_idx3,
+                          arr, read, user,
+                          normal_out ? normal_out + (size_t)v * 9u : NULL))
+            return 0;
 
         // Colours.
         for (unsigned k = 0; k < 2; ++k) {
@@ -351,26 +378,26 @@ int gx_vertex_selftest(void) {
         GXArrayTable arr = {0};
 
         size_t consumed = gx_vertex_load(&st, 0, &arr, NULL, NULL, vtx, n, 2, NULL, NULL,
-                                         NULL, NULL, NULL);
+                                         NULL, NULL, NULL, NULL, NULL);
         if (consumed != 50) {
             return 0;
         }
 
         consumed = gx_vertex_load(&st, 0, &arr, NULL, NULL, vtx, n, 2, NULL, NULL,
-                                  NULL, NULL, pmi);
+                                  NULL, NULL, NULL, pmi, NULL);
         if (consumed != 50 || pmi[0] != 7 || pmi[1] != 0) {
             return 0;
         }
 
         consumed = gx_vertex_load(&st, 0, &arr, NULL, NULL, vtx, n, 2, pos, NULL,
-                                  NULL, NULL, NULL);
+                                  NULL, NULL, NULL, NULL, NULL);
         if (consumed != 50 || pos[0] != 1.5f || pos[1] != -2.0f || pos[2] != 3.25f ||
             pos[3] != 10.0f || pos[5] != 30.0f) {
             return 0;
         }
 
         consumed = gx_vertex_load(&st, 0, &arr, NULL, NULL, vtx, n, 2, NULL, col,
-                                  NULL, NULL, NULL);
+                                  NULL, NULL, NULL, NULL, NULL);
         float c1 = 128.0f / 255.0f, c2 = 64.0f / 255.0f;
         if (consumed != 50 || col[0] != 1.0f || col[3] != 1.0f ||
             col[1] < c1 - 1e-6f || col[1] > c1 + 1e-6f ||
@@ -379,14 +406,14 @@ int gx_vertex_selftest(void) {
         }
 
         consumed = gx_vertex_load(&st, 0, &arr, NULL, NULL, vtx, n, 2, NULL, NULL,
-                                  NULL, tex, NULL);
+                                  NULL, NULL, tex, NULL, NULL);
         if (consumed != 50 || tex0[0] != 0.25f || tex0[1] != 0.75f ||
             tex0[2] != 1.0f || tex0[3] != 0.0f) {
             return 0;
         }
 
         consumed = gx_vertex_load(&st, 0, &arr, NULL, NULL, vtx, n, 2, pos, col,
-                                  NULL, tex, pmi);
+                                  NULL, NULL, tex, pmi, NULL);
         if (consumed != 50 || pmi[0] != 7 || pmi[1] != 0 ||
             pos[0] != 1.5f || pos[1] != -2.0f || pos[2] != 3.25f ||
             pos[3] != 10.0f || pos[5] != 30.0f || col[0] != 1.0f || col[3] != 1.0f) {
@@ -427,11 +454,56 @@ int gx_vertex_selftest(void) {
         float pos[3], col[4];
         float *tex[8] = {0};
         size_t consumed = gx_vertex_load(&st, 0, &arr, test_read, pool, vtx, n, 1, pos,
-                                         col, NULL, tex, NULL);
+                                         col, NULL, NULL, tex, NULL, NULL);
         if (consumed != 4 || pos[0] != 4.0f || pos[1] != -3.0f || pos[2] != 1.0f ||
             col[0] != 1.0f || col[1] != 0.0f || col[2] != 0.0f || col[3] != 1.0f) {
             return 0;
         }
+    }
+
+    {
+        GXFifoState st;
+        gx_fifo_state_reset(&st);
+        gx_fifo_apply_cp(&st, GX_CP_VCD_LO,
+                         0x0000AA03u);  // Pos/TexMtxIdx, pos/nrm/col0/col1 Direct
+        gx_fifo_apply_cp(&st, GX_CP_VCD_HI, 1u);  // tex0 Direct
+        const uint32_t g0 = 1u | (4u << 1) | (1u << 9) | (4u << 10) |
+                            (5u << 14) | (5u << 18) | (1u << 21) | (4u << 22);
+        gx_fifo_apply_cp(&st, GX_CP_VAT_A, g0);
+
+        GXVertexLayout lay;
+        gx_vertex_layout(&st, 0, &lay);
+        if (!lay.has_color0 || !lay.has_color1 || !lay.has_pos_mtx_idx ||
+            !lay.has_tex_mtx_idx[0]) return 0;
+
+        uint8_t vtx[66];
+        size_t n = 0;
+        vtx[n++] = 9; vtx[n++] = 12;
+        put_f(&vtx[n], 1.0f); n += 4;
+        put_f(&vtx[n], 2.0f); n += 4;
+        put_f(&vtx[n], 3.0f); n += 4;
+        for (int i = 0; i < 9; ++i) {
+            put_f(&vtx[n], (float)(i + 1));
+            n += 4;
+        }
+        vtx[n++] = 1; vtx[n++] = 2; vtx[n++] = 3; vtx[n++] = 4;
+        vtx[n++] = 5; vtx[n++] = 6; vtx[n++] = 7; vtx[n++] = 8;
+        put_f(&vtx[n], 0.25f); n += 4;
+        put_f(&vtx[n], 0.75f); n += 4;
+
+        float pos[3], col0[4], col1[4], normal[9], tex0[2];
+        float *tex[8] = {tex0, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+        uint8_t pmi = 0;
+        uint8_t texmi0 = 0;
+        uint8_t *texmi[8] = {&texmi0, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+        GXArrayTable arr = {0};
+        if (gx_vertex_load(&st, 0, &arr, NULL, NULL, vtx, n, 1, pos, col0, col1,
+                           normal, tex, &pmi, texmi) != n)
+            return 0;
+        if (pmi != 9 || texmi0 != 12 || normal[0] != 1.0f || normal[8] != 9.0f ||
+            tex0[0] != 0.25f || tex0[1] != 0.75f ||
+            col0[0] != 1.0f / 255.0f || col1[3] != 8.0f / 255.0f)
+            return 0;
     }
 
     {
@@ -445,7 +517,7 @@ int gx_vertex_selftest(void) {
         float *tex[8] = {0};
         GXArrayTable arr = {0};
         size_t consumed = gx_vertex_load(&st, 0, &arr, NULL, NULL, vtx, sizeof(vtx), 1,
-                                         pos, NULL, NULL, tex, NULL);
+                                         pos, NULL, NULL, NULL, tex, NULL, NULL);
         if (consumed != 0) {
             return 0;
         }

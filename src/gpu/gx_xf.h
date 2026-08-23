@@ -33,6 +33,7 @@ enum {
     XF_SETCHAN1_COLOR  = 0x100F,
     XF_SETCHAN0_ALPHA  = 0x1010,
     XF_SETCHAN1_ALPHA  = 0x1011,
+    XF_DUALTEX         = 0x1012,
     XF_SETVIEWPORT     = 0x101A,  // 0x101A..0x101F
     XF_SETPROJECTION   = 0x1020,  // 0x1020..0x1025 raw
     XF_SETNUMTEXGENS   = 0x103F,
@@ -77,6 +78,11 @@ typedef struct {
     uint8_t emboss_light;  // emboss light index
 } XfTexMtxInfo;
 
+typedef struct {
+    uint8_t index;
+    bool    normalize;
+} XfPostMtxInfo;
+
 #define GX_XF_MAX_TEXGENS 8
 
 // Decoded per-channel lighting control
@@ -109,6 +115,8 @@ typedef struct {
     uint32_t num_color_chans;       // XF_SETNUMCHAN
     uint32_t num_texgens;           // XF_SETNUMTEXGENS
     XfTexMtxInfo texmtx[GX_XF_MAX_TEXGENS];
+    XfPostMtxInfo postmtx[GX_XF_MAX_TEXGENS];
+    bool     dual_tex_enable;
     uint32_t amb_color[2];          // XF_SETCHAN{0,1}_AMBCOLOR (RGBA8)
     uint32_t mat_color[2];          // XF_SETCHAN{0,1}_MATCOLOR (RGBA8)
     XfLitChannel color_chan[2];     // XF_SETCHAN{0,1}_COLOR
@@ -130,6 +138,15 @@ void gx_xf_position_matrix(const XfConfig *cfg, uint32_t mtx_index, float out[16
 // Build the transform VS's uniform matrix.
 void gx_xf_build_vs_cfile(const XfConfig *cfg, uint32_t mtx_index, float out[16]);
 
+// Build the clip-space projection rows without a model-view matrix.
+void gx_xf_build_projection_cfile(const XfConfig *cfg, float out[16]);
+
+// Apply the XF position and normal transforms used by a vertex matrix index.
+void gx_xf_transform_position(const XfConfig *cfg, uint32_t mtx_index,
+                              const float in[3], float out[3]);
+void gx_xf_transform_normal(const XfConfig *cfg, uint32_t mtx_index,
+                            const float in[9], float out[9]);
+
 // Build the 3 cfile rows (12 floats) a regular matrix texgen consumes in the VS.
 void gx_xf_build_texmtx_cfile(const XfConfig *cfg, uint32_t texmtx_index, bool stq,
                               float out[12]);
@@ -149,6 +166,17 @@ typedef struct {
 
 // Reduce a colour channel's lit-channel state to the VS descriptor.
 bool gx_xf_lighting_desc(const XfConfig *cfg, uint32_t chan, XfLightDesc *out);
+
+// Evaluate one XF colour channel
+void gx_xf_light_vertex(const XfConfig *cfg, uint32_t chan, const float pos[3],
+                        const float normal[3], const float color[2][4], float out[4]);
+
+// Generate one texture coordinate after colour/lighting evaluation.
+void gx_xf_generate_texcoord(const XfConfig *cfg, uint32_t tc, const float raw_pos[3],
+                             const float raw_normal[9], const float mv_pos[3],
+                             const float mv_normal[9], const float color[2][4],
+                             const float raw_tex[8][2], uint8_t tex_mtx_index,
+                             const float generated[8][3], float out[3]);
 
 // Build the lighting VS uniform block for colour channel `chan`, using position
 // matrix `pos_mtx_index` for the normal transform.

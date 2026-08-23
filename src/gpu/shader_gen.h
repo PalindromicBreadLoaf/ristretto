@@ -19,6 +19,7 @@ extern "C" {
 // Vertex program shape.
 typedef struct {
     bool     has_color;      // pass a_color through as param 0
+    bool     has_color1;     // pass a_color1 through as param 1
     bool     has_normal;     // fetch a_normal
     uint32_t num_texcoords;  // pass this many texcoords through as the next params
     bool     transform_position;

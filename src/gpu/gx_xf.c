@@ -52,6 +52,9 @@ void gx_xf_reset(XfConfig *cfg) {
     cfg->pos_matrices[0] = 1.0f;
     cfg->pos_matrices[5] = 1.0f;
     cfg->pos_matrices[10] = 1.0f;
+    cfg->normal_matrices[0] = 1.0f;
+    cfg->normal_matrices[4] = 1.0f;
+    cfg->normal_matrices[8] = 1.0f;
     cfg->viewport[0] = 320.0f;
     cfg->viewport[1] = -264.0f;
     cfg->viewport[2] = 16777215.0f;
@@ -118,6 +121,16 @@ static void write_reg(XfConfig *cfg, uint16_t addr, uint32_t word) {
         decode_texmtx(&cfg->texmtx[addr - XF_SETTEXMTXINFO], word);
         return;
     }
+    if (addr >= XF_SETPOSTMTXINFO && addr < XF_SETPOSTMTXINFO + GX_XF_MAX_TEXGENS) {
+        XfPostMtxInfo *pm = &cfg->postmtx[addr - XF_SETPOSTMTXINFO];
+        pm->index = (uint8_t)bits(word, 0, 6);
+        pm->normalize = bits(word, 8, 1) != 0;
+        return;
+    }
+    if (addr == XF_DUALTEX) {
+        cfg->dual_tex_enable = bits(word, 0, 1) != 0;
+        return;
+    }
 }
 
 void gx_xf_apply_xf(XfConfig *cfg, uint16_t address, uint8_t count, const uint8_t *data) {
@@ -177,6 +190,63 @@ void gx_xf_build_vs_cfile(const XfConfig *cfg, uint32_t mtx_index, float out[16]
             out[i * 4 + c] = clip[c * 4 + i];
 }
 
+void gx_xf_build_projection_cfile(const XfConfig *cfg, float out[16]) {
+    float proj[16];
+    gx_xf_projection_matrix(cfg, proj);
+    for (int i = 0; i < 4; ++i)
+        for (int c = 0; c < 4; ++c)
+            out[i * 4 + c] = proj[c * 4 + i];
+}
+
+void gx_xf_transform_position(const XfConfig *cfg, uint32_t mtx_index,
+                              const float in[3], float out[3]) {
+    const uint32_t base = (mtx_index & 0x3Fu) * 4u;
+    if (base + 12u > 256u) {
+        memset(out, 0, 3 * sizeof(*out));
+        return;
+    }
+    for (uint32_t r = 0; r < 3; ++r) {
+        const float *m = &cfg->pos_matrices[base + r * 4u];
+        out[r] = m[0] * in[0] + m[1] * in[1] + m[2] * in[2] + m[3];
+    }
+}
+
+static float vec3_dot(const float a[3], const float b[3]) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static float vec3_normalize(float v[3]) {
+    const float len2 = vec3_dot(v, v);
+    if (len2 <= 1e-16f) {
+        v[0] = v[1] = v[2] = 0.0f;
+        return 0.0f;
+    }
+    const float len = sqrtf(len2);
+    const float inv = 1.0f / len;
+    v[0] *= inv;
+    v[1] *= inv;
+    v[2] *= inv;
+    return len;
+}
+
+void gx_xf_transform_normal(const XfConfig *cfg, uint32_t mtx_index,
+                            const float in[9], float out[9]) {
+    const uint32_t base = (mtx_index & 31u) * 3u;
+    if (base + 9u > 96u) {
+        memset(out, 0, 9 * sizeof(*out));
+        return;
+    }
+    for (uint32_t v = 0; v < 3; ++v) {
+        const float *src = &in[v * 3u];
+        float *dst = &out[v * 3u];
+        for (uint32_t r = 0; r < 3; ++r) {
+            const float *m = &cfg->normal_matrices[base + r * 3u];
+            dst[r] = m[0] * src[0] + m[1] * src[1] + m[2] * src[2];
+        }
+    }
+    vec3_normalize(out);
+}
+
 // SourceRow (Dolphin XFMemory.h)
 enum { GX_XF_SRCROW_TEX0 = 5 };
 
@@ -230,6 +300,216 @@ static void rgba8_to_f(uint32_t w, float out[4]) {
     out[1] = (float)((w >> 16) & 0xFFu) / 255.0f;
     out[2] = (float)((w >> 8)  & 0xFFu) / 255.0f;
     out[3] = (float)(w & 0xFFu) / 255.0f;
+}
+
+static float safe_divide(float numerator, float denominator) {
+    if (fabsf(denominator) > 1e-8f) return numerator / denominator;
+    return numerator > 0.0f ? 1.0f : 0.0f;
+}
+
+static float light_attenuation(const XfLight *light, const XfLitChannel *channel,
+                               const float pos[3], const float normal[3], float ldir[3]) {
+    ldir[0] = light->pos[0] - pos[0];
+    ldir[1] = light->pos[1] - pos[1];
+    ldir[2] = light->pos[2] - pos[2];
+
+    switch (channel->attnfunc) {
+    case GX_XF_AF_NONE:
+    case GX_XF_AF_DIR:
+        if (vec3_normalize(ldir) == 0.0f)
+            memcpy(ldir, normal, 3 * sizeof(*ldir));
+        return 1.0f;
+    case GX_XF_AF_SPEC: {
+        if (vec3_normalize(ldir) == 0.0f)
+            memcpy(ldir, normal, 3 * sizeof(*ldir));
+        float h = vec3_dot(ldir, normal) >= 0.0f ? vec3_dot(light->dir, normal) : 0.0f;
+        if (h < 0.0f) h = 0.0f;
+        const float terms[3] = {1.0f, h, h * h};
+        float dist[3] = {light->distatt[0], light->distatt[1], light->distatt[2]};
+        if (channel->diffusefunc != GX_XF_DF_NONE)
+            vec3_normalize(dist);
+        const float numerator = vec3_dot(light->cosatt, terms);
+        const float denominator = vec3_dot(dist, terms);
+        return safe_divide(numerator > 0.0f ? numerator : 0.0f, denominator);
+    }
+    case GX_XF_AF_SPOT: {
+        const float dist2 = vec3_dot(ldir, ldir);
+        const float dist = sqrtf(dist2);
+        if (dist > 1e-8f) {
+            const float inv = 1.0f / dist;
+            ldir[0] *= inv;
+            ldir[1] *= inv;
+            ldir[2] *= inv;
+        } else {
+            memcpy(ldir, normal, 3 * sizeof(*ldir));
+        }
+        float h = vec3_dot(ldir, light->dir);
+        if (h < 0.0f) h = 0.0f;
+        const float numerator = light->cosatt[0] + light->cosatt[1] * h +
+                                light->cosatt[2] * h * h;
+        const float denominator = light->distatt[0] + light->distatt[1] * dist +
+                                  light->distatt[2] * dist2;
+        return safe_divide(numerator > 0.0f ? numerator : 0.0f, denominator);
+    }
+    default:
+        return 1.0f;
+    }
+}
+
+static float light_factor(const XfLight *light, const XfLitChannel *channel,
+                          const float pos[3], const float normal[3], float ldir[3]) {
+    const float attenuation = light_attenuation(light, channel, pos, normal, ldir);
+    const float ndotl = vec3_dot(ldir, normal);
+    if (channel->diffusefunc == GX_XF_DF_NONE) return attenuation;
+    if (channel->diffusefunc == GX_XF_DF_SIGN) return attenuation * ndotl;
+    return attenuation * (ndotl > 0.0f ? ndotl : 0.0f);
+}
+
+static void accumulate_lights(const XfConfig *cfg, const XfLitChannel *channel,
+                              const float pos[3], const float normal[3], float out[4]) {
+    for (uint32_t li = 0; li < GX_XF_NUM_LIGHTS; ++li) {
+        if (!(channel->light_mask & (1u << li))) continue;
+        float ldir[3];
+        const float factor = light_factor(&cfg->lights[li], channel, pos, normal, ldir);
+        float color[4];
+        rgba8_to_f(cfg->lights[li].color, color);
+        for (uint32_t c = 0; c < 4; ++c) out[c] += color[c] * factor;
+    }
+}
+
+void gx_xf_light_vertex(const XfConfig *cfg, uint32_t chan, const float pos[3],
+                        const float normal[3], const float color[2][4], float out[4]) {
+    if (!cfg || !pos || !normal || !color || !out || chan >= 2) return;
+
+    const XfLitChannel *cc = &cfg->color_chan[chan];
+    const XfLitChannel *ac = &cfg->alpha_chan[chan];
+    float material[4];
+    rgba8_to_f(cfg->mat_color[chan], material);
+
+    const float *vertex_color = color[chan];
+    const float *rgb_material = cc->matsource == GX_XF_MATSRC_VTX ? vertex_color : material;
+    const float *alpha_material = ac->matsource == GX_XF_MATSRC_VTX ? vertex_color : material;
+
+    float ambient[4];
+    rgba8_to_f(cfg->amb_color[chan], ambient);
+
+    float rgb_acc[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    if (cc->enablelighting) {
+        if (cc->ambsource == GX_XF_AMBSRC_VTX)
+            memcpy(rgb_acc, vertex_color, sizeof(rgb_acc));
+        else
+            memcpy(rgb_acc, ambient, sizeof(rgb_acc));
+        accumulate_lights(cfg, cc, pos, normal, rgb_acc);
+    }
+
+    float alpha_acc = 1.0f;
+    if (ac->enablelighting) {
+        alpha_acc = ac->ambsource == GX_XF_AMBSRC_VTX ? vertex_color[3] : ambient[3];
+        for (uint32_t li = 0; li < GX_XF_NUM_LIGHTS; ++li) {
+            if (!(ac->light_mask & (1u << li))) continue;
+            float ldir[3];
+            const float factor = light_factor(&cfg->lights[li], ac, pos, normal, ldir);
+            alpha_acc += ((float)(cfg->lights[li].color & 0xFFu) / 255.0f) * factor;
+        }
+    }
+
+    for (uint32_t c = 0; c < 3; ++c) {
+        float acc = rgb_acc[c];
+        if (acc < 0.0f) acc = 0.0f;
+        if (acc > 1.0f) acc = 1.0f;
+        out[c] = rgb_material[c] * acc;
+    }
+    if (alpha_acc < 0.0f) alpha_acc = 0.0f;
+    if (alpha_acc > 1.0f) alpha_acc = 1.0f;
+    out[3] = alpha_material[3] * alpha_acc;
+}
+
+static void tex_matrix_mul(const float *m, const float coord[4], bool stq, float out[3]) {
+    out[0] = m[0] * coord[0] + m[1] * coord[1] + m[2] * coord[2] + m[3] * coord[3];
+    out[1] = m[4] * coord[0] + m[5] * coord[1] + m[6] * coord[2] + m[7] * coord[3];
+    out[2] = stq ? m[8] * coord[0] + m[9] * coord[1] +
+                    m[10] * coord[2] + m[11] * coord[3]
+                   : 1.0f;
+}
+
+void gx_xf_generate_texcoord(const XfConfig *cfg, uint32_t tc, const float raw_pos[3],
+                             const float raw_normal[9], const float mv_pos[3],
+                             const float mv_normal[9], const float color[2][4],
+                             const float raw_tex[8][2], uint8_t tex_mtx_index,
+                             const float generated[8][3], float out[3]) {
+    if (!cfg || !raw_pos || !raw_normal || !mv_pos || !mv_normal || !color || !raw_tex ||
+        !generated || !out || tc >= GX_XF_MAX_TEXGENS) {
+        return;
+    }
+
+    const XfTexMtxInfo *info = &cfg->texmtx[tc];
+    if (info->texgentype == GX_XF_TG_EMBOSSMAP) {
+        const float *src = generated[info->emboss_source & 7u];
+        float ldir[3] = {
+            cfg->lights[info->emboss_light & 7u].pos[0] - mv_pos[0],
+            cfg->lights[info->emboss_light & 7u].pos[1] - mv_pos[1],
+            cfg->lights[info->emboss_light & 7u].pos[2] - mv_pos[2],
+        };
+        vec3_normalize(ldir);
+        out[0] = src[0] + vec3_dot(ldir, &mv_normal[3]);
+        out[1] = src[1] + vec3_dot(ldir, &mv_normal[6]);
+        out[2] = src[2];
+        return;
+    }
+    if (info->texgentype == GX_XF_TG_COLOR0 || info->texgentype == GX_XF_TG_COLOR1) {
+        const float *src = color[info->texgentype == GX_XF_TG_COLOR1 ? 1 : 0];
+        out[0] = src[0];
+        out[1] = src[1];
+        out[2] = 1.0f;
+        return;
+    }
+
+    float coord[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+    switch (info->sourcerow) {
+    case 0: memcpy(coord, raw_pos, 3 * sizeof(*coord)); break;
+    case 1: memcpy(coord, raw_normal, 3 * sizeof(*coord)); break;
+    case 3: memcpy(coord, raw_normal + 3, 3 * sizeof(*coord)); break;
+    case 4: memcpy(coord, raw_normal + 6, 3 * sizeof(*coord)); break;
+    default:
+        if (info->sourcerow >= 5 && info->sourcerow < 13) {
+            const float *src = raw_tex[info->sourcerow - 5u];
+            coord[0] = src[0];
+            coord[1] = src[1];
+        }
+        break;
+    }
+    if (info->inputform == 0) coord[2] = 1.0f;
+    for (uint32_t c = 0; c < 3; ++c)
+        if (isnan(coord[c])) coord[c] = 1.0f;
+
+    const uint32_t base = (uint32_t)(tex_mtx_index & 0x3Fu) * 4u;
+    if (base + 12u > 256u) {
+        out[0] = out[1] = 0.0f;
+        out[2] = 1.0f;
+    } else {
+        tex_matrix_mul(&cfg->pos_matrices[base], coord,
+                       info->projection == GX_XF_TEX_STQ, out);
+    }
+
+    if (cfg->dual_tex_enable) {
+        const XfPostMtxInfo *post = &cfg->postmtx[tc];
+        float temp[3] = {out[0], out[1], out[2]};
+        if (post->normalize) vec3_normalize(temp);
+        const uint32_t post_base = (uint32_t)(post->index & 0x3Fu) * 4u;
+        if (post_base + 12u <= 256u) {
+            const float post_coord[4] = {temp[0], temp[1], temp[2], 1.0f};
+            tex_matrix_mul(&cfg->post_matrices[post_base], post_coord, true, out);
+        }
+    }
+
+    if (out[2] == 0.0f) {
+        out[0] *= 0.5f;
+        out[1] *= 0.5f;
+        if (out[0] < -1.0f) out[0] = -1.0f;
+        if (out[0] > 1.0f) out[0] = 1.0f;
+        if (out[1] < -1.0f) out[1] = -1.0f;
+        if (out[1] > 1.0f) out[1] = 1.0f;
+    }
 }
 
 int gx_xf_build_light_cfile(const XfConfig *cfg, uint32_t chan, uint32_t pos_mtx_index,
@@ -630,6 +910,93 @@ int gx_xf_selftest(void) {
         XfLightDesc off;
         if (!gx_xf_lighting_desc(&u, 0, &off) || off.enable) return 0;
         if (gx_xf_build_light_cfile(&u, 0, 0, cf, 64) != 0) return 0;
+    }
+
+    {
+        XfConfig t;
+        gx_xf_reset(&t);
+        uint8_t d[12 * 4];
+        const float tex_mtx[12] = {
+            2, 0, 0, 1,
+            0, 3, 0, 2,
+            0, 0, 1, 0,
+        };
+        for (int i = 0; i < 12; ++i) put_f(&d[i * 4], tex_mtx[i]);
+        gx_xf_apply_xf(&t, XF_POSMATRICES + 4, 12, d);
+
+        const float post_mtx[12] = {
+            1, 0, 0, 1,
+            0, 1, 0, -1,
+            0, 0, 1, 0,
+        };
+        for (int i = 0; i < 12; ++i) put_f(&d[i * 4], post_mtx[i]);
+        gx_xf_apply_xf(&t, XF_POSTMATRICES + 4, 12, d);
+
+        uint8_t reg[4];
+        put_u(reg, (uint32_t)GX_XF_TEX_STQ << 1 | 1u << 2);
+        gx_xf_apply_xf(&t, XF_SETTEXMTXINFO, 1, reg);
+        put_u(reg, 1u);
+        gx_xf_apply_xf(&t, XF_SETPOSTMTXINFO, 1, reg);
+        gx_xf_apply_xf(&t, XF_DUALTEX, 1, reg);
+
+        const float raw_pos[3] = {0.5f, 0.25f, 2.0f};
+        const float raw_normal[9] = {0, 0, 1, 1, 0, 0, 0, 1, 0};
+        const float colors[2][4] = {{1, 1, 1, 1}, {1, 1, 1, 1}};
+        const float raw_tex[8][2] = {{0}};
+        const float generated[8][3] = {{0}};
+        float out[3] = {0};
+        gx_xf_generate_texcoord(&t, 0, raw_pos, raw_normal, raw_pos, raw_normal, colors,
+                                raw_tex, 1, generated, out);
+        if (fabsf(out[0] - 3.0f) > 1e-5f || fabsf(out[1] - 1.75f) > 1e-5f ||
+            fabsf(out[2] - 2.0f) > 1e-5f)
+            return 0;
+    }
+
+    // Both XF colour channels have independent material, ambient, and alpha
+    // controls
+    {
+        XfConfig t;
+        gx_xf_reset(&t);
+        uint8_t reg[4];
+        put_u(reg, 2u);
+        gx_xf_apply_xf(&t, XF_SETNUMCHAN, 1, reg);
+        const uint32_t lit = 1u << 1 | 1u << 2 |
+                             (uint32_t)GX_XF_DF_CLAMP << 7 |
+                             (uint32_t)GX_XF_AF_SPOT << 9;
+        put_u(reg, lit);
+        gx_xf_apply_xf(&t, XF_SETCHAN0_COLOR, 1, reg);
+        gx_xf_apply_xf(&t, XF_SETCHAN0_ALPHA, 1, reg);
+        put_u(reg, 0xFFFFFFFFu);
+        gx_xf_apply_xf(&t, XF_SETCHAN0_MATCOLOR, 1, reg);
+        put_u(reg, 0u);
+        gx_xf_apply_xf(&t, XF_SETCHAN0_AMBCOLOR, 1, reg);
+        put_u(reg, GX_XF_MATSRC_VTX);
+        gx_xf_apply_xf(&t, XF_SETCHAN1_COLOR, 1, reg);
+        gx_xf_apply_xf(&t, XF_SETCHAN1_ALPHA, 1, reg);
+
+        uint8_t light[13 * 4];
+        put_u(&light[0], 0xCC663380u);
+        const float cosa[3] = {1, 0, 0};
+        const float dista[3] = {2, 0, 0};
+        const float lpos[3] = {0, 0, 2};
+        const float ldir[3] = {0, 0, 1};
+        for (int i = 0; i < 3; ++i) put_f(&light[(1 + i) * 4], cosa[i]);
+        for (int i = 0; i < 3; ++i) put_f(&light[(4 + i) * 4], dista[i]);
+        for (int i = 0; i < 3; ++i) put_f(&light[(7 + i) * 4], lpos[i]);
+        for (int i = 0; i < 3; ++i) put_f(&light[(10 + i) * 4], ldir[i]);
+        gx_xf_apply_xf(&t, XF_LIGHTS + 3, 13, light);
+
+        const float pos[3] = {0, 0, 0};
+        const float normal[3] = {0, 0, 1};
+        const float colors[2][4] = {{0.1f, 0.2f, 0.3f, 0.4f},
+                                    {0.2f, 0.3f, 0.4f, 0.5f}};
+        float out0[4], out1[4];
+        gx_xf_light_vertex(&t, 0, pos, normal, colors, out0);
+        gx_xf_light_vertex(&t, 1, pos, normal, colors, out1);
+        if (fabsf(out0[0] - 0.4f) > 1e-5f || fabsf(out0[1] - 0.2f) > 1e-5f ||
+            fabsf(out0[2] - 0.1f) > 1e-5f || fabsf(out0[3] - 0.25f) > 1e-5f ||
+            fabsf(out1[0] - 0.2f) > 1e-5f || fabsf(out1[3] - 0.5f) > 1e-5f)
+            return 0;
     }
 
     return 1;

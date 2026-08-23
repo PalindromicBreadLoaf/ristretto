@@ -80,8 +80,10 @@ size_t shader_gen_vs(uint8_t *buf, size_t cap, const ShaderGenVs *cfg)
 
     // Per-vertex diffuse lighting for colour channel 0.
     if (cfg->light.enable) {
-        uint32_t norm_gpr = 2u + (cfg->has_color ? 1u : 0u);
+        uint32_t norm_gpr = 2u + (cfg->has_color ? 1u : 0u) +
+                            (cfg->has_color1 ? 1u : 0u);
         uint32_t in_count = 1u + (cfg->has_color ? 1u : 0u) +
+                            (cfg->has_color1 ? 1u : 0u) +
                             (cfg->has_normal ? 1u : 0u) + cfg->num_texcoords;
         uint32_t ntN  = in_count + 1u;  // transformed normal scratch
         uint32_t lacc = in_count + 2u;  // light accumulator scratch
@@ -172,6 +174,7 @@ size_t shader_gen_vs(uint8_t *buf, size_t cap, const ShaderGenVs *cfg)
     for (uint32_t k = 0; k < cfg->num_texcoords; ++k) {
         if (!cfg->texgen[k]) continue;
         uint32_t g = 2u + (cfg->has_color ? 1u : 0u) +
+                     (cfg->has_color1 ? 1u : 0u) +
                      (cfg->has_normal ? 1u : 0u) + k;
         uint32_t b = 4u + 3u * k;
         // PV = coord.x * row0
@@ -199,15 +202,25 @@ size_t shader_gen_vs(uint8_t *buf, size_t cap, const ShaderGenVs *cfg)
     if (n > 128) return 0;
     if (!r700_prog_alu_clause(&p, alu, n, true)) return 0;
 
-    uint32_t nparam = (cfg->has_color ? 1u : 0u) + cfg->num_texcoords;
+    uint32_t nparam = (cfg->has_color ? 1u : 0u) + (cfg->has_color1 ? 1u : 0u) +
+                      cfg->num_texcoords;
     r700_prog_cf(&p, r700_cf_export(R700_EXPORT_POS, R700_EXPORT_POS0, 1, kSelXYZW,
                                     nparam == 0, true, R700_CF_EXPORT_DONE));
 
-    uint32_t tc_gpr0 = 2u + (cfg->has_color ? 1u : 0u) + (cfg->has_normal ? 1u : 0u);
+    uint32_t tc_gpr0 = 2u + (cfg->has_color ? 1u : 0u) + (cfg->has_color1 ? 1u : 0u) +
+                       (cfg->has_normal ? 1u : 0u);
     uint32_t base = 0, emitted = 0;
     if (cfg->has_color) {
         bool last = emitted + 1 == nparam;
         r700_prog_cf(&p, r700_cf_export(R700_EXPORT_PARAM, base, 2, kSelXYZW,
+                                        last, false,
+                                        last ? R700_CF_EXPORT_DONE : R700_CF_EXPORT));
+        ++base;
+        ++emitted;
+    }
+    if (cfg->has_color1) {
+        bool last = emitted + 1 == nparam;
+        r700_prog_cf(&p, r700_cf_export(R700_EXPORT_PARAM, base, 3, kSelXYZW,
                                         last, false,
                                         last ? R700_CF_EXPORT_DONE : R700_CF_EXPORT));
         ++base;
@@ -273,6 +286,7 @@ void shader_gen_vs_shape(const ShaderGenVs *cfg, Gx2VsShape *out)
     uint32_t inputs = 1;  // position
     out->input_semantics[0] = 0;
     if (cfg->has_color)  out->input_semantics[inputs] = (uint8_t)inputs, ++inputs;
+    if (cfg->has_color1) out->input_semantics[inputs] = (uint8_t)inputs, ++inputs;
     if (cfg->has_normal) out->input_semantics[inputs] = (uint8_t)inputs, ++inputs;
     for (uint32_t k = 0; k < cfg->num_texcoords; ++k)
         out->input_semantics[inputs] = (uint8_t)inputs, ++inputs;
@@ -284,8 +298,10 @@ void shader_gen_vs_shape(const ShaderGenVs *cfg, Gx2VsShape *out)
     // interpolant contract.
     uint32_t exports = 0;
     if (cfg->has_color) out->export_semantics[exports++] = 0;
+    if (cfg->has_color1) out->export_semantics[exports++] = 1;
     for (uint32_t k = 0; k < cfg->num_texcoords; ++k)
-        out->export_semantics[exports++] = (uint8_t)((cfg->has_color ? 1u : 0u) + k);
+        out->export_semantics[exports++] =
+            (uint8_t)((cfg->has_color ? 1u : 0u) + (cfg->has_color1 ? 1u : 0u) + k);
     out->num_exports = exports;
 }
 
@@ -472,6 +488,18 @@ bool shader_gen_selftest(void)
         return false;
     Gx2VsRegs multi_regs;
     if (!gx2_vs_regs(&multi_regs, &multi_shape)) return false;
+
+    ShaderGenVs color2_cfg = {.has_color = true, .has_color1 = true, .num_texcoords = 1};
+    size_t color2_size = shader_gen_vs(vs_buf, sizeof(vs_buf), &color2_cfg);
+    if (color2_size == 0 || count_param_exports(vs_buf, color2_size) != 3) return false;
+    Gx2VsShape color2_shape;
+    shader_gen_vs_shape(&color2_cfg, &color2_shape);
+    if (color2_shape.num_inputs != 4 || color2_shape.num_exports != 3 ||
+        color2_shape.export_semantics[0] != 0 || color2_shape.export_semantics[1] != 1 ||
+        color2_shape.export_semantics[2] != 2)
+        return false;
+    Gx2VsRegs color2_regs;
+    if (!gx2_vs_regs(&color2_regs, &color2_shape)) return false;
 
     ShaderGenVs xf_cfg = {.has_color = true, .num_texcoords = 1,
                           .transform_position = true};

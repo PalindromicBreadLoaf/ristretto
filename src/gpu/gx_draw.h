@@ -55,6 +55,7 @@ typedef struct {
 typedef struct {
     bool     valid;
     bool     transform;
+    bool     has_color1;
     uint8_t  num_stages;
     uint32_t num_texcoords;
     TevStage stage[GX_TEV_MAX_STAGES];

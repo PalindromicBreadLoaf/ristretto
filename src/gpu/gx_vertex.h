@@ -39,7 +39,9 @@ typedef struct {
     bool     pos_3d;            // 3 vs 2 position elements
     bool     has_color0;
     bool     has_color1;
+    bool     has_normal;
     bool     has_pos_mtx_idx;   // per-vertex position/normal matrix index present
+    bool     has_tex_mtx_idx[8];
     uint32_t num_texcoords;     // count of present texcoord slots
     bool     tex_present[8];    // which texcoord slots are present
 } GXVertexLayout;
@@ -52,7 +54,8 @@ void gx_vertex_layout(const GXFifoState *st, uint8_t vat, GXVertexLayout *out);
 size_t gx_vertex_load(const GXFifoState *st, uint8_t vat, const GXArrayTable *arr,
                       GXGuestRead read, void *user, const uint8_t *src, size_t avail,
                       uint32_t num_vertices, float *pos_out, float *col0_out,
-                      float *col1_out, float *tex_out[8], uint8_t *pmi_out);
+                      float *col1_out, float *normal_out, float *tex_out[8],
+                      uint8_t *pmi_out, uint8_t *tex_mtx_out[8]);
 
 int gx_vertex_selftest(void);
 

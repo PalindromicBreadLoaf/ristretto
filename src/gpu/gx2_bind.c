@@ -33,6 +33,13 @@ static const char *const kSamplerNames[GX2_BIND_MAX_SAMPLERS] = {
     "s_tex4", "s_tex5", "s_tex6", "s_tex7",
 };
 
+static bool tev_uses_raster_color1(const TevConfig *cfg) {
+    for (uint32_t s = 0; s < cfg->num_stages; ++s)
+        if (cfg->stage[s].colorchan == GX_RAS_COLOR1)
+            return true;
+    return false;
+}
+
 static void setup_samplers(Gx2BoundShader *out, const uint8_t *locs,
                            uint32_t count) {
     if (count > GX2_BIND_MAX_SAMPLERS) count = GX2_BIND_MAX_SAMPLERS;
@@ -164,8 +171,8 @@ bool gx2_bind_build_tev_ex(Gx2BoundShader *out, const TevConfig *cfg,
 
     // Generate the matching vertex shader.
     static uint8_t vs_buf[512];
-    ShaderGenVs vs_cfg = {.has_color = true, .num_texcoords = ntexcoord,
-                          .transform_position = transform_position};
+    ShaderGenVs vs_cfg = {.has_color = true, .has_color1 = tev_uses_raster_color1(cfg),
+                          .num_texcoords = ntexcoord, .transform_position = transform_position};
     if (texgen)
         for (uint32_t k = 0; k < ntexcoord && k < 8; ++k) vs_cfg.texgen[k] = texgen[k];
     size_t vs_size = shader_gen_vs(vs_buf, sizeof(vs_buf), &vs_cfg);

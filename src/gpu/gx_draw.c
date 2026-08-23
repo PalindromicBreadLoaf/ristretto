@@ -3,6 +3,7 @@
 
 #include "gpu/gx_draw.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include <gx2/draw.h>
@@ -56,6 +57,15 @@ static void on_xf(void *user, uint16_t address, uint8_t count, const uint8_t *da
     gx_xf_apply_xf(&p->xf, address, count, data);
 }
 
+static void on_indexed(void *user, uint8_t array, uint32_t index, uint16_t address,
+                       uint8_t size) {
+    GXDrawPipeline *p = user;
+    if (!p->cb.read_guest || array >= GX_ARRAY_COUNT || size == 0) return;
+    const uint32_t ea = p->arr.base[array] + index * p->arr.stride[array];
+    const uint8_t *data = p->cb.read_guest(p->cb.user, ea, (uint32_t)size * 4u);
+    if (data) gx_xf_apply_xf(&p->xf, address, size, data);
+}
+
 static void on_bp(void *user, uint8_t command, uint32_t value) {
     GXDrawPipeline *p = user;
     gx_state_apply_bp(&p->render, command, value);
@@ -94,13 +104,15 @@ static void build_sig(const GXDrawPipeline *p, bool transform, GXDrawShaderSig *
     out->num_stages = p->tev.num_stages;
     memcpy(out->stage, p->tev.stage, (size_t)out->num_stages * sizeof(out->stage[0]));
     memcpy(out->swap, p->tev.swap, sizeof(out->swap));
+    for (uint32_t s = 0; s < out->num_stages; ++s)
+        if (out->stage[s].colorchan == GX_RAS_COLOR1)
+            out->has_color1 = true;
     out->num_texcoords = distinct_texcoords(&p->tev, out->tex_slot);
-    for (uint32_t k = 0; k < out->num_texcoords; ++k)
-        out->texgen[k] = gx_xf_texgen_is_regular(&p->xf, out->tex_slot[k]);
 }
 
 static bool sig_equal(const GXDrawShaderSig *a, const GXDrawShaderSig *b) {
     if (!a->valid || !b->valid || a->transform != b->transform ||
+        a->has_color1 != b->has_color1 ||
         a->num_stages != b->num_stages || a->num_texcoords != b->num_texcoords) {
         return false;
     }
@@ -155,7 +167,7 @@ static int cache_slot_for(GXDrawPipeline *p, const GXDrawShaderSig *sig) {
 
 static bool build_cached_shader(GXDrawPipeline *p, const GXDrawShaderSig *sig,
                                 uint32_t ntc, int slot) {
-    GX2AttribStream attribs[2 + 8];
+    GX2AttribStream attribs[3 + 8];
     uint32_t na = 0;
     attribs[na++] = (GX2AttribStream){
         .location = 0, .buffer = GX_DRAW_BUF_POS, .offset = 0,
@@ -169,9 +181,18 @@ static bool build_cached_shader(GXDrawPipeline *p, const GXDrawShaderSig *sig,
         .type = GX2_ATTRIB_INDEX_PER_VERTEX, .aluDivisor = 0,
         .mask = GX2_SEL_MASK(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z, GX2_SQ_SEL_W),
         .endianSwap = GX2_ENDIAN_SWAP_DEFAULT};
+    if (sig->has_color1) {
+        attribs[na++] = (GX2AttribStream){
+            .location = 2, .buffer = GX_DRAW_BUF_COL1, .offset = 0,
+            .format = GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32,
+            .type = GX2_ATTRIB_INDEX_PER_VERTEX, .aluDivisor = 0,
+            .mask = GX2_SEL_MASK(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z, GX2_SQ_SEL_W),
+            .endianSwap = GX2_ENDIAN_SWAP_DEFAULT};
+    }
     for (uint32_t k = 0; k < ntc; ++k) {
         attribs[na++] = (GX2AttribStream){
-            .location = 2 + k, .buffer = 2 + k, .offset = 0,
+            .location = 2 + (sig->has_color1 ? 1u : 0u) + k,
+            .buffer = 2 + (sig->has_color1 ? 1u : 0u) + k, .offset = 0,
             .format = GX2_ATTRIB_FORMAT_FLOAT_32_32,
             .type = GX2_ATTRIB_INDEX_PER_VERTEX, .aluDivisor = 0,
             .mask = GX2_SEL_MASK(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_0, GX2_SQ_SEL_1),
@@ -251,7 +272,105 @@ static void record_clear(GXDrawPipeline *p, const GXClearState *clear) {
 // Decode targets
 static float g_dry_pos[GX_DRAW_DRY_MAX * 3];
 static float g_dry_col[GX_DRAW_DRY_MAX * 4];
+static float g_dry_col1[GX_DRAW_DRY_MAX * 4];
 static float g_dry_tex[8][GX_DRAW_DRY_MAX * 2];
+
+static size_t load_and_prepare_vertices(const GXDrawPipeline *p, uint8_t vat,
+                                        const GXVertexLayout *layout, uint32_t num_vertices,
+                                        const uint8_t *vertex_data, size_t vertex_bytes,
+                                        bool transform, float *pos, float *col0, float *col1,
+                                        float *final_tex[8]) {
+    float *normal = calloc((size_t)num_vertices * 9u, sizeof(*normal));
+    float *raw_tex_storage = calloc((size_t)num_vertices * 8u * 2u, sizeof(*raw_tex_storage));
+    uint8_t *pmi = calloc(num_vertices, sizeof(*pmi));
+    uint8_t *tex_mtx_storage = calloc((size_t)num_vertices * 8u, sizeof(*tex_mtx_storage));
+    if (!normal || !raw_tex_storage || !pmi || !tex_mtx_storage) {
+        free(normal);
+        free(raw_tex_storage);
+        free(pmi);
+        free(tex_mtx_storage);
+        return 0;
+    }
+
+    float *raw_tex[8];
+    uint8_t *tex_mtx[8];
+    for (uint32_t tc = 0; tc < 8; ++tc) {
+        raw_tex[tc] = raw_tex_storage + (size_t)tc * num_vertices * 2u;
+        tex_mtx[tc] = tex_mtx_storage + (size_t)tc * num_vertices;
+    }
+    for (uint32_t v = 0; v < num_vertices; ++v)
+        for (uint32_t c = 0; c < 4; ++c)
+            col0[v * 4u + c] = col1[v * 4u + c] = 1.0f;
+
+    const size_t used = gx_vertex_load(&p->fifo, vat, &p->arr, p->cb.read_guest, p->cb.user,
+                                       vertex_data, vertex_bytes, num_vertices, pos, col0, col1,
+                                       normal, raw_tex, pmi, tex_mtx);
+    if (used == 0) {
+        free(normal);
+        free(raw_tex_storage);
+        free(pmi);
+        free(tex_mtx_storage);
+        return 0;
+    }
+
+    const uint32_t num_texgens = p->xf.num_texgens > 8 ? 8 : p->xf.num_texgens;
+    for (uint32_t v = 0; v < num_vertices; ++v) {
+        float raw_pos[3] = {pos[v * 3u + 0], pos[v * 3u + 1], pos[v * 3u + 2]};
+        float raw_normal[9];
+        memcpy(raw_normal, normal + (size_t)v * 9u, sizeof(raw_normal));
+        if (!layout->has_color1)
+            memcpy(col1 + (size_t)v * 4u, col0 + (size_t)v * 4u, 4 * sizeof(float));
+        if (!layout->has_pos_mtx_idx) pmi[v] = (uint8_t)p->geom_mtx_index;
+        for (uint32_t tc = 0; tc < 8; ++tc)
+            if (!layout->has_tex_mtx_idx[tc]) tex_mtx[tc][v] = p->tex_mtx_index[tc];
+
+        float mv_pos[3] = {raw_pos[0], raw_pos[1], raw_pos[2]};
+        if (transform) gx_xf_transform_position(&p->xf, pmi[v], raw_pos, mv_pos);
+        memcpy(pos + (size_t)v * 3u, mv_pos, sizeof(mv_pos));
+
+        float mv_normal[9] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        if (layout->has_normal)
+            gx_xf_transform_normal(&p->xf, pmi[v], raw_normal, mv_normal);
+
+        float input_color[2][4];
+        memcpy(input_color[0], col0 + (size_t)v * 4u, sizeof(input_color[0]));
+        memcpy(input_color[1], col1 + (size_t)v * 4u, sizeof(input_color[1]));
+        float lit_color[2][4];
+        memcpy(lit_color, input_color, sizeof(lit_color));
+        if (p->xf.num_color_chans > 0)
+            gx_xf_light_vertex(&p->xf, 0, mv_pos, mv_normal, input_color, lit_color[0]);
+        if (p->xf.num_color_chans > 1)
+            gx_xf_light_vertex(&p->xf, 1, mv_pos, mv_normal, input_color, lit_color[1]);
+        memcpy(col0 + (size_t)v * 4u, lit_color[0], sizeof(lit_color[0]));
+        memcpy(col1 + (size_t)v * 4u, lit_color[1], sizeof(lit_color[1]));
+
+        float raw_uv[8][2];
+        for (uint32_t tc = 0; tc < 8; ++tc)
+            memcpy(raw_uv[tc], raw_tex[tc] + (size_t)v * 2u, sizeof(raw_uv[tc]));
+        float generated[8][3] = {{0}};
+        for (uint32_t tc = 0; tc < num_texgens; ++tc)
+            gx_xf_generate_texcoord(&p->xf, tc, raw_pos, raw_normal, mv_pos, mv_normal,
+                                    lit_color, raw_uv, tex_mtx[tc][v], generated,
+                                    generated[tc]);
+        for (uint32_t tc = 0; tc < 8; ++tc) {
+            if (!final_tex[tc]) continue;
+            float *out = final_tex[tc] + (size_t)v * 2u;
+            if (tc < num_texgens) {
+                out[0] = generated[tc][0];
+                out[1] = generated[tc][1];
+            } else {
+                out[0] = raw_uv[tc][0];
+                out[1] = raw_uv[tc][1];
+            }
+        }
+    }
+
+    free(normal);
+    free(raw_tex_storage);
+    free(pmi);
+    free(tex_mtx_storage);
+    return used;
+}
 
 static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
                            uint16_t num_vertices, const uint8_t *vertex_data,
@@ -275,13 +394,11 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
         float *tex[8] = {0};
         for (uint32_t k = 0; k < ntc; ++k) {
             uint8_t s = slots[k];
-            tex[s] = layout.tex_present[s] ? g_dry_tex[s] : NULL;
+            tex[s] = g_dry_tex[s];
         }
-        size_t used = gx_vertex_load(&p->fifo, vat, &p->arr, p->cb.read_guest,
-                                     p->cb.user, vertex_data,
-                                     (size_t)num_vertices * vertex_size, num_vertices,
-                                     g_dry_pos, layout.has_color0 ? g_dry_col : NULL,
-                                     NULL, tex, NULL);
+        size_t used = load_and_prepare_vertices(p, vat, &layout, num_vertices, vertex_data,
+                                                (size_t)num_vertices * vertex_size, transform,
+                                                g_dry_pos, g_dry_col, g_dry_col1, tex);
         if (used == 0) return;
         p->prims++;
         p->verts += num_vertices;
@@ -296,6 +413,11 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
         release_record_buffers(rec);
         return;
     }
+    if (sig.has_color1 &&
+        !ensure_buffer(rec, GX_DRAW_BUF_COL1, 4 * sizeof(float), num_vertices)) {
+        release_record_buffers(rec);
+        return;
+    }
     for (uint32_t k = 0; k < ntc; ++k)
         if (!ensure_buffer(rec, GX_DRAW_BUF_TEX0 + slots[k], 2 * sizeof(float),
                            num_vertices)) {
@@ -305,17 +427,21 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
 
     float *pos = GX2RLockBufferEx(&rec->buffer[GX_DRAW_BUF_POS], 0);
     float *col = GX2RLockBufferEx(&rec->buffer[GX_DRAW_BUF_COL0], 0);
+    float *col1 = sig.has_color1 ? GX2RLockBufferEx(&rec->buffer[GX_DRAW_BUF_COL1], 0) :
+                                  calloc((size_t)num_vertices * 4u, sizeof(*col1));
     float *tex[8] = {0};
     float *tex_locked[8] = {0};
     for (uint32_t k = 0; k < ntc; ++k) {
         uint8_t s = slots[k];
         tex_locked[s] = GX2RLockBufferEx(&rec->buffer[GX_DRAW_BUF_TEX0 + s], 0);
-        tex[s] = layout.tex_present[s] ? tex_locked[s] : NULL;
+        tex[s] = tex_locked[s];
     }
 
-    if (!pos || !col) {
+    if (!pos || !col || !col1) {
         if (pos) GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_POS], 0);
         if (col) GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_COL0], 0);
+        if (col1 && sig.has_color1) GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_COL1], 0);
+        if (col1 && !sig.has_color1) free(col1);
         for (uint32_t k = 0; k < ntc; ++k)
             if (tex_locked[slots[k]])
                 GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_TEX0 + slots[k]], 0);
@@ -326,6 +452,8 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
         if (!tex_locked[slots[k]]) {
             GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_POS], 0);
             GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_COL0], 0);
+            if (sig.has_color1) GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_COL1], 0);
+            else free(col1);
             for (uint32_t j = 0; j < ntc; ++j)
                 if (tex_locked[slots[j]])
                     GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_TEX0 + slots[j]], 0);
@@ -333,25 +461,14 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
             return;
         }
 
-    size_t used = gx_vertex_load(&p->fifo, vat, &p->arr, p->cb.read_guest, p->cb.user,
-                                 vertex_data, (size_t)num_vertices * vertex_size,
-                                 num_vertices, pos, layout.has_color0 ? col : NULL,
-                                 NULL, tex, NULL);
-
-    if (used != 0) {
-        if (!layout.has_color0)
-            for (uint32_t v = 0; v < num_vertices; ++v) {
-                col[v * 4 + 0] = col[v * 4 + 1] = col[v * 4 + 2] = col[v * 4 + 3] = 1.0f;
-            }
-        for (uint32_t k = 0; k < ntc; ++k) {
-            uint8_t s = slots[k];
-            if (!layout.tex_present[s])
-                memset(tex_locked[s], 0, (size_t)num_vertices * 2 * sizeof(float));
-        }
-    }
+    size_t used = load_and_prepare_vertices(p, vat, &layout, num_vertices, vertex_data,
+                                            (size_t)num_vertices * vertex_size, transform,
+                                            pos, col, col1, tex);
 
     GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_POS], 0);
     GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_COL0], 0);
+    if (sig.has_color1) GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_COL1], 0);
+    else free(col1);
     for (uint32_t k = 0; k < ntc; ++k)
         GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_TEX0 + slots[k]], 0);
 
@@ -377,19 +494,8 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
     rec->ntc   = ntc;
     rec->shader_cache_index = (uint8_t)shader_slot;
     memcpy(rec->slots, slots, sizeof(rec->slots));
-    if (transform)
-        gx_xf_build_vs_cfile(&p->xf, p->geom_mtx_index, rec->vs_cfile);
-    else
-        gx_xf_build_vs_cfile(&p->xf, 0, rec->vs_cfile);  // 2D passthrough
-    memset(rec->vs_cfile + 16, 0, sizeof(float) * 12 * ntc);
-    for (uint32_t k = 0; k < ntc; ++k) {
-        if (!sig.texgen[k]) continue;
-        uint8_t tc = slots[k];
-        bool stq = p->xf.texmtx[tc].projection == GX_XF_TEX_STQ;
-        gx_xf_build_texmtx_cfile(&p->xf, p->tex_mtx_index[tc], stq,
-                                 rec->vs_cfile + 16 + 12 * k);
-    }
-    rec->vs_cfile_count = 16 + 12 * ntc;
+    gx_xf_build_projection_cfile(&p->xf, rec->vs_cfile);
+    rec->vs_cfile_count = 16;
     gx_tev_build_ps_cfile(&p->tev, rec->ps_cfile);
     memcpy(rec->texture_unit, p->texture.unit, sizeof(rec->texture_unit));
     for (uint32_t i = 0; i < GX_TEXTURE_MAX_UNITS; ++i)
@@ -456,9 +562,14 @@ bool gx_draw_replay(GXDrawPipeline *p) {
                                rec->buffer[GX_DRAW_BUF_POS].elemSize, 0);
         GX2RSetAttributeBuffer(&rec->buffer[GX_DRAW_BUF_COL0], 1,
                                rec->buffer[GX_DRAW_BUF_COL0].elemSize, 0);
+        const uint32_t tex_binding_base = entry->sig.has_color1 ? 3u : 2u;
+        if (entry->sig.has_color1)
+            GX2RSetAttributeBuffer(&rec->buffer[GX_DRAW_BUF_COL1], 2,
+                                   rec->buffer[GX_DRAW_BUF_COL1].elemSize, 0);
         for (uint32_t k = 0; k < rec->ntc; ++k) {
             int bi = GX_DRAW_BUF_TEX0 + rec->slots[k];
-            GX2RSetAttributeBuffer(&rec->buffer[bi], 2 + k, rec->buffer[bi].elemSize, 0);
+            GX2RSetAttributeBuffer(&rec->buffer[bi], tex_binding_base + k,
+                                   rec->buffer[bi].elemSize, 0);
         }
         GX2DrawEx(rec->mode, rec->count, 0, 1);
     }
@@ -539,6 +650,7 @@ size_t gx_draw_submit(GXDrawPipeline *p, const uint8_t *fifo, size_t len) {
     const GXFifoSink sink = {
         .on_cp = on_cp,
         .on_xf = on_xf,
+        .on_indexed = on_indexed,
         .on_bp = on_bp,
         .on_primitive = on_primitive,
         .resolve_dl = resolve_dl,
@@ -575,11 +687,36 @@ static void put_f(uint8_t *b, size_t *n, float f) {
     put_be32(b, n, u);
 }
 
+static const uint8_t *draw_test_read(void *user, uint32_t ea, uint32_t len) {
+    const uint8_t *data = user;
+    if (ea < 0x80018000u || ea - 0x80018000u + len > 96u) return NULL;
+    return data + ea - 0x80018000u;
+}
+
 int gx_draw_selftest(void) {
     static GXDrawPipeline p;
-    GXDrawCallbacks cb = {0};
+    uint8_t guest[96] = {0};
+    GXDrawCallbacks cb = {.read_guest = draw_test_read, .user = guest};
     if (!gx_draw_init(&p, &cb)) return 0;
     p.dry_run = true;
+
+    size_t gn = 48;
+    const float indexed_mtx[12] = {
+        1, 0, 0, 4,
+        0, 1, 0, 5,
+        0, 0, 1, 6,
+    };
+    for (uint32_t i = 0; i < 12; ++i) put_f(guest, &gn, indexed_mtx[i]);
+    p.arr.base[12] = 0x80018000u;
+    p.arr.stride[12] = 48;
+    uint8_t indexed[5] = {GX_OPCODE_LOAD_INDX_A, 0, 1, 0xB0,
+                          (uint8_t)(XF_POSMATRICES + 4)};
+    if (gx_draw_submit(&p, indexed, sizeof(indexed)) != sizeof(indexed) ||
+        p.xf.pos_matrices[4] != 1.0f || p.xf.pos_matrices[7] != 4.0f ||
+        p.xf.pos_matrices[11] != 5.0f || p.xf.pos_matrices[15] != 6.0f) {
+        gx_draw_shutdown(&p);
+        return 0;
+    }
 
     const uint32_t vcd_lo = (1u << 9) | (1u << 13);  // pos Direct, col0 Direct
     const uint32_t vcd_hi = 0x00000001;              // tex0 Direct

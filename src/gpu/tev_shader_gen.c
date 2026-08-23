@@ -21,7 +21,8 @@ static const uint8_t kSelXYZW[4] = {R700_CHAN_X, R700_CHAN_Y, R700_CHAN_Z, R700_
 
 // GPR allocation for a generated program.
 typedef struct {
-    uint32_t ras;           // rasterised colour 0
+    uint32_t ras[2];        // rasterised colours 0 and 1
+    bool     has_ras1;
     uint32_t coord_gpr[8];  // interpolant GPR per texcoord index
     bool     coord_used[8];
     uint32_t ncoord;
@@ -38,13 +39,22 @@ static uint32_t f32_bits(float f)
     return u;
 }
 
+static bool uses_ras1(const TevConfig *cfg)
+{
+    for (uint32_t s = 0; s < cfg->num_stages; ++s)
+        if (cfg->stage[s].colorchan == GX_RAS_COLOR1)
+            return true;
+    return false;
+}
+
 // One resolved ALU operand.
 typedef struct { uint32_t sel; uint32_t chan; } AluSrc;
 
 static void plan_alloc(const TevConfig *cfg, TevPsAlloc *a)
 {
     memset(a, 0, sizeof(*a));
-    a->ras = 0;
+    a->ras[0] = 0;
+    a->has_ras1 = uses_ras1(cfg);
 
     // Assign an interpolant GPR to each distinct texcoord in ascending order.
     for (uint32_t s = 0; s < cfg->num_stages; ++s) {
@@ -53,6 +63,7 @@ static void plan_alloc(const TevConfig *cfg, TevPsAlloc *a)
         a->coord_used[tc] = true;
     }
     uint32_t next = 1;
+    if (a->has_ras1) a->ras[1] = next++;
     for (uint32_t tc = 0; tc < 8; ++tc)
         if (a->coord_used[tc]) { a->coord_gpr[tc] = next++; a->ncoord++; }
 
@@ -93,17 +104,18 @@ static AluSrc resolve_cc_full(const TevConfig *cfg, const TevPsAlloc *a,
     const uint8_t *tsw = cfg->swap[st->tswap];
     const uint8_t *rsw = cfg->swap[st->rswap];
     bool ras_zero = st->colorchan == GX_RAS_ZERO;
+    uint32_t ras = st->colorchan == GX_RAS_COLOR1 && a->has_ras1 ? a->ras[1] : a->ras[0];
     AluSrc r;
     switch (sel) {
         case GX_CC_TEXC: r.sel = a->tex; r.chan = tsw[ch]; return r;
         case GX_CC_TEXA: r.sel = a->tex; r.chan = tsw[3];  return r;
         case GX_CC_RASC:
             if (ras_zero) { r.sel = R700_ALU_SRC_0; r.chan = 0; }
-            else          { r.sel = a->ras; r.chan = rsw[ch]; }
+            else          { r.sel = ras; r.chan = rsw[ch]; }
             return r;
         case GX_CC_RASA:
             if (ras_zero) { r.sel = R700_ALU_SRC_0; r.chan = 0; }
-            else          { r.sel = a->ras; r.chan = rsw[3]; }
+            else          { r.sel = ras; r.chan = rsw[3]; }
             return r;
         default: return resolve_cc(a, sel, ch);
     }
@@ -117,6 +129,7 @@ static AluSrc resolve_ca(const TevConfig *cfg, const TevPsAlloc *a, uint32_t s,
     const uint8_t *tsw = cfg->swap[st->tswap];
     const uint8_t *rsw = cfg->swap[st->rswap];
     bool ras_zero = st->colorchan == GX_RAS_ZERO;
+    uint32_t ras = st->colorchan == GX_RAS_COLOR1 && a->has_ras1 ? a->ras[1] : a->ras[0];
     AluSrc r = {R700_ALU_SRC_0, 0};
     switch (sel) {
         case GX_CA_APREV: r.sel = a->reg[0]; r.chan = 3; break;
@@ -125,7 +138,7 @@ static AluSrc resolve_ca(const TevConfig *cfg, const TevPsAlloc *a, uint32_t s,
         case GX_CA_A2:    r.sel = a->reg[3]; r.chan = 3; break;
         case GX_CA_TEXA:  r.sel = a->tex; r.chan = tsw[3]; break;
         case GX_CA_RASA:
-            if (!ras_zero) { r.sel = a->ras; r.chan = rsw[3]; }
+            if (!ras_zero) { r.sel = ras; r.chan = rsw[3]; }
             break;
         case GX_CA_KONST: r.sel = a->konst; r.chan = 3; break;
         case GX_CA_ZERO:  break;
@@ -555,8 +568,9 @@ void tev_shader_gen_ps_shape(const TevConfig *cfg, Gx2PsShape *out)
     TevPsAlloc a;
     plan_alloc(cfg, &a);
 
-    out->input_semantics[0] = 0;  // rasterised colour
+    out->input_semantics[0] = 0;  // rasterised colour 0
     uint32_t inputs = 1;
+    if (a.has_ras1) out->input_semantics[inputs++] = 1;
     for (uint32_t tc = 0; tc < 8; ++tc)
         if (a.coord_used[tc]) {
             out->input_semantics[inputs] = (uint8_t)inputs;  // consecutive param ids
@@ -638,6 +652,16 @@ bool tev_shader_gen_selftest(void)
     if (exp_gpr != 2) return false;          // PREV lives at R2 here
 
     Gx2PsRegs pr;
+    if (!gx2_ps_regs(&pr, &shape)) return false;
+
+    s0->colorchan = GX_RAS_COLOR1;
+    n = tev_shader_gen_ps(ps, sizeof(ps), &cfg);
+    if (n == 0 || !walk_cf(ps, n, &tex_c, &alu_c, &exp_gpr)) return false;
+    tev_shader_gen_ps_shape(&cfg, &shape);
+    if (shape.num_inputs != 3 || shape.input_semantics[0] != 0 ||
+        shape.input_semantics[1] != 1 || shape.input_semantics[2] != 2 ||
+        shape.num_gprs != 9 || exp_gpr != 3)
+        return false;
     if (!gx2_ps_regs(&pr, &shape)) return false;
 
     // A three-stage config with konst + two textures must build and grow.
