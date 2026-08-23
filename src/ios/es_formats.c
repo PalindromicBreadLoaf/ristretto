@@ -74,7 +74,7 @@ bool es_ticket_parse(const void *data, size_t size, EsTicketInfo *out_info) {
 
 bool es_formats_selftest(void) {
     uint8_t tmd[0x1E4] = {0};
-    tmd[3] = 1;
+    tmd[1] = 1; tmd[3] = 1;
     tmd[0x183] = 1;
     tmd[0x18C] = 0x00; tmd[0x18D] = 0x01; tmd[0x18E] = 0x00; tmd[0x18F] = 0x01;
     tmd[0x190] = 0x48; tmd[0x191] = 0x41; tmd[0x192] = 0x42; tmd[0x193] = 0x43;
@@ -86,7 +86,7 @@ bool es_formats_selftest(void) {
         return false;
 
     uint8_t ticket[0x2A4] = {0};
-    ticket[3] = 1;
+    ticket[1] = 1; ticket[3] = 1;
     ticket[0x1DC] = 0x00; ticket[0x1DD] = 0x01; ticket[0x1DE] = 0x00; ticket[0x1DF] = 0x01;
     ticket[0x1E0] = 0x48; ticket[0x1E1] = 0x41; ticket[0x1E2] = 0x42; ticket[0x1E3] = 0x43;
     ticket[0x1F1] = 1;
