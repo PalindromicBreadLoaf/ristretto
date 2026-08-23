@@ -52,6 +52,12 @@ void gx_xf_reset(XfConfig *cfg) {
     cfg->pos_matrices[0] = 1.0f;
     cfg->pos_matrices[5] = 1.0f;
     cfg->pos_matrices[10] = 1.0f;
+    cfg->viewport[0] = 320.0f;
+    cfg->viewport[1] = -264.0f;
+    cfg->viewport[2] = 16777215.0f;
+    cfg->viewport[3] = 320.0f;
+    cfg->viewport[4] = 264.0f;
+    cfg->viewport[5] = 16777215.0f;
 }
 
 // Fold a single XF register write into the config.

@@ -15,6 +15,7 @@
 #include <gx2r/buffer.h>
 
 #include "gpu/gx2_bind.h"
+#include "gpu/gx_efb.h"
 #include "gpu/gx_fifo.h"
 #include "gpu/gx_state.h"
 #include "gpu/gx_tev.h"
@@ -44,8 +45,8 @@ typedef struct {
     void       *user;
 } GXDrawCallbacks;
 
-// Maximum primitives recorded per prepared stream.
-#define GX_DRAW_MAX_RECORDS 64
+// Maximum replay operations retained for a prepared stream.
+#define GX_DRAW_MAX_RECORDS 128
 
 // Generated shader trios retained by a draw pipeline.
 #define GX_DRAW_SHADER_CACHE_CAP 64
@@ -75,8 +76,14 @@ typedef struct {
     uint32_t entries;
 } GXDrawShaderCacheStats;
 
-// One prepared draw
+typedef enum {
+    GX_DRAW_RECORD_DRAW,
+    GX_DRAW_RECORD_CLEAR,
+} GXDrawRecordType;
+
+// One recorded EFB operation.
 typedef struct {
+    GXDrawRecordType type;
     GX2PrimitiveMode mode;
     uint32_t         count;
     uint32_t         ntc;
@@ -90,6 +97,11 @@ typedef struct {
     GXDepthState     depth;
     GXBlendState     blend;
     GXCullState      cull;
+    GXViewportState  viewport;
+    GXScissorState   scissor;
+    GXClearState     clear;
+    GX2RBuffer       buffer[GX_DRAW_BUF_COUNT];
+    uint32_t         buffer_cap[GX_DRAW_BUF_COUNT];
 } GXDrawRecord;
 
 typedef struct {
@@ -111,9 +123,8 @@ typedef struct {
     uint32_t               shader_cache_misses;
     uint32_t               shader_cache_evictions;
 
-    // Growable per-attribute GX2R vertex buffers.
-    GX2RBuffer buffer[GX_DRAW_BUF_COUNT];
-    uint32_t   buffer_cap[GX_DRAW_BUF_COUNT];
+    GXEfb efb;
+    bool  live_replay;
 
     // Draws recorded by the last prepare.
     GXDrawRecord record[GX_DRAW_MAX_RECORDS];
@@ -130,17 +141,21 @@ bool gx_draw_init(GXDrawPipeline *p, const GXDrawCallbacks *cb);
 
 void gx_draw_shutdown(GXDrawPipeline *p);
 
+void gx_draw_shutdown_after_gpu_idle(GXDrawPipeline *p);
+
 void gx_draw_reset_state(GXDrawPipeline *p);
 
 void gx_draw_begin_frame(GXDrawPipeline *p);
+
+// Allocate the EFB targets required for replay.
+bool gx_draw_enable_live_replay(GXDrawPipeline *p);
 
 size_t gx_draw_submit(GXDrawPipeline *p, const uint8_t *fifo, size_t len);
 
 // Prepare a GX FIFO command stream.
 uint32_t gx_draw_execute(GXDrawPipeline *p, const uint8_t *fifo, size_t len);
 
-// Re-issue the draws recorded by the last gx_draw_execute.
-void gx_draw_replay(GXDrawPipeline *p);
+bool gx_draw_replay(GXDrawPipeline *p);
 
 GXDrawShaderCacheStats gx_draw_shader_cache_stats(const GXDrawPipeline *p);
 

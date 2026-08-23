@@ -3,7 +3,12 @@
 
 #include "gpu/gx_state.h"
 
+#include <math.h>
 #include <string.h>
+
+#define GX_EFB_WIDTH  640u
+#define GX_EFB_HEIGHT 528u
+#define GX_EFB_DEPTH_MAX 16777215.0f
 
 // GX SrcBlendFactor (Zero,One,DstClr,InvDstClr,SrcAlpha,InvSrcAlpha,DstAlpha,InvDstAlpha)
 // to GX2BlendMode.
@@ -38,14 +43,30 @@ static GX2CompareFunction to_compare(uint32_t gx_compare) {
 
 void gx_state_reset(GXRenderState *state) {
     memset(state, 0, sizeof(*state));
+    state->scissor_tl = 342u | (342u << 12);
+    state->scissor_br = (342u + GX_EFB_WIDTH - 1u) |
+                        ((342u + GX_EFB_HEIGHT - 1u) << 12);
+    state->scissor_offset = 171u | (171u << 10);
+    state->efb_wh = (GX_EFB_WIDTH - 1u) | ((GX_EFB_HEIGHT - 1u) << 10);
 }
 
 void gx_state_apply_bp(GXRenderState *state, uint8_t reg, uint32_t value) {
     switch (reg) {
     case GX_BP_GENMODE:       state->genmode = value; break;
+    case GX_BP_SCISSORTL:     state->scissor_tl = value; break;
+    case GX_BP_SCISSORBR:     state->scissor_br = value; break;
     case GX_BP_ZMODE:         state->zmode = value; break;
     case GX_BP_BLENDMODE:     state->blendmode = value; break;
     case GX_BP_CONSTANTALPHA: state->constant_alpha = value; break;
+    case GX_BP_EFB_TL:        state->efb_tl = value; break;
+    case GX_BP_EFB_WH:        state->efb_wh = value; break;
+    case GX_BP_CLEAR_AR:      state->clear_ar = value; break;
+    case GX_BP_CLEAR_GB:      state->clear_gb = value; break;
+    case GX_BP_CLEAR_Z:       state->clear_z = value; break;
+    case GX_BP_TRIGGER_EFB_COPY:
+        state->clear_pending = (value & (1u << 11)) != 0;
+        break;
+    case GX_BP_SCISSOROFFSET: state->scissor_offset = value; break;
     case GX_BP_ALPHACOMPARE:  state->alpha_compare = value; break;
     default: break;
     }
@@ -116,6 +137,114 @@ void gx_state_alpha_test(const GXRenderState *state, GXAlphaTestState *out) {
     out->op = (a >> 22) & 3;
     out->enable = !(out->comp0 == GX2_COMPARE_FUNC_ALWAYS &&
                     out->comp1 == GX2_COMPARE_FUNC_ALWAYS);
+}
+
+static uint32_t clamp_u32(int32_t value, uint32_t limit) {
+    if (value <= 0) return 0;
+    if ((uint32_t)value >= limit) return limit;
+    return (uint32_t)value;
+}
+
+void gx_state_scissor(const GXRenderState *state, GXScissorState *out) {
+    const int32_t xoff = (int32_t)((state->scissor_offset & 0x1FFu) << 1);
+    const int32_t yoff = (int32_t)(((state->scissor_offset >> 10) & 0x1FFu) << 1);
+    const int32_t left = (int32_t)(state->scissor_tl & 0x7FFu) - xoff;
+    const int32_t top = (int32_t)((state->scissor_tl >> 12) & 0x7FFu) - yoff;
+    const int32_t right = (int32_t)(state->scissor_br & 0x7FFu) - xoff;
+    const int32_t bottom = (int32_t)((state->scissor_br >> 12) & 0x7FFu) - yoff;
+
+    const uint32_t x0 = clamp_u32(left, GX_EFB_WIDTH);
+    const uint32_t y0 = clamp_u32(top, GX_EFB_HEIGHT);
+    const uint32_t x1 = clamp_u32(right + 1, GX_EFB_WIDTH);
+    const uint32_t y1 = clamp_u32(bottom + 1, GX_EFB_HEIGHT);
+    out->x = x0;
+    out->y = y0;
+    out->width = x1 > x0 ? x1 - x0 : 0;
+    out->height = y1 > y0 ? y1 - y0 : 0;
+}
+
+static float clamp_finite(float value, float fallback) {
+    return isfinite(value) ? value : fallback;
+}
+
+static float clamp_float(float value, float lo, float hi) {
+    if (value < lo) return lo;
+    if (value > hi) return hi;
+    return value;
+}
+
+void gx_state_viewport(const GXRenderState *state, const float xf_viewport[6],
+                       GXViewportState *out) {
+    const float wd = clamp_finite(xf_viewport[0], 320.0f);
+    const float ht = clamp_finite(xf_viewport[1], -264.0f);
+    const float z_range = clamp_finite(xf_viewport[2], GX_EFB_DEPTH_MAX);
+    const float x_orig = clamp_finite(xf_viewport[3], 320.0f);
+    const float y_orig = clamp_finite(xf_viewport[4], 264.0f);
+    const float far_z = clamp_finite(xf_viewport[5], GX_EFB_DEPTH_MAX);
+    const float xoff = (float)((state->scissor_offset & 0x1FFu) << 1);
+    const float yoff = (float)(((state->scissor_offset >> 10) & 0x1FFu) << 1);
+
+    out->x = x_orig - xoff - wd;
+    out->y = y_orig - yoff + ht;
+    out->width = 2.0f * wd;
+    out->height = -2.0f * ht;
+    if (out->width < 0.0f) {
+        out->x += out->width;
+        out->width = -out->width;
+    }
+    if (out->height < 0.0f) {
+        out->y += out->height;
+        out->height = -out->height;
+    }
+    if (!isfinite(out->x) || !isfinite(out->y) || !isfinite(out->width) ||
+        !isfinite(out->height)) {
+        out->x = 0.0f;
+        out->y = 0.0f;
+        out->width = GX_EFB_WIDTH;
+        out->height = GX_EFB_HEIGHT;
+    } else {
+        out->x = clamp_float(out->x, -(float)GX_EFB_WIDTH, 2.0f * GX_EFB_WIDTH);
+        out->y = clamp_float(out->y, -(float)GX_EFB_HEIGHT, 2.0f * GX_EFB_HEIGHT);
+        out->width = clamp_float(out->width, 0.0f, 3.0f * GX_EFB_WIDTH);
+        out->height = clamp_float(out->height, 0.0f, 3.0f * GX_EFB_HEIGHT);
+    }
+    out->near_z = (far_z - z_range) / GX_EFB_DEPTH_MAX;
+    out->far_z = far_z / GX_EFB_DEPTH_MAX;
+    if (!isfinite(out->near_z) || !isfinite(out->far_z)) {
+        out->near_z = 0.0f;
+        out->far_z = 1.0f;
+    } else {
+        out->near_z = clamp_float(out->near_z, 0.0f, 1.0f);
+        out->far_z = clamp_float(out->far_z, 0.0f, 1.0f);
+    }
+}
+
+bool gx_state_take_clear(GXRenderState *state, GXClearState *out) {
+    if (!state->clear_pending) return false;
+    state->clear_pending = false;
+
+    const int32_t x = (int32_t)(state->efb_tl & 0x3FFu);
+    const int32_t y = (int32_t)((state->efb_tl >> 10) & 0x3FFu);
+    const int32_t width = (int32_t)(state->efb_wh & 0x3FFu) + 1;
+    const int32_t height = (int32_t)((state->efb_wh >> 10) & 0x3FFu) + 1;
+    const uint32_t x0 = clamp_u32(x, GX_EFB_WIDTH);
+    const uint32_t y0 = clamp_u32(y, GX_EFB_HEIGHT);
+    const uint32_t x1 = clamp_u32(x + width, GX_EFB_WIDTH);
+    const uint32_t y1 = clamp_u32(y + height, GX_EFB_HEIGHT);
+
+    out->rect.x = x0;
+    out->rect.y = y0;
+    out->rect.width = x1 > x0 ? x1 - x0 : 0;
+    out->rect.height = y1 > y0 ? y1 - y0 : 0;
+    out->color[0] = (float)(state->clear_ar & 0xFFu) / 255.0f;
+    out->color[1] = (float)((state->clear_gb >> 8) & 0xFFu) / 255.0f;
+    out->color[2] = (float)(state->clear_gb & 0xFFu) / 255.0f;
+    out->color[3] = (float)((state->clear_ar >> 8) & 0xFFu) / 255.0f;
+    out->depth = (float)(state->clear_z & 0xFFFFFFu) / GX_EFB_DEPTH_MAX;
+    out->color_enable = (state->blendmode & (1u << 3)) != 0;
+    out->alpha_enable = (state->blendmode & (1u << 4)) != 0;
+    out->depth_enable = (state->zmode & (1u << 4)) != 0;
+    return out->color_enable || out->alpha_enable || out->depth_enable;
 }
 
 // Self test
@@ -192,6 +321,39 @@ int gx_state_selftest(void) {
     gx_state_apply_bp(&st, GX_BP_ALPHACOMPARE, (7u << 16) | (7u << 19));
     gx_state_alpha_test(&st, &at);
     if (at.enable) return 0;
+
+    gx_state_apply_bp(&st, GX_BP_SCISSORTL, 342u | (342u << 12));
+    gx_state_apply_bp(&st, GX_BP_SCISSORBR, 981u | (869u << 12));
+    gx_state_apply_bp(&st, GX_BP_SCISSOROFFSET, 171u | (171u << 10));
+    GXScissorState scissor;
+    gx_state_scissor(&st, &scissor);
+    if (scissor.x != 0 || scissor.y != 0 || scissor.width != 640 || scissor.height != 528)
+        return 0;
+
+    const float xf_viewport[6] = {320.0f, -264.0f, GX_EFB_DEPTH_MAX,
+                                  320.0f, 264.0f, GX_EFB_DEPTH_MAX};
+    GXViewportState viewport;
+    gx_state_viewport(&st, xf_viewport, &viewport);
+    if (viewport.x != 0.0f || viewport.y != 0.0f || viewport.width != 640.0f ||
+        viewport.height != 528.0f || viewport.near_z != 0.0f || viewport.far_z != 1.0f)
+        return 0;
+
+    gx_state_apply_bp(&st, GX_BP_BLENDMODE, (1u << 3) | (1u << 4));
+    gx_state_apply_bp(&st, GX_BP_ZMODE, (1u << 4));
+    gx_state_apply_bp(&st, GX_BP_EFB_TL, 4u | (8u << 10));
+    gx_state_apply_bp(&st, GX_BP_EFB_WH, 15u | (31u << 10));
+    gx_state_apply_bp(&st, GX_BP_CLEAR_AR, 0xA011u);
+    gx_state_apply_bp(&st, GX_BP_CLEAR_GB, 0x2233u);
+    gx_state_apply_bp(&st, GX_BP_CLEAR_Z, 0x7FFFFFu);
+    gx_state_apply_bp(&st, GX_BP_TRIGGER_EFB_COPY, 1u << 11);
+    GXClearState clear;
+    if (!gx_state_take_clear(&st, &clear) || clear.rect.x != 4 || clear.rect.y != 8 ||
+        clear.rect.width != 16 || clear.rect.height != 32 || clear.color[0] != 17.0f / 255.0f ||
+        clear.color[1] != 34.0f / 255.0f || clear.color[2] != 51.0f / 255.0f ||
+        clear.color[3] != 160.0f / 255.0f || clear.depth < 0.4999f || clear.depth > 0.5001f ||
+        !clear.color_enable || !clear.alpha_enable || !clear.depth_enable)
+        return 0;
+    if (gx_state_take_clear(&st, &clear)) return 0;
 
     return 1;
 }

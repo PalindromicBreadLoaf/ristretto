@@ -111,6 +111,7 @@ int gx_texture_decode(uint8_t *dst, const uint8_t *src, int width, int height,
 
 bool gx_texture_cache_init(GXTextureCache *cache, GXTextureGuestRead read_guest, void *user);
 void gx_texture_cache_destroy(GXTextureCache *cache);
+void gx_texture_cache_destroy_after_gpu_idle(GXTextureCache *cache);
 void gx_texture_cache_reset_state(GXTextureCache *cache);
 
 // Fold a BP texture/TLUT command.

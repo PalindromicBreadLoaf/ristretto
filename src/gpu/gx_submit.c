@@ -50,6 +50,14 @@ void gx_submit_shutdown(GXSubmitter *submitter) {
     memset(submitter, 0, sizeof(*submitter));
 }
 
+void gx_submit_shutdown_after_gpu_idle(GXSubmitter *submitter) {
+    if (!submitter)
+        return;
+    gx_draw_shutdown_after_gpu_idle(&submitter->draw);
+    free(submitter->pending);
+    memset(submitter, 0, sizeof(*submitter));
+}
+
 void gx_submit_begin_frame(GXSubmitter *submitter) {
     if (!submitter)
         return;

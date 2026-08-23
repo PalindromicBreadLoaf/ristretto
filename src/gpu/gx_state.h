@@ -18,9 +18,18 @@ extern "C" {
 // BP register addresses this translator consumes.
 enum {
     GX_BP_GENMODE       = 0x00,
+    GX_BP_SCISSORTL     = 0x20,
+    GX_BP_SCISSORBR     = 0x21,
     GX_BP_ZMODE         = 0x40,
     GX_BP_BLENDMODE     = 0x41,
     GX_BP_CONSTANTALPHA = 0x42,
+    GX_BP_EFB_TL        = 0x49,
+    GX_BP_EFB_WH        = 0x4A,
+    GX_BP_CLEAR_AR      = 0x4F,
+    GX_BP_CLEAR_GB      = 0x50,
+    GX_BP_CLEAR_Z       = 0x51,
+    GX_BP_TRIGGER_EFB_COPY = 0x52,
+    GX_BP_SCISSOROFFSET = 0x59,
     GX_BP_ALPHACOMPARE  = 0xF3,
 };
 
@@ -30,7 +39,16 @@ typedef struct {
     uint32_t zmode;          // 0x40
     uint32_t blendmode;      // 0x41
     uint32_t constant_alpha; // 0x42
+    uint32_t scissor_tl;     // 0x20
+    uint32_t scissor_br;     // 0x21
+    uint32_t scissor_offset; // 0x59
+    uint32_t efb_tl;         // 0x49
+    uint32_t efb_wh;         // 0x4A
+    uint32_t clear_ar;       // 0x4F
+    uint32_t clear_gb;       // 0x50
+    uint32_t clear_z;        // 0x51
     uint32_t alpha_compare;  // 0xF3
+    bool     clear_pending;
 } GXRenderState;
 
 // GX2 depth test pipeline state.
@@ -72,6 +90,31 @@ typedef struct {
     uint8_t op;
 } GXAlphaTestState;
 
+typedef struct {
+    float x;
+    float y;
+    float width;
+    float height;
+    float near_z;
+    float far_z;
+} GXViewportState;
+
+typedef struct {
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+} GXScissorState;
+
+typedef struct {
+    GXScissorState rect;
+    float          color[4];
+    float          depth;
+    bool           color_enable;
+    bool           alpha_enable;
+    bool           depth_enable;
+} GXClearState;
+
 // Reset all tracked registers to zero.
 void gx_state_reset(GXRenderState *state);
 
@@ -83,6 +126,14 @@ void gx_state_depth(const GXRenderState *state, GXDepthState *out);
 void gx_state_blend(const GXRenderState *state, GXBlendState *out);
 void gx_state_cull(const GXRenderState *state, GXCullState *out);
 void gx_state_alpha_test(const GXRenderState *state, GXAlphaTestState *out);
+
+// Convert the guest XF viewport and BP scissor fields to native EFB coordinates.
+void gx_state_viewport(const GXRenderState *state, const float xf_viewport[6],
+                       GXViewportState *out);
+void gx_state_scissor(const GXRenderState *state, GXScissorState *out);
+
+// Consume a clear requested by an EFB-copy BP command.
+bool gx_state_take_clear(GXRenderState *state, GXClearState *out);
 
 int gx_state_selftest(void);
 

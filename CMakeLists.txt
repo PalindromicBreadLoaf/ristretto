@@ -24,6 +24,7 @@ add_executable(ristretto
     src/gpu/gx2_bind.c
     src/gpu/gx2_shader.c
     src/gpu/gx_draw.c
+    src/gpu/gx_efb.c
     src/gpu/gx_fifo.c
     src/gpu/gx_state.c
     src/gpu/gx_submit.c

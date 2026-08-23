@@ -376,9 +376,9 @@ static bool entry_matches(const GXTextureCacheEntry *entry, const GXTextureUnit 
            entry->tlut == unit->tlut;
 }
 
-static void destroy_entry(GXTextureCacheEntry *entry) {
+static void destroy_entry(GXTextureCacheEntry *entry, bool wait_for_gpu) {
     if (entry->allocated) {
-        GX2DrawDone();
+        if (wait_for_gpu) GX2DrawDone();
         GX2RDestroySurfaceEx(&entry->texture.surface, GX2R_RESOURCE_BIND_NONE);
     }
     memset(entry, 0, sizeof(*entry));
@@ -403,12 +403,12 @@ static GXTextureCacheEntry *find_entry(GXTextureCache *cache, const GXTextureUni
         if (!entry->allocated && !entry->valid && entry->source_size == 0) return entry;
         if (entry->last_used < oldest->last_used) oldest = entry;
     }
-    destroy_entry(oldest);
+    destroy_entry(oldest, true);
     return oldest;
 }
 
 static bool create_surface(GXTextureCacheEntry *entry, const GXTextureDesc *desc) {
-    if (entry->allocated) destroy_entry(entry);
+    if (entry->allocated) destroy_entry(entry, true);
 
     GX2Texture *texture = &entry->texture;
     memset(texture, 0, sizeof(*texture));
@@ -569,7 +569,15 @@ bool gx_texture_cache_init(GXTextureCache *cache, GXTextureGuestRead read_guest,
 void gx_texture_cache_destroy(GXTextureCache *cache) {
     if (!cache) return;
     for (uint32_t i = 0; i < GX_TEXTURE_CACHE_CAP; ++i)
-        destroy_entry(&cache->entry[i]);
+        destroy_entry(&cache->entry[i], true);
+    free(cache->tmem);
+    memset(cache, 0, sizeof(*cache));
+}
+
+void gx_texture_cache_destroy_after_gpu_idle(GXTextureCache *cache) {
+    if (!cache) return;
+    for (uint32_t i = 0; i < GX_TEXTURE_CACHE_CAP; ++i)
+        destroy_entry(&cache->entry[i], false);
     free(cache->tmem);
     memset(cache, 0, sizeof(*cache));
 }

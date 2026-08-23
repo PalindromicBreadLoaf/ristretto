@@ -41,6 +41,7 @@ typedef struct {
 
 bool gx_submit_init(GXSubmitter *submitter, const GXDrawCallbacks *callbacks);
 void gx_submit_shutdown(GXSubmitter *submitter);
+void gx_submit_shutdown_after_gpu_idle(GXSubmitter *submitter);
 
 // Start a new host frame without discarding folded GX state or an incomplete
 // write-gather command.

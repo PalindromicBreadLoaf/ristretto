@@ -18,6 +18,8 @@
 
 // state folding
 
+static void record_clear(GXDrawPipeline *p, const GXClearState *clear);
+
 static void on_cp(void *user, uint8_t sub, uint32_t value) {
     GXDrawPipeline *p = user;
     const uint8_t group = sub & GX_CP_COMMAND_MASK;
@@ -59,6 +61,9 @@ static void on_bp(void *user, uint8_t command, uint32_t value) {
     gx_state_apply_bp(&p->render, command, value);
     gx_tev_apply_bp(&p->tev, command, value);
     gx_texture_cache_apply_bp(&p->texture, command, value);
+    GXClearState clear;
+    if (gx_state_take_clear(&p->render, &clear) && !p->dry_run)
+        record_clear(p, &clear);
 }
 
 static const uint8_t *resolve_dl(void *user, uint32_t addr, uint32_t size) {
@@ -107,7 +112,8 @@ static bool sig_equal(const GXDrawShaderSig *a, const GXDrawShaderSig *b) {
 
 static bool cache_entry_in_use(const GXDrawPipeline *p, uint32_t index) {
     for (uint32_t i = 0; i < p->nrecords; ++i)
-        if (p->record[i].shader_cache_index == index) return true;
+        if (p->record[i].type == GX_DRAW_RECORD_DRAW &&
+            p->record[i].shader_cache_index == index) return true;
     return false;
 }
 
@@ -196,13 +202,13 @@ static GX2PrimitiveMode prim_mode(GXPrimitive prim) {
     }
 }
 
-static bool ensure_buffer(GXDrawPipeline *p, int idx, uint32_t elem_size,
+static bool ensure_buffer(GXDrawRecord *rec, int idx, uint32_t elem_size,
                           uint32_t elem_count) {
-    GX2RBuffer *b = &p->buffer[idx];
-    if (p->buffer_cap[idx] >= elem_count && b->elemSize == elem_size) return true;
-    if (p->buffer_cap[idx]) {
+    GX2RBuffer *b = &rec->buffer[idx];
+    if (rec->buffer_cap[idx] >= elem_count && b->elemSize == elem_size) return true;
+    if (rec->buffer_cap[idx]) {
         GX2RDestroyBufferEx(b, 0);
-        p->buffer_cap[idx] = 0;
+        rec->buffer_cap[idx] = 0;
     }
     memset(b, 0, sizeof(*b));
     b->flags = GX2R_RESOURCE_BIND_VERTEX_BUFFER | GX2R_RESOURCE_USAGE_CPU_READ |
@@ -213,8 +219,33 @@ static bool ensure_buffer(GXDrawPipeline *p, int idx, uint32_t elem_size,
         memset(b, 0, sizeof(*b));
         return false;
     }
-    p->buffer_cap[idx] = elem_count;
+    rec->buffer_cap[idx] = elem_count;
     return true;
+}
+
+static void release_record_buffers(GXDrawRecord *rec) {
+    for (int i = 0; i < GX_DRAW_BUF_COUNT; ++i)
+        if (rec->buffer_cap[i]) {
+            GX2RDestroyBufferEx(&rec->buffer[i], 0);
+            rec->buffer_cap[i] = 0;
+        }
+}
+
+static void release_records(GXDrawPipeline *p, bool wait_for_gpu) {
+    if (p->nrecords && wait_for_gpu) GX2DrawDone();
+    for (uint32_t i = 0; i < p->nrecords; ++i) {
+        release_record_buffers(&p->record[i]);
+        memset(&p->record[i], 0, sizeof(p->record[i]));
+    }
+    p->nrecords = 0;
+}
+
+static void record_clear(GXDrawPipeline *p, const GXClearState *clear) {
+    if (p->nrecords >= GX_DRAW_MAX_RECORDS) return;
+    GXDrawRecord *rec = &p->record[p->nrecords++];
+    memset(rec, 0, sizeof(*rec));
+    rec->type = GX_DRAW_RECORD_CLEAR;
+    rec->clear = *clear;
 }
 
 // Decode targets
@@ -257,22 +288,50 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
         return;
     }
 
-    if (!ensure_buffer(p, GX_DRAW_BUF_POS, 3 * sizeof(float), num_vertices)) return;
-    if (!ensure_buffer(p, GX_DRAW_BUF_COL0, 4 * sizeof(float), num_vertices)) return;
+    GXDrawRecord *rec = &p->record[p->nrecords];
+    memset(rec, 0, sizeof(*rec));
+    rec->type = GX_DRAW_RECORD_DRAW;
+    if (!ensure_buffer(rec, GX_DRAW_BUF_POS, 3 * sizeof(float), num_vertices)) return;
+    if (!ensure_buffer(rec, GX_DRAW_BUF_COL0, 4 * sizeof(float), num_vertices)) {
+        release_record_buffers(rec);
+        return;
+    }
     for (uint32_t k = 0; k < ntc; ++k)
-        if (!ensure_buffer(p, GX_DRAW_BUF_TEX0 + slots[k], 2 * sizeof(float),
-                           num_vertices))
+        if (!ensure_buffer(rec, GX_DRAW_BUF_TEX0 + slots[k], 2 * sizeof(float),
+                           num_vertices)) {
+            release_record_buffers(rec);
             return;
+        }
 
-    float *pos = GX2RLockBufferEx(&p->buffer[GX_DRAW_BUF_POS], 0);
-    float *col = GX2RLockBufferEx(&p->buffer[GX_DRAW_BUF_COL0], 0);
+    float *pos = GX2RLockBufferEx(&rec->buffer[GX_DRAW_BUF_POS], 0);
+    float *col = GX2RLockBufferEx(&rec->buffer[GX_DRAW_BUF_COL0], 0);
     float *tex[8] = {0};
     float *tex_locked[8] = {0};
     for (uint32_t k = 0; k < ntc; ++k) {
         uint8_t s = slots[k];
-        tex_locked[s] = GX2RLockBufferEx(&p->buffer[GX_DRAW_BUF_TEX0 + s], 0);
+        tex_locked[s] = GX2RLockBufferEx(&rec->buffer[GX_DRAW_BUF_TEX0 + s], 0);
         tex[s] = layout.tex_present[s] ? tex_locked[s] : NULL;
     }
+
+    if (!pos || !col) {
+        if (pos) GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_POS], 0);
+        if (col) GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_COL0], 0);
+        for (uint32_t k = 0; k < ntc; ++k)
+            if (tex_locked[slots[k]])
+                GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_TEX0 + slots[k]], 0);
+        release_record_buffers(rec);
+        return;
+    }
+    for (uint32_t k = 0; k < ntc; ++k)
+        if (!tex_locked[slots[k]]) {
+            GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_POS], 0);
+            GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_COL0], 0);
+            for (uint32_t j = 0; j < ntc; ++j)
+                if (tex_locked[slots[j]])
+                    GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_TEX0 + slots[j]], 0);
+            release_record_buffers(rec);
+            return;
+        }
 
     size_t used = gx_vertex_load(&p->fifo, vat, &p->arr, p->cb.read_guest, p->cb.user,
                                  vertex_data, (size_t)num_vertices * vertex_size,
@@ -291,20 +350,28 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
         }
     }
 
-    GX2RUnlockBufferEx(&p->buffer[GX_DRAW_BUF_POS], 0);
-    GX2RUnlockBufferEx(&p->buffer[GX_DRAW_BUF_COL0], 0);
+    GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_POS], 0);
+    GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_COL0], 0);
     for (uint32_t k = 0; k < ntc; ++k)
-        GX2RUnlockBufferEx(&p->buffer[GX_DRAW_BUF_TEX0 + slots[k]], 0);
+        GX2RUnlockBufferEx(&rec->buffer[GX_DRAW_BUF_TEX0 + slots[k]], 0);
 
-    if (used == 0) return;
+    if (used == 0) {
+        release_record_buffers(rec);
+        return;
+    }
 
     int shader_slot = cache_slot_for(p, &sig);
-    if (shader_slot < 0) return;
+    if (shader_slot < 0) {
+        release_record_buffers(rec);
+        return;
+    }
     if (!p->shader_cache[shader_slot].bound.valid &&
-        !build_cached_shader(p, &sig, ntc, shader_slot)) return;
+        !build_cached_shader(p, &sig, ntc, shader_slot)) {
+        release_record_buffers(rec);
+        return;
+    }
 
     // Record the draw for replay inside the render pass.
-    GXDrawRecord *rec = &p->record[p->nrecords++];
     rec->mode  = prim_mode(prim);
     rec->count = num_vertices;
     rec->ntc   = ntc;
@@ -330,7 +397,10 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
     gx_state_depth(&p->render, &rec->depth);
     gx_state_blend(&p->render, &rec->blend);
     gx_state_cull(&p->render, &rec->cull);
+    gx_state_viewport(&p->render, p->xf.viewport, &rec->viewport);
+    gx_state_scissor(&p->render, &rec->scissor);
 
+    p->nrecords++;
     p->prims++;
     p->verts += num_vertices;
 }
@@ -344,6 +414,7 @@ static void apply_state(const GXDrawRecord *rec) {
                        rec->blend.blend_enable ? 1u : 0u, TRUE,
                        (rec->blend.color_update || rec->blend.alpha_update) ? TRUE
                                                                            : FALSE);
+    gx_efb_apply_color_mask(rec->blend.color_update, rec->blend.alpha_update);
     GX2SetBlendControl(GX2_RENDER_TARGET_0, rec->blend.src_color, rec->blend.dst_color,
                        rec->blend.color_combine, TRUE, rec->blend.src_alpha,
                        rec->blend.dst_alpha, rec->blend.alpha_combine);
@@ -351,13 +422,19 @@ static void apply_state(const GXDrawRecord *rec) {
                           rec->cull.cull_back);
 }
 
-void gx_draw_replay(GXDrawPipeline *p) {
-    if (!p || p->nrecords == 0) return;
+bool gx_draw_replay(GXDrawPipeline *p) {
+    if (!p || !p->live_replay || p->nrecords == 0 || !gx_efb_bind(&p->efb)) return false;
 
     for (uint32_t r = 0; r < p->nrecords; ++r) {
-        const GXDrawRecord *rec = &p->record[r];
+        GXDrawRecord *rec = &p->record[r];
+        if (rec->type == GX_DRAW_RECORD_CLEAR) {
+            (void)gx_efb_clear(&p->efb, &rec->clear);
+            continue;
+        }
         const GXDrawShaderCacheEntry *entry = &p->shader_cache[rec->shader_cache_index];
         if (!entry->bound.valid) continue;
+        gx_efb_apply_viewport(&rec->viewport);
+        gx_efb_apply_scissor(&rec->scissor);
         GX2SetFetchShader(&entry->bound.fs);
         GX2SetVertexShader(&entry->bound.vs);
         GX2SetPixelShader(&entry->bound.ps);
@@ -375,16 +452,17 @@ void gx_draw_replay(GXDrawPipeline *p) {
         }
         GX2SetVertexUniformReg(0, rec->vs_cfile_count, (void *)rec->vs_cfile);
         apply_state(rec);
-        GX2RSetAttributeBuffer(&p->buffer[GX_DRAW_BUF_POS], 0,
-                               p->buffer[GX_DRAW_BUF_POS].elemSize, 0);
-        GX2RSetAttributeBuffer(&p->buffer[GX_DRAW_BUF_COL0], 1,
-                               p->buffer[GX_DRAW_BUF_COL0].elemSize, 0);
+        GX2RSetAttributeBuffer(&rec->buffer[GX_DRAW_BUF_POS], 0,
+                               rec->buffer[GX_DRAW_BUF_POS].elemSize, 0);
+        GX2RSetAttributeBuffer(&rec->buffer[GX_DRAW_BUF_COL0], 1,
+                               rec->buffer[GX_DRAW_BUF_COL0].elemSize, 0);
         for (uint32_t k = 0; k < rec->ntc; ++k) {
             int bi = GX_DRAW_BUF_TEX0 + rec->slots[k];
-            GX2RSetAttributeBuffer(&p->buffer[bi], 2 + k, p->buffer[bi].elemSize, 0);
+            GX2RSetAttributeBuffer(&rec->buffer[bi], 2 + k, rec->buffer[bi].elemSize, 0);
         }
         GX2DrawEx(rec->mode, rec->count, 0, 1);
     }
+    return true;
 }
 
 static void on_primitive(void *user, GXPrimitive prim, uint8_t vat,
@@ -400,23 +478,32 @@ bool gx_draw_init(GXDrawPipeline *p, const GXDrawCallbacks *cb) {
     memset(p, 0, sizeof(*p));
     p->cb = *cb;
     if (!gx_texture_cache_init(&p->texture, cb->read_guest, cb->user)) return false;
+    p->dry_run = true;
     gx_draw_reset_state(p);
     p->ok = true;
     return true;
 }
 
-void gx_draw_shutdown(GXDrawPipeline *p) {
+static void gx_draw_shutdown_impl(GXDrawPipeline *p, bool wait_for_gpu) {
     if (!p) return;
+    release_records(p, wait_for_gpu);
     for (uint32_t i = 0; i < GX_DRAW_SHADER_CACHE_CAP; ++i)
         if (p->shader_cache[i].sig.valid)
             gx2_bind_free(&p->shader_cache[i].bound);
-    for (int i = 0; i < GX_DRAW_BUF_COUNT; ++i)
-        if (p->buffer_cap[i]) {
-            GX2RDestroyBufferEx(&p->buffer[i], 0);
-            p->buffer_cap[i] = 0;
-        }
-    gx_texture_cache_destroy(&p->texture);
+    gx_efb_shutdown(&p->efb);
+    if (wait_for_gpu)
+        gx_texture_cache_destroy(&p->texture);
+    else
+        gx_texture_cache_destroy_after_gpu_idle(&p->texture);
     p->ok = false;
+}
+
+void gx_draw_shutdown(GXDrawPipeline *p) {
+    gx_draw_shutdown_impl(p, true);
+}
+
+void gx_draw_shutdown_after_gpu_idle(GXDrawPipeline *p) {
+    gx_draw_shutdown_impl(p, false);
 }
 
 void gx_draw_reset_state(GXDrawPipeline *p) {
@@ -433,9 +520,18 @@ void gx_draw_reset_state(GXDrawPipeline *p) {
 
 void gx_draw_begin_frame(GXDrawPipeline *p) {
     if (!p) return;
+    release_records(p, true);
     p->prims = 0;
     p->verts = 0;
-    p->nrecords = 0;
+}
+
+bool gx_draw_enable_live_replay(GXDrawPipeline *p) {
+    if (!p) return false;
+    if (p->live_replay) return true;
+    if (!gx_efb_init(&p->efb)) return false;
+    p->dry_run = false;
+    p->live_replay = true;
+    return true;
 }
 
 size_t gx_draw_submit(GXDrawPipeline *p, const uint8_t *fifo, size_t len) {

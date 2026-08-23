@@ -8,6 +8,7 @@
 #include <whb/sdcard.h>
 
 #include <gx2/draw.h>
+#include <gx2/context.h>
 #include <gx2/mem.h>
 #include <gx2/registers.h>
 #include <gx2/sampler.h>
@@ -54,10 +55,6 @@
 // PoC for a fixed-function pipeline via GX2.
 
 #define TEX_SIZE 64
-
-#ifndef RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO
-#define RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO 0
-#endif
 
 static const float sPositions[] = {
     -0.8f, -0.8f,
@@ -285,6 +282,51 @@ static bool selfTestBoot(void) {
 static uint8_t *g_dol_buf = NULL;
 static long     g_dol_len = 0;
 static GXSubmitter g_gx_submit;
+static FILE *g_sd_log;
+static bool g_sd_mounted;
+
+static bool ensureSdCardMounted(void) {
+    if (g_sd_mounted) return true;
+    if (!WHBMountSdCard()) return false;
+    g_sd_mounted = true;
+    return true;
+}
+
+static void sdLogHandler(const char *message) {
+    if (!g_sd_log || !message) return;
+    fputs(message, g_sd_log);
+    size_t len = strlen(message);
+    if (len == 0 || message[len - 1] != '\n') fputc('\n', g_sd_log);
+    fflush(g_sd_log);
+}
+
+static bool initSdLog(void) {
+    if (!ensureSdCardMounted()) return false;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/wiiu/apps/ristretto/ristretto-debug.log",
+             WHBGetSdCardMountPath());
+    g_sd_log = fopen(path, "w");
+    if (!g_sd_log) return false;
+    if (!WHBAddLogHandler(sdLogHandler)) {
+        fclose(g_sd_log);
+        g_sd_log = NULL;
+        return false;
+    }
+    WHBLogPrintf("log: writing %s", path);
+    return true;
+}
+
+static void shutdownSdLog(void) {
+    if (g_sd_log) {
+        WHBRemoveLogHandler(sdLogHandler);
+        fclose(g_sd_log);
+        g_sd_log = NULL;
+    }
+    if (g_sd_mounted) {
+        WHBUnmountSdCard();
+        g_sd_mounted = false;
+    }
+}
 
 static const uint8_t *gxReadGuest(void *user, uint32_t ea, uint32_t len) {
     (void)user;
@@ -293,7 +335,7 @@ static const uint8_t *gxReadGuest(void *user, uint32_t ea, uint32_t len) {
 
 // Read boot.dol off SD into g_dol_buf.
 static void tryLoadDolFromSd(void) {
-    if (!WHBMountSdCard()) {
+    if (!ensureSdCardMounted()) {
         WHBLogPrint("boot: SD mount failed. Skipping DOL boot");
         return;
     }
@@ -305,7 +347,6 @@ static void tryLoadDolFromSd(void) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         WHBLogPrintf("boot: no %s (optional). No DOL to boot", path);
-        WHBUnmountSdCard();
         return;
     }
 
@@ -315,7 +356,6 @@ static void tryLoadDolFromSd(void) {
     if (len <= 0) {
         WHBLogPrint("boot: boot.dol is empty");
         fclose(f);
-        WHBUnmountSdCard();
         return;
     }
 
@@ -329,7 +369,6 @@ static void tryLoadDolFromSd(void) {
         free(buf);
     }
     fclose(f);
-    WHBUnmountSdCard();
 }
 
 // Guest XFB to present.
@@ -366,6 +405,10 @@ static void loadAndRunGuestDol(void) {
     GXDrawCallbacks gx_callbacks = {.read_guest = gxReadGuest};
     bool capture_gx = gx_submit_init(&g_gx_submit, &gx_callbacks);
     if (capture_gx) {
+        if (gx_draw_enable_live_replay(&g_gx_submit.draw))
+            WHBLogPrint("gx: live EFB replay enabled");
+        else
+            WHBLogPrint("gx: live EFB allocation failed");
         gx_submit_begin_frame(&g_gx_submit);
         wii_mmio_set_wgp_sink(gx_submit_wgp_sink, &g_gx_submit);
     } else {
@@ -453,8 +496,8 @@ static Disc g_disc;
 static bool g_disc_mounted = false;
 
 static void tryMountDiscFromSd(void) {
-    if (!WHBMountSdCard()) {
-        WHBLogPrint("disc: SD mount failed. Skipping disc loopback test");
+    if (!ensureSdCardMounted()) {
+        WHBLogPrint("disc: SD mount failed.");
         return;
     }
 
@@ -464,7 +507,6 @@ static void tryMountDiscFromSd(void) {
 
     if (!disc_open_file(&g_disc, path)) {
         WHBLogPrintf("disc: no %s. Skipping disc loopback test", path);
-        WHBUnmountSdCard();
         return;
     }
 
@@ -502,90 +544,16 @@ static void tryMountDiscFromSd(void) {
                  (unsigned long long)part, id);
 }
 
-typedef struct {
-    GX2Texture *tex;
-    GX2Sampler *smp;
-} DemoTexCtx;
-
-static GX2Texture *demoGetTexture(void *u, uint8_t map) {
-    (void)map;
-    return ((DemoTexCtx *)u)->tex;
-}
-static GX2Sampler *demoGetSampler(void *u, uint8_t map) {
-    (void)map;
-    return ((DemoTexCtx *)u)->smp;
-}
-static const uint8_t *demoReadGuest(void *u, uint32_t ea, uint32_t len) {
-    (void)u;
-    return wii_mem_range(ea, len);
-}
-
-static void demoPushCp(uint8_t *f, size_t *n, uint8_t sub, uint32_t val) {
-    f[(*n)++] = GX_OPCODE_LOAD_CP_REG;
-    f[(*n)++] = sub;
-    putBe32(&f[*n], val);
-    *n += 4;
-}
-static void demoPutF(uint8_t *f, size_t *n, float v) {
-    uint32_t u;
-    memcpy(&u, &v, sizeof u);
-    putBe32(&f[*n], u);
-    *n += 4;
-}
-static void demoPushBp(uint8_t *f, size_t *n, uint8_t reg, uint32_t val24) {
-    f[(*n)++] = GX_OPCODE_LOAD_BP_REG;
-    f[(*n)++] = reg;
-    f[(*n)++] = (uint8_t)(val24 >> 16);
-    f[(*n)++] = (uint8_t)(val24 >> 8);
-    f[(*n)++] = (uint8_t)val24;
-}
-
-static size_t buildDemoFifo(uint8_t *f) {
-    size_t n = 0;
-    demoPushCp(f, &n, GX_CP_VCD_LO, (1u << 9) | (1u << 13));
-    demoPushCp(f, &n, GX_CP_VCD_HI, 0x00000001);
-    demoPushCp(f, &n, GX_CP_VAT_A, 0x01216009);
-
-    f[n++] = GX_OPCODE_LOAD_XF_REG;
-    putBe32(&f[n], ((7u - 1u) << 16) | XF_SETPROJECTION);
-    n += 4;
-    static const float proj[6] = {1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f};
-    for (int i = 0; i < 6; ++i) demoPutF(f, &n, proj[i]);
-    putBe32(&f[n], GX_XF_ORTHOGRAPHIC);
-    n += 4;
-
-    demoPushBp(f, &n, GX_BP_BLENDMODE, (1u << 3) | (1u << 4));
-
-    static const float pos[4][3] = {
-        {-0.8f, -0.8f, 0.0f}, {0.8f, -0.8f, 0.0f},
-        {-0.8f, 0.8f, 0.0f},  {0.8f, 0.8f, 0.0f}};
-    static const uint8_t col[4][4] = {
-        {0xFF, 0x33, 0x33, 0xFF}, {0x33, 0xFF, 0x33, 0xFF},
-        {0x33, 0x33, 0xFF, 0xFF}, {0xFF, 0xFF, 0xFF, 0xFF}};
-    static const float uv[4][2] = {
-        {0.0f, 1.0f}, {1.0f, 1.0f}, {0.0f, 0.0f}, {1.0f, 0.0f}};
-    f[n++] = 0x98;  // GX_PRIM_TRIANGLE_STRIP, VAT 0
-    f[n++] = 0x00;
-    f[n++] = 4;
-    for (int v = 0; v < 4; ++v) {
-        demoPutF(f, &n, pos[v][0]);
-        demoPutF(f, &n, pos[v][1]);
-        demoPutF(f, &n, pos[v][2]);
-        f[n++] = col[v][0]; f[n++] = col[v][1]; f[n++] = col[v][2]; f[n++] = col[v][3];
-        demoPutF(f, &n, uv[v][0]);
-        demoPutF(f, &n, uv[v][1]);
-    }
-    return n;
-}
-
 int main(int argc, char **argv) {
     WHBProcInit();
     WHBLogUdpInit();
+    if (!initSdLog()) WHBLogPrint("log: SD capture unavailable");
     WHBGfxInit();
 
     if (!wii_mem_init()) {
         WHBLogPrint("Failed to allocate guest memory map");
         WHBGfxShutdown();
+        shutdownSdLog();
         WHBLogUdpDeinit();
         WHBProcShutdown();
         return -1;
@@ -639,6 +607,7 @@ int main(int argc, char **argv) {
     loadAndRunGuestDol();
 
     int result = 0;
+    bool procui_shutdown = false;
     WHBGfxShaderGroup group = {0};
     GX2RBuffer positionBuffer = {0};
     GX2RBuffer colourBuffer   = {0};
@@ -724,23 +693,9 @@ int main(int argc, char **argv) {
     GX2PixelShader  *ps = useGenerated ? &bound.ps : group.pixelShader;
     uint32_t samplerLoc = ps->samplerVars[0].location;
 
-#if RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO
-    static GXDrawPipeline pipeline;
-    DemoTexCtx demoCtx = {&texture, &sampler};
-    GXDrawCallbacks dcb = {.get_texture = demoGetTexture, .get_sampler = demoGetSampler,
-                           .read_guest = demoReadGuest, .user = &demoCtx};
-    uint8_t demoFifo[256];
-
-    bool useDrawPipeline = gx_draw_init(&pipeline, &dcb);
-    if (useDrawPipeline) {
-        gx_draw_reset_state(&pipeline);
-        pipeline.tev = modulateTev;  // configure the TEV modulate stage directly
-        size_t demoFifoLen = buildDemoFifo(demoFifo);
-
-        uint32_t recorded = gx_draw_execute(&pipeline, demoFifo, demoFifoLen);
-        useDrawPipeline = recorded > 0;
-    }
-#endif
+    const bool haveLiveGuestReplay = g_gx_submit.draw.live_replay &&
+                                     g_gx_submit.draw.nrecords != 0;
+    bool liveReplayPending = haveLiveGuestReplay;
 
     // Present XFB instead of the test shader.
     bool presentGuest = false;
@@ -758,16 +713,19 @@ int main(int argc, char **argv) {
     while (WHBProcIsRunning()) {
         WHBGfxBeginRender();
 
+        if (liveReplayPending) {
+            const bool replayed = gx_draw_replay(&g_gx_submit.draw);
+            GX2ContextState *tv_context = WHBGfxGetTVContextState();
+            if (tv_context) GX2SetContextState(tv_context);
+            WHBLogPrintf("gx: live EFB replay %s", replayed ? "submitted" : "failed");
+            liveReplayPending = false;
+        }
+
         WHBGfxBeginRenderTV();
         WHBGfxClearColor(0.1f, 0.1f, 0.12f, 1.0f);
         if (presentGuest)
             drawQuadPass(fs, vs, ps, samplerLoc, &xfbTexture, &linearSampler,
                          &fsPosBuffer, &whiteBuffer, &texCoordBuffer, tevUniforms);
-#if RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO
-        else if (useDrawPipeline) {
-            gx_draw_replay(&pipeline);
-        }
-#endif
         else
             drawQuadPass(fs, vs, ps, samplerLoc, &texture, &sampler,
                          &positionBuffer, &colourBuffer, &texCoordBuffer, tevUniforms);
@@ -778,11 +736,6 @@ int main(int argc, char **argv) {
         if (presentGuest)
             drawQuadPass(fs, vs, ps, samplerLoc, &xfbTexture, &linearSampler,
                          &fsPosBuffer, &whiteBuffer, &texCoordBuffer, tevUniforms);
-#if RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO
-        else if (useDrawPipeline) {
-            gx_draw_replay(&pipeline);
-        }
-#endif
         else
             drawQuadPass(fs, vs, ps, samplerLoc, &texture, &sampler,
                          &positionBuffer, &colourBuffer, &texCoordBuffer, tevUniforms);
@@ -791,15 +744,16 @@ int main(int argc, char **argv) {
         WHBGfxFinishRender();
     }
 
-#if RISTRETTO_ENABLE_LIVE_GX_DRAW_DEMO
-    if (useDrawPipeline) gx_draw_shutdown(&pipeline);
-#endif
+    procui_shutdown = true;
     gx2_bind_free(&bound);
 
 exit:
     WHBLogPrint("Exiting...");
     wii_mmio_set_wgp_sink(NULL, NULL);
-    gx_submit_shutdown(&g_gx_submit);
+    if (procui_shutdown)
+        gx_submit_shutdown_after_gpu_idle(&g_gx_submit);
+    else
+        gx_submit_shutdown(&g_gx_submit);
     if (texture.surface.image) {
         free(texture.surface.image);
     }
@@ -817,11 +771,11 @@ exit:
     if (g_disc_mounted) {
         ios_ipc_mount_disc(NULL);
         disc_close(&g_disc);
-        WHBUnmountSdCard();
     }
     ios_ipc_shutdown();
     wii_mem_shutdown();
     WHBGfxShutdown();
+    shutdownSdLog();
     WHBLogUdpDeinit();
     WHBProcShutdown();
     return result;
