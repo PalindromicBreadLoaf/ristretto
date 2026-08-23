@@ -422,11 +422,15 @@ void gx_draw_reset_state(GXDrawPipeline *p) {
     memset(p->tex_mtx_index, 0, sizeof(p->tex_mtx_index));
 }
 
-uint32_t gx_draw_execute(GXDrawPipeline *p, const uint8_t *fifo, size_t len) {
-    if (!p || !fifo) return 0;
+void gx_draw_begin_frame(GXDrawPipeline *p) {
+    if (!p) return;
     p->prims = 0;
     p->verts = 0;
     p->nrecords = 0;
+}
+
+size_t gx_draw_submit(GXDrawPipeline *p, const uint8_t *fifo, size_t len) {
+    if (!p || !fifo) return 0;
     const GXFifoSink sink = {
         .on_cp = on_cp,
         .on_xf = on_xf,
@@ -434,7 +438,13 @@ uint32_t gx_draw_execute(GXDrawPipeline *p, const uint8_t *fifo, size_t len) {
         .on_primitive = on_primitive,
         .resolve_dl = resolve_dl,
     };
-    gx_fifo_run(&p->fifo, fifo, len, &sink, p);
+    return gx_fifo_run(&p->fifo, fifo, len, &sink, p);
+}
+
+uint32_t gx_draw_execute(GXDrawPipeline *p, const uint8_t *fifo, size_t len) {
+    if (!p || !fifo) return 0;
+    gx_draw_begin_frame(p);
+    gx_draw_submit(p, fifo, len);
     return p->prims;
 }
 

@@ -35,6 +35,7 @@
 #include "gpu/gx_draw.h"
 #include "gpu/gx_fifo.h"
 #include "gpu/gx_state.h"
+#include "gpu/gx_submit.h"
 #include "gpu/gx_tev.h"
 #include "gpu/gx_texture.h"
 #include "gpu/gx_vertex.h"
@@ -283,6 +284,12 @@ static bool selfTestBoot(void) {
 // A boot.dol read from SD and kept until we run it.
 static uint8_t *g_dol_buf = NULL;
 static long     g_dol_len = 0;
+static GXSubmitter g_gx_submit;
+
+static const uint8_t *gxReadGuest(void *user, uint32_t ea, uint32_t len) {
+    (void)user;
+    return wii_mem_range(ea, len);
+}
 
 // Read boot.dol off SD into g_dol_buf.
 static void tryLoadDolFromSd(void) {
@@ -355,6 +362,16 @@ static void loadAndRunGuestDol(void) {
     // Fresh VI / IPC / write-gather state for the guest run.
     wii_mmio_reset();
 
+    gx_submit_shutdown(&g_gx_submit);
+    GXDrawCallbacks gx_callbacks = {.read_guest = gxReadGuest};
+    bool capture_gx = gx_submit_init(&g_gx_submit, &gx_callbacks);
+    if (capture_gx) {
+        gx_submit_begin_frame(&g_gx_submit);
+        wii_mmio_set_wgp_sink(gx_submit_wgp_sink, &g_gx_submit);
+    } else {
+        WHBLogPrint("gx: failed to initialise write-gather submission");
+    }
+
     PpcContext ctx;
     memset(&ctx, 0, sizeof ctx);
     ctx.pc     = r.entry_point;
@@ -369,6 +386,20 @@ static void loadAndRunGuestDol(void) {
     if (s.stop == PPC_XSTOP_FAULT)
         WHBLogPrintf("guest: faulted @0x%08X class=%u (translator/HLE coverage gap)",
                      s.last_pc, s.last_class);
+
+    if (capture_gx) {
+        wii_mmio_set_wgp_sink(NULL, NULL);
+        GXSubmitStats gx_stats = gx_submit_stats(&g_gx_submit);
+        WiiWgpStats wgp_stats = wii_mmio_wgp_stats();
+        WHBLogPrintf("gx: WGP=%llu decoded=%llu pending=%u prims=%u verts=%u capture=%u/%llu",
+                     (unsigned long long)gx_stats.bytes_received,
+                     (unsigned long long)gx_stats.bytes_decoded, gx_stats.pending_bytes,
+                     gx_stats.primitives, gx_stats.vertices, wgp_stats.bytes_captured,
+                     (unsigned long long)wgp_stats.bytes_written);
+        if (gx_stats.failed)
+            WHBLogPrintf("gx: submission stopped after %u rejected WGP bytes",
+                         gx_stats.rejected_bytes);
+    }
 
     uint32_t xfb = wii_vi_current_xfb();
     if (xfb) {
@@ -590,6 +621,7 @@ int main(int argc, char **argv) {
     WHBLogPrintf("es_formats selftest: %s", es_formats_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("disc selftest: %s", disc_selftest() ? "PASS" : "FAIL");
     tryMountDiscFromSd();
+    WHBLogPrintf("wii_mmio selftest: %s", wii_mmio_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("wii_vi selftest: %s", wii_vi_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_fifo selftest: %s", gx_fifo_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_state selftest: %s", gx_state_selftest() ? "PASS" : "FAIL");
@@ -598,6 +630,7 @@ int main(int argc, char **argv) {
     WHBLogPrintf("gx_xf selftest: %s", gx_xf_selftest() ? "PASS" : "FAIL");
     (void)gx_vertex_selftest();
     WHBLogPrintf("gx_draw selftest: %s", gx_draw_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("gx_submit selftest: %s", gx_submit_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("r700_emit selftest: %s", r700_emit_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx2_shader selftest: %s", gx2_shader_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("shader_gen selftest: %s", shader_gen_selftest() ? "PASS" : "FAIL");
@@ -765,6 +798,8 @@ int main(int argc, char **argv) {
 
 exit:
     WHBLogPrint("Exiting...");
+    wii_mmio_set_wgp_sink(NULL, NULL);
+    gx_submit_shutdown(&g_gx_submit);
     if (texture.surface.image) {
         free(texture.surface.image);
     }

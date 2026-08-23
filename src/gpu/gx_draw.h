@@ -128,6 +128,10 @@ void gx_draw_shutdown(GXDrawPipeline *p);
 
 void gx_draw_reset_state(GXDrawPipeline *p);
 
+void gx_draw_begin_frame(GXDrawPipeline *p);
+
+size_t gx_draw_submit(GXDrawPipeline *p, const uint8_t *fifo, size_t len);
+
 // Prepare a GX FIFO command stream.
 uint32_t gx_draw_execute(GXDrawPipeline *p, const uint8_t *fifo, size_t len);
 

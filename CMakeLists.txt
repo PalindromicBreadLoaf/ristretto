@@ -26,6 +26,7 @@ add_executable(ristretto
     src/gpu/gx_draw.c
     src/gpu/gx_fifo.c
     src/gpu/gx_state.c
+    src/gpu/gx_submit.c
     src/gpu/gx_tev.c
     src/gpu/gx_texture.c
     src/gpu/gx_vertex.c
