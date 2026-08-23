@@ -18,6 +18,7 @@
 #include "gpu/gx_fifo.h"
 #include "gpu/gx_state.h"
 #include "gpu/gx_tev.h"
+#include "gpu/gx_texture.h"
 #include "gpu/gx_vertex.h"
 #include "gpu/gx_xf.h"
 
@@ -84,6 +85,8 @@ typedef struct {
     float            vs_cfile[16 + 12 * 8];
     uint32_t         vs_cfile_count;   // floats to upload
     float            ps_cfile[8][4];
+    GXTextureUnit    texture_unit[GX_TEXTURE_MAX_UNITS];
+    GX2Sampler       sampler[GX_TEXTURE_MAX_UNITS];
     GXDepthState     depth;
     GXBlendState     blend;
     GXCullState      cull;
@@ -97,6 +100,7 @@ typedef struct {
     XfConfig      xf;        // transform-unit registers
     TevConfig     tev;       // TEV combiner pipeline
     GXRenderState render;    // fixed-function render-state BP registers
+    GXTextureCache texture;  // BP texture units, TLUT memory, and GX2 resources
     GXArrayTable  arr;       // CP array bases/strides for indexed attributes
     uint32_t      geom_mtx_index;   // MATINDEX_A position/normal matrix index
     uint8_t       tex_mtx_index[8]; // MATINDEX_A/B per-texcoord texture matrix index

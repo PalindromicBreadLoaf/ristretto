@@ -6,9 +6,12 @@
 #ifndef RISTRETTO_GPU_GX_TEXTURE_H
 #define RISTRETTO_GPU_GX_TEXTURE_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include <gx2/enum.h>
+#include <gx2/sampler.h>
+#include <gx2/texture.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,6 +42,59 @@ typedef enum {
 // Every format is decoded to 8-bit UNORM RGBA.
 #define GX_TEXTURE_GX2_FORMAT GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8
 
+#define GX_TEXTURE_MAX_UNITS 8
+#define GX_TEXTURE_CACHE_CAP 32
+#define GX_TEXTURE_TMEM_SIZE (1024u * 1024u)
+
+// BP texture-unit state.
+typedef struct {
+    uint32_t mode0;
+    uint32_t mode1;
+    uint32_t image0;
+    uint32_t image1;
+    uint32_t image2;
+    uint32_t image3;
+    uint32_t tlut;
+} GXTextureUnit;
+
+typedef const uint8_t *(*GXTextureGuestRead)(void *user, uint32_t ea, uint32_t size);
+
+typedef struct {
+    GX2Texture texture;
+    uint32_t   source_ea;
+    uint32_t   source_size;
+    uint32_t   tlut_offset;
+    uint32_t   tlut_size;
+    uint32_t   levels;
+    uint32_t   image0;
+    uint32_t   image1;
+    uint32_t   image2;
+    uint32_t   image3;
+    uint32_t   tlut;
+    uint64_t   source_hash;
+    uint64_t   tlut_hash;
+    uint32_t   last_used;
+    bool       allocated;
+    bool       valid;
+    bool       stale;
+} GXTextureCacheEntry;
+
+// Main-memory texture cache and the emulated 1 MiB texture-memory backing used
+// for TLUT loads.
+typedef struct {
+    GXTextureUnit       unit[GX_TEXTURE_MAX_UNITS];
+    GXTextureCacheEntry entry[GX_TEXTURE_CACHE_CAP];
+    GX2Sampler          sampler[GX_TEXTURE_MAX_UNITS];
+    uint32_t            sampler_mode0[GX_TEXTURE_MAX_UNITS];
+    uint32_t            sampler_mode1[GX_TEXTURE_MAX_UNITS];
+    uint8_t            *tmem;
+    uint32_t            tlut_source;
+    uint32_t            clock;
+    GXTextureGuestRead  read_guest;
+    void               *user;
+    bool                sampler_valid[GX_TEXTURE_MAX_UNITS];
+} GXTextureCache;
+
 // Tile dimensions of a format in texels.
 int gx_texture_block_width(GXTextureFormat fmt);
 int gx_texture_block_height(GXTextureFormat fmt);
@@ -52,6 +108,22 @@ int gx_texture_palette_size(GXTextureFormat fmt);
 // Decode an encoded GX texture into a linear RGBA8 surface.
 int gx_texture_decode(uint8_t *dst, const uint8_t *src, int width, int height,
                       GXTextureFormat fmt, const uint8_t *tlut, GXTlutFormat tlutfmt);
+
+bool gx_texture_cache_init(GXTextureCache *cache, GXTextureGuestRead read_guest, void *user);
+void gx_texture_cache_destroy(GXTextureCache *cache);
+void gx_texture_cache_reset_state(GXTextureCache *cache);
+
+// Fold a BP texture/TLUT command.
+void gx_texture_cache_apply_bp(GXTextureCache *cache, uint8_t reg, uint32_t value);
+
+void gx_texture_cache_invalidate_range(GXTextureCache *cache, uint32_t ea, uint32_t size);
+void gx_texture_cache_invalidate_all(GXTextureCache *cache);
+
+GX2Texture *gx_texture_cache_get_texture(GXTextureCache *cache, uint8_t texmap);
+GX2Sampler *gx_texture_cache_get_sampler(GXTextureCache *cache, uint8_t texmap);
+GX2Texture *gx_texture_cache_get_texture_unit(GXTextureCache *cache,
+                                               const GXTextureUnit *unit);
+void gx_texture_sampler_from_unit(GX2Sampler *sampler, const GXTextureUnit *unit);
 
 int gx_texture_selftest(void);
 

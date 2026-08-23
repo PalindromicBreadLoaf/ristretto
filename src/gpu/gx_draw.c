@@ -58,6 +58,7 @@ static void on_bp(void *user, uint8_t command, uint32_t value) {
     GXDrawPipeline *p = user;
     gx_state_apply_bp(&p->render, command, value);
     gx_tev_apply_bp(&p->tev, command, value);
+    gx_texture_cache_apply_bp(&p->texture, command, value);
 }
 
 static const uint8_t *resolve_dl(void *user, uint32_t addr, uint32_t size) {
@@ -323,6 +324,9 @@ static void draw_primitive(GXDrawPipeline *p, GXPrimitive prim, uint8_t vat,
     }
     rec->vs_cfile_count = 16 + 12 * ntc;
     gx_tev_build_ps_cfile(&p->tev, rec->ps_cfile);
+    memcpy(rec->texture_unit, p->texture.unit, sizeof(rec->texture_unit));
+    for (uint32_t i = 0; i < GX_TEXTURE_MAX_UNITS; ++i)
+        gx_texture_sampler_from_unit(&rec->sampler[i], &rec->texture_unit[i]);
     gx_state_depth(&p->render, &rec->depth);
     gx_state_blend(&p->render, &rec->blend);
     gx_state_cull(&p->render, &rec->cull);
@@ -360,10 +364,12 @@ void gx_draw_replay(GXDrawPipeline *p) {
         GX2SetPixelUniformReg(0, 8 * 4, (void *)&rec->ps_cfile[0][0]);
         for (uint32_t i = 0; i < entry->bound.ps_sampler_count; ++i) {
             uint32_t loc = entry->bound.ps_samplers[i].location;
+            if (loc >= GX_TEXTURE_MAX_UNITS) continue;
             GX2Texture *t = p->cb.get_texture ? p->cb.get_texture(p->cb.user, (uint8_t)loc)
-                                              : NULL;
-            GX2Sampler *s = p->cb.get_sampler ? p->cb.get_sampler(p->cb.user, (uint8_t)loc)
-                                              : NULL;
+                                              : gx_texture_cache_get_texture_unit(
+                                                    &p->texture, &rec->texture_unit[loc]);
+            const GX2Sampler *s = p->cb.get_sampler ? p->cb.get_sampler(p->cb.user, (uint8_t)loc)
+                                                    : &rec->sampler[loc];
             if (t) GX2SetPixelTexture(t, loc);
             if (s) GX2SetPixelSampler(s, loc);
         }
@@ -393,6 +399,7 @@ bool gx_draw_init(GXDrawPipeline *p, const GXDrawCallbacks *cb) {
     if (!p || !cb) return false;
     memset(p, 0, sizeof(*p));
     p->cb = *cb;
+    if (!gx_texture_cache_init(&p->texture, cb->read_guest, cb->user)) return false;
     gx_draw_reset_state(p);
     p->ok = true;
     return true;
@@ -408,6 +415,7 @@ void gx_draw_shutdown(GXDrawPipeline *p) {
             GX2RDestroyBufferEx(&p->buffer[i], 0);
             p->buffer_cap[i] = 0;
         }
+    gx_texture_cache_destroy(&p->texture);
     p->ok = false;
 }
 
@@ -417,6 +425,7 @@ void gx_draw_reset_state(GXDrawPipeline *p) {
     gx_xf_reset(&p->xf);
     gx_tev_reset(&p->tev);
     gx_state_reset(&p->render);
+    gx_texture_cache_reset_state(&p->texture);
     memset(&p->arr, 0, sizeof(p->arr));
     p->geom_mtx_index = 0;
     memset(p->tex_mtx_index, 0, sizeof(p->tex_mtx_index));
