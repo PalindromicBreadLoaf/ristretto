@@ -43,7 +43,9 @@ enum {
     R700_OP2_MUL_IEEE = 0x002,
     R700_OP2_MAX      = 0x003,
     R700_OP2_MIN      = 0x004,
+    R700_OP2_FLOOR    = 0x014,
     R700_OP2_MOV      = 0x019,
+    R700_OP2_KILLE    = 0x02C,
 };
 
 // ALU OP3 opcodes.

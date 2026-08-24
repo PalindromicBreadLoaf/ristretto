@@ -132,11 +132,18 @@ void gx_tev_apply_bp(TevConfig *cfg, uint8_t reg, uint32_t value) {
     }
 }
 
-void gx_tev_build_ps_cfile(const TevConfig *cfg, float out[8][4]) {
+void gx_tev_build_ps_cfile(const TevConfig *cfg, float out[GX_TEV_PS_CFILE_COUNT][4]) {
     for (int i = 0; i < 4; ++i)
         for (int ch = 0; ch < 4; ++ch) out[i][ch] = cfg->color[i][ch];
     for (int i = 0; i < 4; ++i)
         for (int ch = 0; ch < 4; ++ch) out[4 + i][ch] = cfg->konst[i][ch];
+    out[8][0] = (float)cfg->pixel.alpha_ref0 / 255.0f;
+    out[8][1] = (float)cfg->pixel.alpha_ref1 / 255.0f;
+    out[8][2] = cfg->pixel.rgba6 ? (float)(cfg->pixel.dst_alpha >> 2) / 63.0f
+                                  : (float)cfg->pixel.dst_alpha / 255.0f;
+    out[8][3] = 0.0f;
+    out[9][0] = cfg->pixel.rgba6 ? 63.0f : 255.0f;
+    out[9][1] = cfg->pixel.rgba6 ? 1.0f / 63.0f : 1.0f / 255.0f;
 }
 
 // Self test
@@ -251,10 +258,19 @@ int gx_tev_selftest(void) {
     if (cfg.color[0][0] != -1.0f / 255.0f) return 0;
 
     // cfile packs PREV/C0/C1/C2 then K0..K3.
-    float cfile[8][4];
+    float cfile[GX_TEV_PS_CFILE_COUNT][4];
     gx_tev_build_ps_cfile(&cfg, cfile);
     if (cfile[1][0] != cfg.color[1][0] || cfile[1][1] != cfg.color[1][1]) return 0;
     if (cfile[6][0] != cfg.konst[2][0] || cfile[6][3] != cfg.konst[2][3]) return 0;
+    cfg.pixel.alpha_ref0 = 0x20;
+    cfg.pixel.alpha_ref1 = 0xE0;
+    cfg.pixel.rgba6 = true;
+    cfg.pixel.dst_alpha = 0x80;
+    gx_tev_build_ps_cfile(&cfg, cfile);
+    if (cfile[8][0] != 32.0f / 255.0f || cfile[8][1] != 224.0f / 255.0f ||
+        cfile[8][2] != 32.0f / 63.0f || cfile[9][0] != 63.0f ||
+        cfile[9][1] != 1.0f / 63.0f)
+        return 0;
 
     return 1;
 }

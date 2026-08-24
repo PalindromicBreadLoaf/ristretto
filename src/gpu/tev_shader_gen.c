@@ -29,6 +29,8 @@ typedef struct {
     uint32_t reg[4];        // PREV, C0, C1, C2
     uint32_t tex;           // current-stage texture sample
     uint32_t konst;         // current-stage konst colour
+    uint32_t fixed;         // post-TEV fixed-function scratch
+    uint32_t blend_source;  // source one alpha for destination alpha override
     uint32_t num_gprs;
 } TevPsAlloc;
 
@@ -72,6 +74,10 @@ static void plan_alloc(const TevConfig *cfg, TevPsAlloc *a)
     a->tex   = base + 4;
     a->konst = base + 5;
     a->num_gprs = base + 6;
+    if (cfg->pixel.alpha_test_enable || cfg->pixel.rgba6 || cfg->pixel.dst_alpha_enable)
+        a->fixed = a->num_gprs++;
+    if (cfg->pixel.dst_alpha_enable)
+        a->blend_source = a->num_gprs++;
 }
 
 // Colour-combiner input select to operand for output channel ch (0..2).
@@ -526,6 +532,152 @@ static uint32_t emit_reg_init(const TevPsAlloc *a, R700Inst64 *buf)
     return n;
 }
 
+// Materialise one GX compare result as 0.0 or 1.0.
+static uint32_t emit_alpha_compare_result(uint8_t comp, uint32_t dst_chan,
+                                          const TevPsAlloc *a, R700Inst64 *buf)
+{
+    const uint32_t alpha = a->reg[0];
+    const uint32_t ref = R700_ALU_SRC_CFILE(TEV_PS_PIXEL_CFILE_BASE);
+    const uint32_t ref_chan = dst_chan;
+    switch (comp & 7u) {
+    case 0: // NEVER
+        buf[0] = r700_alu_op2(R700_OP2_MOV, a->fixed, dst_chan,
+                              R700_ALU_SRC_0, 0, false, R700_ALU_SRC_0, 0, false,
+                              false, true, true);
+        return 1;
+    case 1: // LESS
+    case 2: // EQUAL
+    case 3: // LEQUAL
+    case 4: // GREATER
+    case 5: // NOT_EQUAL
+    case 6: // GEQUAL
+        break;
+    default: // ALWAYS
+        buf[0] = r700_alu_op2(R700_OP2_MOV, a->fixed, dst_chan,
+                              R700_ALU_SRC_1, 0, false, R700_ALU_SRC_0, 0, false,
+                              false, true, true);
+        return 1;
+    }
+    buf[0] = r700_alu_op2(R700_OP2_ADD, TEV_PS_PV_GPR, R700_CHAN_X,
+                          alpha, R700_CHAN_W, false, ref, ref_chan, true,
+                          false, false, false);
+    if ((comp & 7u) == 1)
+        buf[1] = r700_alu_op3(R700_OP3_CNDGE, a->fixed, dst_chan,
+                              R700_ALU_SRC_PV, R700_CHAN_X, false,
+                              R700_ALU_SRC_0, 0, false, R700_ALU_SRC_1, 0, false,
+                              false, true);
+    else if ((comp & 7u) == 2)
+        buf[1] = r700_alu_op3(R700_OP3_CNDE, a->fixed, dst_chan,
+                              R700_ALU_SRC_PV, R700_CHAN_X, false,
+                              R700_ALU_SRC_1, 0, false, R700_ALU_SRC_0, 0, false,
+                              false, true);
+    else if ((comp & 7u) == 3)
+        buf[1] = r700_alu_op3(R700_OP3_CNDGT, a->fixed, dst_chan,
+                              R700_ALU_SRC_PV, R700_CHAN_X, false,
+                              R700_ALU_SRC_0, 0, false, R700_ALU_SRC_1, 0, false,
+                              false, true);
+    else if ((comp & 7u) == 4)
+        buf[1] = r700_alu_op3(R700_OP3_CNDGT, a->fixed, dst_chan,
+                              R700_ALU_SRC_PV, R700_CHAN_X, false,
+                              R700_ALU_SRC_1, 0, false, R700_ALU_SRC_0, 0, false,
+                              false, true);
+    else if ((comp & 7u) == 5)
+        buf[1] = r700_alu_op3(R700_OP3_CNDE, a->fixed, dst_chan,
+                              R700_ALU_SRC_PV, R700_CHAN_X, false,
+                              R700_ALU_SRC_0, 0, false, R700_ALU_SRC_1, 0, false,
+                              false, true);
+    else
+        buf[1] = r700_alu_op3(R700_OP3_CNDGE, a->fixed, dst_chan,
+                              R700_ALU_SRC_PV, R700_CHAN_X, false,
+                              R700_ALU_SRC_1, 0, false, R700_ALU_SRC_0, 0, false,
+                              false, true);
+    return 2;
+}
+
+static uint32_t emit_alpha_test(const TevConfig *cfg, const TevPsAlloc *a, R700Inst64 *buf)
+{
+    if (!cfg->pixel.alpha_test_enable) return 0;
+    uint32_t n = emit_alpha_compare_result(cfg->pixel.alpha_comp0, R700_CHAN_X, a, buf);
+    n += emit_alpha_compare_result(cfg->pixel.alpha_comp1, R700_CHAN_Y, a, buf + n);
+    switch (cfg->pixel.alpha_op & 3u) {
+    case 0: // AND
+        buf[n++] = r700_alu_op2(R700_OP2_MUL, a->fixed, R700_CHAN_Z,
+                                a->fixed, R700_CHAN_X, false, a->fixed, R700_CHAN_Y, false,
+                                false, true, false);
+        break;
+    case 1: // OR
+        buf[n++] = r700_alu_op2(R700_OP2_MAX, a->fixed, R700_CHAN_Z,
+                                a->fixed, R700_CHAN_X, false, a->fixed, R700_CHAN_Y, false,
+                                false, true, false);
+        break;
+    case 2: // XOR
+        buf[n++] = r700_alu_op2(R700_OP2_MAX, TEV_PS_PV_GPR, R700_CHAN_X,
+                                a->fixed, R700_CHAN_X, false, a->fixed, R700_CHAN_Y, false,
+                                false, false, false);
+        buf[n++] = r700_alu_op2(R700_OP2_MIN, TEV_PS_PV_GPR, R700_CHAN_Y,
+                                a->fixed, R700_CHAN_X, false, a->fixed, R700_CHAN_Y, false,
+                                false, false, false);
+        buf[n++] = r700_alu_op2(R700_OP2_ADD, a->fixed, R700_CHAN_Z,
+                                R700_ALU_SRC_PV, R700_CHAN_X, false,
+                                R700_ALU_SRC_PV, R700_CHAN_Y, true, false, true, false);
+        break;
+    default: // XNOR
+        buf[n++] = r700_alu_op2(R700_OP2_MAX, TEV_PS_PV_GPR, R700_CHAN_X,
+                                a->fixed, R700_CHAN_X, false, a->fixed, R700_CHAN_Y, false,
+                                false, false, false);
+        buf[n++] = r700_alu_op2(R700_OP2_MIN, TEV_PS_PV_GPR, R700_CHAN_Y,
+                                a->fixed, R700_CHAN_X, false, a->fixed, R700_CHAN_Y, false,
+                                false, false, false);
+        buf[n++] = r700_alu_op2(R700_OP2_ADD, a->fixed, R700_CHAN_Z,
+                                R700_ALU_SRC_1, 0, false,
+                                R700_ALU_SRC_PV, R700_CHAN_X, true, false, true, false);
+        buf[n++] = r700_alu_op2(R700_OP2_ADD, a->fixed, R700_CHAN_Z,
+                                a->fixed, R700_CHAN_Z, false,
+                                R700_ALU_SRC_PV, R700_CHAN_Y, false, false, true, false);
+        break;
+    }
+    // KILL instructions must finish their clause.
+    buf[n++] = r700_alu_op2(R700_OP2_KILLE, TEV_PS_PV_GPR, R700_CHAN_X,
+                            a->fixed, R700_CHAN_Z, false, R700_ALU_SRC_0, 0, false,
+                            false, false, true);
+    return n;
+}
+
+static uint32_t emit_output_format(const TevConfig *cfg, const TevPsAlloc *a, R700Inst64 *buf)
+{
+    if (!cfg->pixel.rgba6 && !cfg->pixel.dst_alpha_enable) return 0;
+    uint32_t n = 0;
+    if (cfg->pixel.dst_alpha_enable) {
+        for (uint32_t ch = 0; ch < 3; ++ch)
+            buf[n++] = r700_alu_op2(R700_OP2_MOV, a->blend_source, ch,
+                                    R700_ALU_SRC_0, 0, false, R700_ALU_SRC_0, 0, false,
+                                    false, true, ch == 2);
+        buf[n++] = r700_alu_op2(R700_OP2_MOV, a->blend_source, R700_CHAN_W,
+                                a->reg[0], R700_CHAN_W, false,
+                                R700_ALU_SRC_0, 0, false, false, true, false);
+        buf[n++] = r700_alu_op2(R700_OP2_MOV, a->reg[0], R700_CHAN_W,
+                                R700_ALU_SRC_CFILE(TEV_PS_PIXEL_CFILE_BASE), R700_CHAN_Z,
+                                false, R700_ALU_SRC_0, 0, false, false, true,
+                                !cfg->pixel.rgba6);
+    }
+    if (cfg->pixel.rgba6) {
+        for (uint32_t ch = 0; ch < 4; ++ch) {
+            buf[n++] = r700_alu_op2(R700_OP2_MUL, TEV_PS_PV_GPR, ch,
+                                    a->reg[0], ch, false,
+                                    R700_ALU_SRC_CFILE(TEV_PS_FORMAT_CFILE_BASE), R700_CHAN_X,
+                                    false, false, false, ch == 3);
+            buf[n++] = r700_alu_op2(R700_OP2_FLOOR, a->reg[0], ch,
+                                    R700_ALU_SRC_PV, ch, false, R700_ALU_SRC_0, 0, false,
+                                    false, true, ch == 3);
+            buf[n++] = r700_alu_op2(R700_OP2_MUL, a->reg[0], ch,
+                                    a->reg[0], ch, false,
+                                    R700_ALU_SRC_CFILE(TEV_PS_FORMAT_CFILE_BASE), R700_CHAN_Y,
+                                    false, false, true, ch == 3);
+        }
+    }
+    return n;
+}
+
 size_t tev_shader_gen_ps(uint8_t *buf, size_t cap, const TevConfig *cfg)
 {
     if (!buf || !cfg || cfg->num_stages == 0 ||
@@ -556,9 +708,19 @@ size_t tev_shader_gen_ps(uint8_t *buf, size_t cap, const TevConfig *cfg)
         if (!r700_prog_alu_clause(&p, body, n, true)) return 0;
     }
 
+    n = emit_alpha_test(cfg, &a, body);
+    if (n && !r700_prog_alu_clause(&p, body, n, true)) return 0;
+    n = emit_output_format(cfg, &a, body);
+    if (n && !r700_prog_alu_clause(&p, body, n, true)) return 0;
+
     // Export PREV as the pixel colour.
     r700_prog_cf(&p, r700_cf_export(R700_EXPORT_PIXEL, 0, a.reg[0], kSelXYZW,
-                                    true, true, R700_CF_EXPORT_DONE));
+                                    !cfg->pixel.dst_alpha_enable, true,
+                                    cfg->pixel.dst_alpha_enable ? R700_CF_EXPORT :
+                                                                    R700_CF_EXPORT_DONE));
+    if (cfg->pixel.dst_alpha_enable)
+        r700_prog_cf(&p, r700_cf_export(R700_EXPORT_PIXEL, 1, a.blend_source, kSelXYZW,
+                                        true, true, R700_CF_EXPORT_DONE));
     return r700_prog_finalize(&p);
 }
 
@@ -579,7 +741,7 @@ void tev_shader_gen_ps_shape(const TevConfig *cfg, Gx2PsShape *out)
     out->num_inputs = inputs;
     out->num_gprs = a.num_gprs;
     out->stack_size = 0;
-    out->num_color_exports = 1;
+    out->num_color_exports = cfg->pixel.dst_alpha_enable ? 2 : 1;
 }
 
 // Self test
@@ -715,6 +877,28 @@ bool tev_shader_gen_selftest(void)
     if (!walk_cf(ps, n, &tex_c, &alu_c, &exp_gpr)) return false;
     if (tex_c != 1 || alu_c != 2) return false;   // reg-init + one compare stage
     if (exp_gpr != 2) return false;               // PREV at R2
+
+    cfg.pixel.alpha_test_enable = true;
+    cfg.pixel.alpha_comp0 = 6;  // GEQUAL
+    cfg.pixel.alpha_comp1 = 1;  // LESS
+    cfg.pixel.alpha_op = 2;     // XOR
+    cfg.pixel.alpha_ref0 = 0x40;
+    cfg.pixel.alpha_ref1 = 0xC0;
+    n = tev_shader_gen_ps(ps, sizeof(ps), &cfg);
+    if (n == 0 || !walk_cf(ps, n, &tex_c, &alu_c, &exp_gpr)) return false;
+    if (tex_c != 1 || alu_c != 3 || exp_gpr != 2) return false;
+    tev_shader_gen_ps_shape(&cfg, &shape);
+    if (shape.num_gprs != 9 || shape.num_color_exports != 1) return false;
+
+    cfg.pixel.alpha_test_enable = false;
+    cfg.pixel.rgba6 = true;
+    cfg.pixel.dst_alpha_enable = true;
+    cfg.pixel.dst_alpha = 0x80;
+    n = tev_shader_gen_ps(ps, sizeof(ps), &cfg);
+    if (n == 0 || !walk_cf(ps, n, &tex_c, &alu_c, &exp_gpr)) return false;
+    if (tex_c != 1 || alu_c != 3 || exp_gpr != 9) return false;
+    tev_shader_gen_ps_shape(&cfg, &shape);
+    if (shape.num_gprs != 10 || shape.num_color_exports != 2) return false;
 
     return true;
 }

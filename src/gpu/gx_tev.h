@@ -14,6 +14,7 @@ extern "C" {
 #endif
 
 #define GX_TEV_MAX_STAGES 16
+#define GX_TEV_PS_CFILE_COUNT 10
 
 // Colour combiner input select
 enum {
@@ -62,6 +63,19 @@ typedef struct {
     uint8_t kasel;      // KonstSel for alpha konst (0..31)
 } TevStage;
 
+// Pixel operations which are performed after the last TEV stage.
+typedef struct {
+    bool    alpha_test_enable;
+    uint8_t alpha_comp0;
+    uint8_t alpha_comp1;
+    uint8_t alpha_op;
+    uint8_t alpha_ref0;
+    uint8_t alpha_ref1;
+    bool    rgba6;
+    bool    dst_alpha_enable;
+    uint8_t dst_alpha;
+} TevPixelState;
+
 // The accumulated TEV pipeline.
 typedef struct {
     uint8_t  num_stages;  // 1..16 (GENMODE numtevstages + 1)
@@ -71,6 +85,7 @@ typedef struct {
     // (K0..K3), each RGBA normalised to 0..1.
     float    color[4][4];
     float    konst[4][4];
+    TevPixelState pixel;
 } TevConfig;
 
 // Reset to a defined identity.
@@ -81,7 +96,7 @@ void gx_tev_apply_bp(TevConfig *cfg, uint8_t reg, uint32_t value);
 
 // Lay the colour/konst registers into the pixel-shader uniform cfile the
 // generated multi-stage TEV program expects.
-void gx_tev_build_ps_cfile(const TevConfig *cfg, float out[8][4]);
+void gx_tev_build_ps_cfile(const TevConfig *cfg, float out[GX_TEV_PS_CFILE_COUNT][4]);
 
 int gx_tev_selftest(void);
 

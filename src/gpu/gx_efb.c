@@ -190,7 +190,7 @@ bool gx_efb_clear(GXEfb *efb, const GXClearState *clear) {
     GX2RUnlockBufferEx(&efb->clear_position, 0);
     GX2RUnlockBufferEx(&efb->clear_color, 0);
 
-    static const float zero_cfile[8][4] = {{0}};
+    static const float zero_cfile[GX_TEV_PS_CFILE_COUNT][4] = {{0}};
     const GXViewportState full_viewport = {
         .x = 0.0f, .y = 0.0f, .width = GX_EFB_WIDTH, .height = GX_EFB_HEIGHT,
         .near_z = 0.0f, .far_z = 1.0f,
@@ -199,7 +199,7 @@ bool gx_efb_clear(GXEfb *efb, const GXClearState *clear) {
     GX2SetVertexShader(&efb->clear_shader.vs);
     GX2SetPixelShader(&efb->clear_shader.ps);
     GX2SetVertexUniformReg(0, 16, (void *)kIdentity);
-    GX2SetPixelUniformReg(0, 8 * 4, (void *)&zero_cfile[0][0]);
+    GX2SetPixelUniformReg(0, GX_TEV_PS_CFILE_COUNT * 4, (void *)&zero_cfile[0][0]);
     gx_efb_apply_viewport(&full_viewport);
     gx_efb_apply_scissor(&clear->rect);
     GX2SetDepthOnlyControl(clear->depth_enable, clear->depth_enable,

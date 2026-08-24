@@ -19,6 +19,8 @@ extern "C" {
 
 // cfile register that holds the first konst colour K0.
 #define TEV_PS_KONST_CFILE_BASE 4u
+#define TEV_PS_PIXEL_CFILE_BASE 8u
+#define TEV_PS_FORMAT_CFILE_BASE 9u
 
 // Emit the R700 pixel program for cfg into buf.
 size_t tev_shader_gen_ps(uint8_t *buf, size_t cap, const TevConfig *cfg);

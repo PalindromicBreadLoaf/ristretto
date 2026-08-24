@@ -48,6 +48,7 @@ void gx_state_reset(GXRenderState *state) {
                         ((342u + GX_EFB_HEIGHT - 1u) << 12);
     state->scissor_offset = 171u | (171u << 10);
     state->efb_wh = (GX_EFB_WIDTH - 1u) | ((GX_EFB_HEIGHT - 1u) << 10);
+    state->alpha_compare = (7u << 16) | (7u << 19);
 }
 
 void gx_state_apply_bp(GXRenderState *state, uint8_t reg, uint32_t value) {
@@ -58,6 +59,7 @@ void gx_state_apply_bp(GXRenderState *state, uint8_t reg, uint32_t value) {
     case GX_BP_ZMODE:         state->zmode = value; break;
     case GX_BP_BLENDMODE:     state->blendmode = value; break;
     case GX_BP_CONSTANTALPHA: state->constant_alpha = value; break;
+    case GX_BP_ZCOMPARE:      state->zcompare = value; break;
     case GX_BP_EFB_TL:        state->efb_tl = value; break;
     case GX_BP_EFB_WH:        state->efb_wh = value; break;
     case GX_BP_CLEAR_AR:      state->clear_ar = value; break;
@@ -91,6 +93,8 @@ void gx_state_blend(const GXRenderState *state, GXBlendState *out) {
     memset(out, 0, sizeof(*out));
     out->color_update = (b >> 3) & 1;
     out->alpha_update = (b >> 4) & 1;
+    out->dual_source_alpha = ((state->constant_alpha >> 8) & 1u) && out->alpha_update &&
+                             (state->zcompare & 7u) == 1u;
     out->color_combine = GX2_BLEND_COMBINE_MODE_ADD;
     out->alpha_combine = GX2_BLEND_COMBINE_MODE_ADD;
     out->src_color = out->src_alpha = GX2_BLEND_MODE_ONE;
@@ -117,7 +121,24 @@ void gx_state_blend(const GXRenderState *state, GXBlendState *out) {
         out->logic_op_enable = true;
         out->logic_op = kLogicOp[logic_idx];
     }
-    // Todo: EFB pixel format gating
+    if (out->dual_source_alpha) {
+        if (out->src_color == GX2_BLEND_MODE_SRC_ALPHA)
+            out->src_color = GX2_BLEND_MODE_SRC1_ALPHA;
+        else if (out->src_color == GX2_BLEND_MODE_INV_SRC_ALPHA)
+            out->src_color = GX2_BLEND_MODE_INV_SRC1_ALPHA;
+        if (out->dst_color == GX2_BLEND_MODE_SRC_ALPHA)
+            out->dst_color = GX2_BLEND_MODE_SRC1_ALPHA;
+        else if (out->dst_color == GX2_BLEND_MODE_INV_SRC_ALPHA)
+            out->dst_color = GX2_BLEND_MODE_INV_SRC1_ALPHA;
+        if (out->src_alpha == GX2_BLEND_MODE_SRC_ALPHA)
+            out->src_alpha = GX2_BLEND_MODE_SRC1_ALPHA;
+        else if (out->src_alpha == GX2_BLEND_MODE_INV_SRC_ALPHA)
+            out->src_alpha = GX2_BLEND_MODE_INV_SRC1_ALPHA;
+        if (out->dst_alpha == GX2_BLEND_MODE_SRC_ALPHA)
+            out->dst_alpha = GX2_BLEND_MODE_SRC1_ALPHA;
+        else if (out->dst_alpha == GX2_BLEND_MODE_INV_SRC_ALPHA)
+            out->dst_alpha = GX2_BLEND_MODE_INV_SRC1_ALPHA;
+    }
 }
 
 void gx_state_cull(const GXRenderState *state, GXCullState *out) {
@@ -321,6 +342,13 @@ int gx_state_selftest(void) {
     gx_state_apply_bp(&st, GX_BP_ALPHACOMPARE, (7u << 16) | (7u << 19));
     gx_state_alpha_test(&st, &at);
     if (at.enable) return 0;
+
+    gx_state_apply_bp(&st, GX_BP_ZCOMPARE, 1u);
+    gx_state_apply_bp(&st, GX_BP_CONSTANTALPHA, 0x80u | (1u << 8));
+    gx_state_apply_bp(&st, GX_BP_BLENDMODE, (1u << 3) | (1u << 4) | (4u << 8));
+    gx_state_blend(&st, &blend);
+    if (!blend.dual_source_alpha || blend.src_color != GX2_BLEND_MODE_SRC1_ALPHA)
+        return 0;
 
     gx_state_apply_bp(&st, GX_BP_SCISSORTL, 342u | (342u << 12));
     gx_state_apply_bp(&st, GX_BP_SCISSORBR, 981u | (869u << 12));

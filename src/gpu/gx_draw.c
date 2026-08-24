@@ -21,6 +21,22 @@
 
 static void record_clear(GXDrawPipeline *p, const GXClearState *clear);
 
+static void refresh_tev_pixel_state(GXDrawPipeline *p) {
+    GXAlphaTestState alpha;
+    gx_state_alpha_test(&p->render, &alpha);
+    p->tev.pixel.alpha_test_enable = alpha.enable;
+    p->tev.pixel.alpha_comp0 = (uint8_t)alpha.comp0;
+    p->tev.pixel.alpha_comp1 = (uint8_t)alpha.comp1;
+    p->tev.pixel.alpha_op = alpha.op;
+    p->tev.pixel.alpha_ref0 = alpha.ref0;
+    p->tev.pixel.alpha_ref1 = alpha.ref1;
+    p->tev.pixel.rgba6 = (p->render.zcompare & 7u) == 1u;
+    p->tev.pixel.dst_alpha_enable = ((p->render.constant_alpha >> 8) & 1u) &&
+                                    ((p->render.blendmode >> 4) & 1u) &&
+                                    p->tev.pixel.rgba6;
+    p->tev.pixel.dst_alpha = (uint8_t)p->render.constant_alpha;
+}
+
 static void on_cp(void *user, uint8_t sub, uint32_t value) {
     GXDrawPipeline *p = user;
     const uint8_t group = sub & GX_CP_COMMAND_MASK;
@@ -70,6 +86,7 @@ static void on_bp(void *user, uint8_t command, uint32_t value) {
     GXDrawPipeline *p = user;
     gx_state_apply_bp(&p->render, command, value);
     gx_tev_apply_bp(&p->tev, command, value);
+    refresh_tev_pixel_state(p);
     gx_texture_cache_apply_bp(&p->texture, command, value);
     GXClearState clear;
     if (gx_state_take_clear(&p->render, &clear) && !p->dry_run)
@@ -104,6 +121,7 @@ static void build_sig(const GXDrawPipeline *p, bool transform, GXDrawShaderSig *
     out->num_stages = p->tev.num_stages;
     memcpy(out->stage, p->tev.stage, (size_t)out->num_stages * sizeof(out->stage[0]));
     memcpy(out->swap, p->tev.swap, sizeof(out->swap));
+    out->pixel = p->tev.pixel;
     for (uint32_t s = 0; s < out->num_stages; ++s)
         if (out->stage[s].colorchan == GX_RAS_COLOR1)
             out->has_color1 = true;
@@ -118,6 +136,7 @@ static bool sig_equal(const GXDrawShaderSig *a, const GXDrawShaderSig *b) {
     }
     return memcmp(a->stage, b->stage, (size_t)a->num_stages * sizeof(a->stage[0])) == 0 &&
            memcmp(a->swap, b->swap, sizeof(a->swap)) == 0 &&
+           memcmp(&a->pixel, &b->pixel, sizeof(a->pixel)) == 0 &&
            memcmp(a->tex_slot, b->tex_slot, a->num_texcoords) == 0 &&
            memcmp(a->texgen, b->texgen, a->num_texcoords * sizeof(a->texgen[0])) == 0;
 }
@@ -544,7 +563,7 @@ bool gx_draw_replay(GXDrawPipeline *p) {
         GX2SetFetchShader(&entry->bound.fs);
         GX2SetVertexShader(&entry->bound.vs);
         GX2SetPixelShader(&entry->bound.ps);
-        GX2SetPixelUniformReg(0, 8 * 4, (void *)&rec->ps_cfile[0][0]);
+        GX2SetPixelUniformReg(0, GX_TEV_PS_CFILE_COUNT * 4, (void *)&rec->ps_cfile[0][0]);
         for (uint32_t i = 0; i < entry->bound.ps_sampler_count; ++i) {
             uint32_t loc = entry->bound.ps_samplers[i].location;
             if (loc >= GX_TEXTURE_MAX_UNITS) continue;
@@ -623,6 +642,7 @@ void gx_draw_reset_state(GXDrawPipeline *p) {
     gx_xf_reset(&p->xf);
     gx_tev_reset(&p->tev);
     gx_state_reset(&p->render);
+    refresh_tev_pixel_state(p);
     gx_texture_cache_reset_state(&p->texture);
     memset(&p->arr, 0, sizeof(p->arr));
     p->geom_mtx_index = 0;

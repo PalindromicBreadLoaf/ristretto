@@ -188,9 +188,9 @@ bool gx2_bind_build_tev_ex(Gx2BoundShader *out, const TevConfig *cfg,
 
 void gx2_bind_set_tev_uniforms(const TevConfig *cfg) {
     if (!cfg) return;
-    float cfile[8][4];
+    float cfile[GX_TEV_PS_CFILE_COUNT][4];
     gx_tev_build_ps_cfile(cfg, cfile);
-    GX2SetPixelUniformReg(0, 8 * 4, &cfile[0][0]);
+    GX2SetPixelUniformReg(0, GX_TEV_PS_CFILE_COUNT * 4, &cfile[0][0]);
 }
 
 void gx2_bind_free(Gx2BoundShader *out) {

@@ -60,6 +60,7 @@ typedef struct {
     uint32_t num_texcoords;
     TevStage stage[GX_TEV_MAX_STAGES];
     uint8_t  swap[4][4];
+    TevPixelState pixel;
     uint8_t  tex_slot[8];   // distinct sampled texcoord slots
     bool     texgen[8];
 } GXDrawShaderSig;
@@ -92,7 +93,7 @@ typedef struct {
     uint8_t          slots[8];   // distinct sampled texcoord slots, ascending
     float            vs_cfile[16 + 12 * 8];
     uint32_t         vs_cfile_count;   // floats to upload
-    float            ps_cfile[8][4];
+    float            ps_cfile[GX_TEV_PS_CFILE_COUNT][4];
     GXTextureUnit    texture_unit[GX_TEXTURE_MAX_UNITS];
     GX2Sampler       sampler[GX_TEXTURE_MAX_UNITS];
     GXDepthState     depth;

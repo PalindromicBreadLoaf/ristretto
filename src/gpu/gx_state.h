@@ -23,6 +23,7 @@ enum {
     GX_BP_ZMODE         = 0x40,
     GX_BP_BLENDMODE     = 0x41,
     GX_BP_CONSTANTALPHA = 0x42,
+    GX_BP_ZCOMPARE      = 0x43,
     GX_BP_EFB_TL        = 0x49,
     GX_BP_EFB_WH        = 0x4A,
     GX_BP_CLEAR_AR      = 0x4F,
@@ -39,6 +40,7 @@ typedef struct {
     uint32_t zmode;          // 0x40
     uint32_t blendmode;      // 0x41
     uint32_t constant_alpha; // 0x42
+    uint32_t zcompare;       // 0x43
     uint32_t scissor_tl;     // 0x20
     uint32_t scissor_br;     // 0x21
     uint32_t scissor_offset; // 0x59
@@ -64,6 +66,7 @@ typedef struct {
     bool logic_op_enable;
     bool color_update;
     bool alpha_update;
+    bool dual_source_alpha;
     GX2BlendMode src_color;
     GX2BlendMode dst_color;
     GX2BlendMode src_alpha;
