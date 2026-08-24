@@ -14,6 +14,9 @@
 #define TEV_PS_REG_CFILE_BASE 0u
 
 #define TEV_PS_PV_GPR 127u
+#define TEV_PS_IND_MTX_CFILE_BASE 10u
+#define TEV_PS_FOG_COLOR_CFILE 16u
+#define TEV_PS_FOG_PARAM_CFILE 17u
 
 // A 2D texture is sampled with coordinates (x, y, 0, x).
 static const uint8_t kCoord2D[4] = {R700_SEL_X, R700_SEL_Y, R700_SEL_0, R700_SEL_X};
@@ -25,6 +28,12 @@ typedef struct {
     bool     has_ras1;
     uint32_t coord_gpr[8];  // interpolant GPR per texcoord index
     bool     coord_used[8];
+    uint32_t ind_sample[4];
+    bool     ind_used[4];
+    uint32_t coord_tmp;
+    uint32_t ind_offset;
+    uint32_t bump;
+    bool     has_bump;
     uint32_t ncoord;
     uint32_t reg[4];        // PREV, C0, C1, C2
     uint32_t tex;           // current-stage texture sample
@@ -32,6 +41,7 @@ typedef struct {
     uint32_t fixed;         // post-TEV fixed-function scratch
     uint32_t blend_source;  // source one alpha for destination alpha override
     uint32_t num_gprs;
+    uint32_t fog_coord;
 } TevPsAlloc;
 
 static uint32_t f32_bits(float f)
@@ -64,17 +74,39 @@ static void plan_alloc(const TevConfig *cfg, TevPsAlloc *a)
         uint8_t tc = cfg->stage[s].texcoord & 7u;
         a->coord_used[tc] = true;
     }
+    for (uint32_t s = 0; s < cfg->num_stages; ++s) {
+        const uint32_t ind = cfg->stage[s].indirect;
+        const uint32_t matrix = (ind >> 9) & 3u;
+        const uint32_t bump = (ind >> 7) & 3u;
+        if (matrix == 0 && bump == 0) continue;
+        const uint32_t bt = ind & 3u;
+        a->ind_used[bt] = true;
+        a->coord_used[cfg->indirect_stage[bt].texcoord & 7u] = true;
+        a->has_bump |= bump != 0;
+    }
     uint32_t next = 1;
     if (a->has_ras1) a->ras[1] = next++;
     for (uint32_t tc = 0; tc < 8; ++tc)
         if (a->coord_used[tc]) { a->coord_gpr[tc] = next++; a->ncoord++; }
+
+    if (cfg->pixel.fog_type != 0) a->fog_coord = next++;
 
     uint32_t base = next;
     for (uint32_t i = 0; i < 4; ++i) a->reg[i] = base + i;
     a->tex   = base + 4;
     a->konst = base + 5;
     a->num_gprs = base + 6;
-    if (cfg->pixel.alpha_test_enable || cfg->pixel.rgba6 || cfg->pixel.dst_alpha_enable)
+    for (uint32_t i = 0; i < 4; ++i)
+        if (a->ind_used[i]) a->ind_sample[i] = a->num_gprs++;
+    for (uint32_t i = 0; i < 4; ++i)
+        if (a->ind_used[i]) {
+            a->coord_tmp = a->num_gprs++;
+            a->ind_offset = a->num_gprs++;
+            break;
+        }
+    if (a->has_bump) a->bump = a->num_gprs++;
+    if (cfg->pixel.alpha_test_enable || cfg->pixel.rgba6 || cfg->pixel.dst_alpha_enable ||
+        cfg->pixel.efb_format == 2 || cfg->pixel.fog_type != 0 || cfg->pixel.ztex_op != 0)
         a->fixed = a->num_gprs++;
     if (cfg->pixel.dst_alpha_enable)
         a->blend_source = a->num_gprs++;
@@ -116,11 +148,15 @@ static AluSrc resolve_cc_full(const TevConfig *cfg, const TevPsAlloc *a,
         case GX_CC_TEXC: r.sel = a->tex; r.chan = tsw[ch]; return r;
         case GX_CC_TEXA: r.sel = a->tex; r.chan = tsw[3];  return r;
         case GX_CC_RASC:
-            if (ras_zero) { r.sel = R700_ALU_SRC_0; r.chan = 0; }
+            if (st->colorchan == 5 || st->colorchan == 6) {
+                r.sel = a->bump; r.chan = R700_CHAN_X;
+            } else if (ras_zero) { r.sel = R700_ALU_SRC_0; r.chan = 0; }
             else          { r.sel = ras; r.chan = rsw[ch]; }
             return r;
         case GX_CC_RASA:
-            if (ras_zero) { r.sel = R700_ALU_SRC_0; r.chan = 0; }
+            if (st->colorchan == 5 || st->colorchan == 6) {
+                r.sel = a->bump; r.chan = R700_CHAN_X;
+            } else if (ras_zero) { r.sel = R700_ALU_SRC_0; r.chan = 0; }
             else          { r.sel = ras; r.chan = rsw[3]; }
             return r;
         default: return resolve_cc(a, sel, ch);
@@ -144,7 +180,9 @@ static AluSrc resolve_ca(const TevConfig *cfg, const TevPsAlloc *a, uint32_t s,
         case GX_CA_A2:    r.sel = a->reg[3]; r.chan = 3; break;
         case GX_CA_TEXA:  r.sel = a->tex; r.chan = tsw[3]; break;
         case GX_CA_RASA:
-            if (!ras_zero) { r.sel = ras; r.chan = rsw[3]; }
+            if (st->colorchan == 5 || st->colorchan == 6) {
+                r.sel = a->bump; r.chan = R700_CHAN_X;
+            } else if (!ras_zero) { r.sel = ras; r.chan = rsw[3]; }
             break;
         case GX_CA_KONST: r.sel = a->konst; r.chan = 3; break;
         case GX_CA_ZERO:  break;
@@ -519,6 +557,52 @@ static uint32_t emit_stage(const TevConfig *cfg, uint32_t s, const TevPsAlloc *a
     return n;
 }
 
+static uint32_t emit_indirect_coordinate(const TevConfig *cfg, uint32_t s,
+                                         const TevPsAlloc *a, R700Inst64 *buf)
+{
+    const TevStage *st = &cfg->stage[s];
+    const uint32_t ind = st->indirect;
+    const uint32_t matrix = (ind >> 9) & 3u;
+    const uint32_t bump = (ind >> 7) & 3u;
+    if (matrix == 0 && bump == 0) return 0;
+    const uint32_t bt = ind & 3u;
+    const uint32_t base = a->coord_gpr[st->texcoord & 7u];
+    uint32_t n = 0;
+    buf[n++] = r700_alu_op2(R700_OP2_MOV, a->coord_tmp, R700_CHAN_X,
+                            base, R700_CHAN_X, false, R700_ALU_SRC_0, 0, false,
+                            false, true, false);
+    buf[n++] = r700_alu_op2(R700_OP2_MOV, a->coord_tmp, R700_CHAN_Y,
+                            base, R700_CHAN_Y, false, R700_ALU_SRC_0, 0, false,
+                            false, true, bump == 0 && matrix == 0);
+    if (bump) {
+        const uint32_t channel = bump - 1u;
+        buf[n++] = r700_alu_op2(R700_OP2_MOV, a->bump, R700_CHAN_X,
+                                a->ind_sample[bt], channel, false,
+                                R700_ALU_SRC_0, 0, false, false, true, matrix == 0);
+    }
+    if (matrix) {
+        const uint32_t row = TEV_PS_IND_MTX_CFILE_BASE + (matrix - 1u) * 2u;
+        for (uint32_t ch = 0; ch < 2; ++ch) {
+            buf[n++] = r700_alu_op3(R700_OP3_MULADD, a->ind_offset, ch,
+                                    a->ind_sample[bt], R700_CHAN_X, false,
+                                    R700_ALU_SRC_CFILE(row + ch), R700_CHAN_X, false,
+                                    a->ind_sample[bt], R700_CHAN_Y, false, false, false);
+            buf[n++] = r700_alu_op3(R700_OP3_MULADD, a->ind_offset, ch,
+                                    a->ind_sample[bt], R700_CHAN_Z, false,
+                                    R700_ALU_SRC_CFILE(row + ch), R700_CHAN_Z, false,
+                                    a->ind_offset, ch, false, false, ch == 1);
+            buf[n++] = r700_alu_op2(R700_OP2_MUL, a->ind_offset, ch,
+                                    a->ind_offset, ch, false,
+                                    R700_ALU_SRC_CFILE(row), R700_CHAN_W, false,
+                                    false, true, false);
+            buf[n++] = r700_alu_op2(R700_OP2_ADD, a->coord_tmp, ch,
+                                    a->coord_tmp, ch, false, a->ind_offset, ch, false,
+                                    false, true, ch == 1);
+        }
+    }
+    return n;
+}
+
 // Emit the reg-file initialisation clause
 static uint32_t emit_reg_init(const TevPsAlloc *a, R700Inst64 *buf)
 {
@@ -645,7 +729,8 @@ static uint32_t emit_alpha_test(const TevConfig *cfg, const TevPsAlloc *a, R700I
 
 static uint32_t emit_output_format(const TevConfig *cfg, const TevPsAlloc *a, R700Inst64 *buf)
 {
-    if (!cfg->pixel.rgba6 && !cfg->pixel.dst_alpha_enable) return 0;
+    const bool rgb565 = cfg->pixel.efb_format == 2;
+    if (!cfg->pixel.rgba6 && !rgb565 && !cfg->pixel.dst_alpha_enable) return 0;
     uint32_t n = 0;
     if (cfg->pixel.dst_alpha_enable) {
         for (uint32_t ch = 0; ch < 3; ++ch)
@@ -660,21 +745,89 @@ static uint32_t emit_output_format(const TevConfig *cfg, const TevPsAlloc *a, R7
                                 false, R700_ALU_SRC_0, 0, false, false, true,
                                 !cfg->pixel.rgba6);
     }
-    if (cfg->pixel.rgba6) {
-        for (uint32_t ch = 0; ch < 4; ++ch) {
+    if (cfg->pixel.rgba6 || rgb565) {
+        for (uint32_t ch = 0; ch < (cfg->pixel.rgba6 ? 4u : 3u); ++ch) {
+            const float steps = cfg->pixel.rgba6 ? 63.0f : (ch == 1 ? 63.0f : 31.0f);
             buf[n++] = r700_alu_op2(R700_OP2_MUL, TEV_PS_PV_GPR, ch,
-                                    a->reg[0], ch, false,
-                                    R700_ALU_SRC_CFILE(TEV_PS_FORMAT_CFILE_BASE), R700_CHAN_X,
+                                    a->reg[0], ch, false, R700_ALU_SRC_LITERAL, R700_CHAN_X,
                                     false, false, false, ch == 3);
             buf[n++] = r700_alu_op2(R700_OP2_FLOOR, a->reg[0], ch,
                                     R700_ALU_SRC_PV, ch, false, R700_ALU_SRC_0, 0, false,
                                     false, true, ch == 3);
             buf[n++] = r700_alu_op2(R700_OP2_MUL, a->reg[0], ch,
-                                    a->reg[0], ch, false,
-                                    R700_ALU_SRC_CFILE(TEV_PS_FORMAT_CFILE_BASE), R700_CHAN_Y,
+                                    a->reg[0], ch, false, R700_ALU_SRC_LITERAL, R700_CHAN_Y,
                                     false, false, true, ch == 3);
+            buf[n++] = r700_alu_literal(f32_bits(steps), f32_bits(1.0f / steps));
         }
     }
+    return n;
+}
+
+static uint32_t emit_fog(const TevConfig *cfg, const TevPsAlloc *a, R700Inst64 *buf)
+{
+    if (cfg->pixel.fog_type == 0) return 0;
+    uint32_t n = 0;
+    const uint32_t zsrc = cfg->pixel.ztex_op ? a->fixed : a->fog_coord;
+    const uint32_t zchan = cfg->pixel.ztex_op ? R700_CHAN_W : R700_CHAN_Z;
+    buf[n++] = r700_alu_op3(R700_OP3_MULADD, a->fixed, R700_CHAN_X,
+                            zsrc, zchan, false,
+                            R700_ALU_SRC_CFILE(TEV_PS_FOG_PARAM_CFILE), R700_CHAN_X, false,
+                            R700_ALU_SRC_CFILE(TEV_PS_FOG_PARAM_CFILE), R700_CHAN_Y, false,
+                            true, true);
+    if (cfg->pixel.fog_type == 4 || cfg->pixel.fog_type == 6) {
+        buf[n++] = r700_alu_op2(R700_OP2_MUL, a->fixed, R700_CHAN_X,
+                                a->fixed, R700_CHAN_X, false, a->fixed, R700_CHAN_X, false,
+                                true, true, true);
+    } else if (cfg->pixel.fog_type == 5 || cfg->pixel.fog_type == 7) {
+        buf[n++] = r700_alu_op2(R700_OP2_MUL, a->fixed, R700_CHAN_X,
+                                a->fixed, R700_CHAN_X, false, a->fixed, R700_CHAN_X, false,
+                                true, true, true);
+        buf[n++] = r700_alu_op2(R700_OP2_MUL, a->fixed, R700_CHAN_X,
+                                a->fixed, R700_CHAN_X, false, a->fixed, R700_CHAN_X, false,
+                                true, true, true);
+    }
+    buf[n++] = r700_alu_op2(R700_OP2_ADD, TEV_PS_PV_GPR, R700_CHAN_X,
+                            R700_ALU_SRC_1, 0, false, a->fixed, R700_CHAN_X, true,
+                            false, false, true);
+    for (uint32_t ch = 0; ch < 3; ++ch) {
+        buf[n++] = r700_alu_op2(R700_OP2_MUL, a->fixed, ch,
+                                a->reg[0], ch, false, R700_ALU_SRC_PV, R700_CHAN_X, false,
+                                false, true, ch == 2);
+        buf[n++] = r700_alu_op3(R700_OP3_MULADD, a->reg[0], ch,
+                                R700_ALU_SRC_CFILE(TEV_PS_FOG_COLOR_CFILE), ch, false,
+                                a->fixed, R700_CHAN_X, false, a->fixed, ch, false,
+                                false, ch == 2);
+    }
+    return n;
+}
+
+static uint32_t emit_ztexture(const TevConfig *cfg, const TevPsAlloc *a, R700Inst64 *buf)
+{
+    if (cfg->pixel.ztex_op == 0) return 0;
+    const uint32_t prior = cfg->pixel.ztex_op == 1 ? a->fog_coord : R700_ALU_SRC_0;
+    const uint32_t prior_chan = cfg->pixel.ztex_op == 1 ? R700_CHAN_Z : R700_CHAN_X;
+    uint32_t n = 0;
+    if (cfg->pixel.ztex_format == 0) {
+        buf[n++] = r700_alu_op2(R700_OP2_MOV, a->fixed, R700_CHAN_W,
+                                a->tex, R700_CHAN_X, false,
+                                R700_ALU_SRC_0, 0, false, false, true, false);
+    } else if (cfg->pixel.ztex_format == 1) {
+        buf[n++] = r700_alu_op3(R700_OP3_MULADD, a->fixed, R700_CHAN_W,
+                                a->tex, R700_CHAN_X, false, R700_ALU_SRC_LITERAL, R700_CHAN_X,
+                                false, a->tex, R700_CHAN_Y, false, false, true);
+        buf[n++] = r700_alu_literal(f32_bits(256.0f), 0);
+    } else {
+        buf[n++] = r700_alu_op3(R700_OP3_MULADD, a->fixed, R700_CHAN_W,
+                                a->tex, R700_CHAN_X, false, R700_ALU_SRC_LITERAL, R700_CHAN_X,
+                                false, a->tex, R700_CHAN_Y, false, false, false);
+        buf[n++] = r700_alu_op3(R700_OP3_MULADD, a->fixed, R700_CHAN_W,
+                                a->fixed, R700_CHAN_W, false, R700_ALU_SRC_1, 0, false,
+                                a->tex, R700_CHAN_Z, false, false, true);
+        buf[n++] = r700_alu_literal(f32_bits(65536.0f), 0);
+    }
+    buf[n++] = r700_alu_op3(R700_OP3_MULADD, a->fixed, R700_CHAN_W,
+                            a->fixed, R700_CHAN_W, false, R700_ALU_SRC_1, 0, false,
+                            prior, prior_chan, false, false, false);
     return n;
 }
 
@@ -695,10 +848,35 @@ size_t tev_shader_gen_ps(uint8_t *buf, size_t cap, const TevConfig *cfg)
     uint32_t n = emit_reg_init(&a, body);
     if (!r700_prog_alu_clause(&p, body, n, true)) return 0;
 
+    for (uint32_t i = 0; i < 4; ++i) {
+        if (!a.ind_used[i]) continue;
+        const TevIndirectStage *is = &cfg->indirect_stage[i];
+        const uint32_t coord = a.coord_gpr[is->texcoord & 7u];
+        const float ss = 1.0f / (float)(1u << is->scale_s);
+        const float ts = 1.0f / (float)(1u << is->scale_t);
+        body[0] = r700_alu_op2(R700_OP2_MUL, a.ind_offset, R700_CHAN_X,
+                               coord, R700_CHAN_X, false,
+                               R700_ALU_SRC_LITERAL, R700_CHAN_X, false,
+                               false, true, false);
+        body[1] = r700_alu_op2(R700_OP2_MUL, a.ind_offset, R700_CHAN_Y,
+                               coord, R700_CHAN_Y, false,
+                               R700_ALU_SRC_LITERAL, R700_CHAN_Y, false,
+                               false, true, true);
+        body[2] = r700_alu_literal(f32_bits(ss), f32_bits(ts));
+        if (!r700_prog_alu_clause(&p, body, 3, true)) return 0;
+        R700Inst128 tex = r700_tex_sample(is->texmap, is->texmap, a.ind_offset, a.ind_sample[i],
+                                          kCoord2D, kSelXYZW);
+        if (!r700_prog_tex_clause(&p, &tex, 1, true, true)) return 0;
+    }
+
     for (uint32_t s = 0; s < cfg->num_stages; ++s) {
         const TevStage *st = &cfg->stage[s];
         if (st->tex_enable) {
-            uint32_t coord = a.coord_gpr[st->texcoord & 7u];
+            n = emit_indirect_coordinate(cfg, s, &a, body);
+            if (n && !r700_prog_alu_clause(&p, body, n, true)) return 0;
+            const uint32_t ind = st->indirect;
+            uint32_t coord = (((ind >> 9) & 3u) || ((ind >> 7) & 3u)) ?
+                             a.coord_tmp : a.coord_gpr[st->texcoord & 7u];
             R700Inst128 tex = r700_tex_sample(st->texmap, st->texmap, coord,
                                               a.tex, kCoord2D, kSelXYZW);
             if (!r700_prog_tex_clause(&p, &tex, 1, true, true)) return 0;
@@ -709,6 +887,10 @@ size_t tev_shader_gen_ps(uint8_t *buf, size_t cap, const TevConfig *cfg)
     }
 
     n = emit_alpha_test(cfg, &a, body);
+    if (n && !r700_prog_alu_clause(&p, body, n, true)) return 0;
+    n = emit_ztexture(cfg, &a, body);
+    if (n && !r700_prog_alu_clause(&p, body, n, true)) return 0;
+    n = emit_fog(cfg, &a, body);
     if (n && !r700_prog_alu_clause(&p, body, n, true)) return 0;
     n = emit_output_format(cfg, &a, body);
     if (n && !r700_prog_alu_clause(&p, body, n, true)) return 0;
@@ -738,6 +920,8 @@ void tev_shader_gen_ps_shape(const TevConfig *cfg, Gx2PsShape *out)
             out->input_semantics[inputs] = (uint8_t)inputs;  // consecutive param ids
             ++inputs;
         }
+    if (cfg->pixel.fog_type != 0)
+        out->input_semantics[inputs++] = (uint8_t)inputs;
     out->num_inputs = inputs;
     out->num_gprs = a.num_gprs;
     out->stack_size = 0;
@@ -899,6 +1083,23 @@ bool tev_shader_gen_selftest(void)
     if (tex_c != 1 || alu_c != 3 || exp_gpr != 9) return false;
     tev_shader_gen_ps_shape(&cfg, &shape);
     if (shape.num_gprs != 10 || shape.num_color_exports != 2) return false;
+
+    gx_tev_reset(&cfg);
+    cfg.num_stages = 1;
+    cfg.stage[0].tex_enable = true;
+    cfg.stage[0].texmap = 1;
+    cfg.stage[0].texcoord = 0;
+    cfg.stage[0].colorchan = 5;
+    cfg.stage[0].indirect = 2u | (3u << 7) | (1u << 9);
+    cfg.indirect_stage[2] = (TevIndirectStage){.texmap = 3, .texcoord = 1};
+    cfg.pixel.fog_type = 2;
+    cfg.pixel.ztex_op = 1;
+    n = tev_shader_gen_ps(ps, sizeof(ps), &cfg);
+    if (n == 0 || !walk_cf(ps, n, &tex_c, &alu_c, &exp_gpr)) return false;
+    tev_shader_gen_ps_shape(&cfg, &shape);
+    if (tex_c != 2 || shape.num_inputs != 4 || shape.input_semantics[3] != 3 ||
+        shape.num_gprs < 12 || !gx2_ps_regs(&pr, &shape))
+        return false;
 
     return true;
 }

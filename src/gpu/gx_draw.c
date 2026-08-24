@@ -30,7 +30,8 @@ static void refresh_tev_pixel_state(GXDrawPipeline *p) {
     p->tev.pixel.alpha_op = alpha.op;
     p->tev.pixel.alpha_ref0 = alpha.ref0;
     p->tev.pixel.alpha_ref1 = alpha.ref1;
-    p->tev.pixel.rgba6 = (p->render.zcompare & 7u) == 1u;
+    p->tev.pixel.efb_format = (uint8_t)gx_state_efb_format(&p->render);
+    p->tev.pixel.rgba6 = p->tev.pixel.efb_format == GX_EFB_RGBA6_Z24;
     p->tev.pixel.dst_alpha_enable = ((p->render.constant_alpha >> 8) & 1u) &&
                                     ((p->render.blendmode >> 4) & 1u) &&
                                     p->tev.pixel.rgba6;
@@ -108,6 +109,11 @@ static uint32_t distinct_texcoords(const TevConfig *tev, uint8_t slots[8]) {
         if (!tev->stage[s].tex_enable) continue;
         used[tev->stage[s].texcoord & 7u] = true;
     }
+    for (uint32_t s = 0; s < tev->num_stages; ++s) {
+        const uint32_t ind = tev->stage[s].indirect;
+        if (((ind >> 9) & 3u) == 0 && ((ind >> 7) & 3u) == 0) continue;
+        used[tev->indirect_stage[ind & 3u].texcoord & 7u] = true;
+    }
     uint32_t n = 0;
     for (uint32_t tc = 0; tc < 8; ++tc)
         if (used[tc]) slots[n++] = (uint8_t)tc;
@@ -122,6 +128,7 @@ static void build_sig(const GXDrawPipeline *p, bool transform, GXDrawShaderSig *
     memcpy(out->stage, p->tev.stage, (size_t)out->num_stages * sizeof(out->stage[0]));
     memcpy(out->swap, p->tev.swap, sizeof(out->swap));
     out->pixel = p->tev.pixel;
+    memcpy(out->indirect_stage, p->tev.indirect_stage, sizeof(out->indirect_stage));
     for (uint32_t s = 0; s < out->num_stages; ++s)
         if (out->stage[s].colorchan == GX_RAS_COLOR1)
             out->has_color1 = true;
@@ -137,6 +144,7 @@ static bool sig_equal(const GXDrawShaderSig *a, const GXDrawShaderSig *b) {
     return memcmp(a->stage, b->stage, (size_t)a->num_stages * sizeof(a->stage[0])) == 0 &&
            memcmp(a->swap, b->swap, sizeof(a->swap)) == 0 &&
            memcmp(&a->pixel, &b->pixel, sizeof(a->pixel)) == 0 &&
+           memcmp(a->indirect_stage, b->indirect_stage, sizeof(a->indirect_stage)) == 0 &&
            memcmp(a->tex_slot, b->tex_slot, a->num_texcoords) == 0 &&
            memcmp(a->texgen, b->texgen, a->num_texcoords * sizeof(a->texgen[0])) == 0;
 }

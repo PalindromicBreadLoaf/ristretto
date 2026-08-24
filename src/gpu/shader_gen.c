@@ -203,7 +203,7 @@ size_t shader_gen_vs(uint8_t *buf, size_t cap, const ShaderGenVs *cfg)
     if (!r700_prog_alu_clause(&p, alu, n, true)) return 0;
 
     uint32_t nparam = (cfg->has_color ? 1u : 0u) + (cfg->has_color1 ? 1u : 0u) +
-                      cfg->num_texcoords;
+                      cfg->num_texcoords + (cfg->has_fog ? 1u : 0u);
     r700_prog_cf(&p, r700_cf_export(R700_EXPORT_POS, R700_EXPORT_POS0, 1, kSelXYZW,
                                     nparam == 0, true, R700_CF_EXPORT_DONE));
 
@@ -234,6 +234,9 @@ size_t shader_gen_vs(uint8_t *buf, size_t cap, const ShaderGenVs *cfg)
         ++base;
         ++emitted;
     }
+    if (cfg->has_fog)
+        r700_prog_cf(&p, r700_cf_export(R700_EXPORT_PARAM, base, 1, kSelXYZW,
+                                        true, false, R700_CF_EXPORT_DONE));
 
     return r700_prog_finalize(&p);
 }
@@ -302,6 +305,8 @@ void shader_gen_vs_shape(const ShaderGenVs *cfg, Gx2VsShape *out)
     for (uint32_t k = 0; k < cfg->num_texcoords; ++k)
         out->export_semantics[exports++] =
             (uint8_t)((cfg->has_color ? 1u : 0u) + (cfg->has_color1 ? 1u : 0u) + k);
+    if (cfg->has_fog)
+        out->export_semantics[exports++] = (uint8_t)exports;
     out->num_exports = exports;
 }
 

@@ -14,7 +14,7 @@ extern "C" {
 #endif
 
 #define GX_TEV_MAX_STAGES 16
-#define GX_TEV_PS_CFILE_COUNT 10
+#define GX_TEV_PS_CFILE_COUNT 20
 
 // Colour combiner input select
 enum {
@@ -61,7 +61,15 @@ typedef struct {
     uint8_t colorchan;  // GX_RAS_* rasterised colour channel
     uint8_t kcsel;      // KonstSel for colour konst (0..31)
     uint8_t kasel;      // KonstSel for alpha konst (0..31)
+    uint32_t indirect;  // TEVIND register
 } TevStage;
+
+typedef struct {
+    uint8_t texmap;
+    uint8_t texcoord;
+    uint8_t scale_s;
+    uint8_t scale_t;
+} TevIndirectStage;
 
 // Pixel operations which are performed after the last TEV stage.
 typedef struct {
@@ -74,6 +82,19 @@ typedef struct {
     bool    rgba6;
     bool    dst_alpha_enable;
     uint8_t dst_alpha;
+    uint8_t efb_format;
+    uint8_t ztex_format;
+    uint8_t ztex_op;
+    uint32_t ztex_bias;
+    uint8_t fog_type;
+    bool    fog_ortho;
+    bool    fog_range_enable;
+    uint32_t fog_a;
+    uint32_t fog_b_magnitude;
+    uint32_t fog_b_shift;
+    uint32_t fog_c;
+    uint32_t fog_color;
+    uint32_t fog_range[6];
 } TevPixelState;
 
 // The accumulated TEV pipeline.
@@ -85,6 +106,8 @@ typedef struct {
     // (K0..K3), each RGBA normalised to 0..1.
     float    color[4][4];
     float    konst[4][4];
+    TevIndirectStage indirect_stage[4];
+    float    indirect_mtx[3][2][4];
     TevPixelState pixel;
 } TevConfig;
 

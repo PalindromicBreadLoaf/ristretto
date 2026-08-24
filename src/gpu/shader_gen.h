@@ -23,6 +23,7 @@ typedef struct {
     bool     has_normal;     // fetch a_normal
     uint32_t num_texcoords;  // pass this many texcoords through as the next params
     bool     transform_position;
+    bool     has_fog;        // export projected position
     bool     texgen[8];
     // Per-vertex diffuse lighting for colour channel 0.
     struct {

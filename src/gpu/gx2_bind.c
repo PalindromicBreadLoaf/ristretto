@@ -168,11 +168,21 @@ bool gx2_bind_build_tev_ex(Gx2BoundShader *out, const TevConfig *cfg,
         uint8_t tc = st->texcoord & (GX2_BIND_MAX_SAMPLERS - 1);
         if (!seen_coord[tc]) { seen_coord[tc] = true; ++ntexcoord; }
     }
+    for (uint32_t s = 0; s < cfg->num_stages; ++s) {
+        const uint32_t ind = cfg->stage[s].indirect;
+        if (((ind >> 9) & 3u) == 0 && ((ind >> 7) & 3u) == 0) continue;
+        const TevIndirectStage *is = &cfg->indirect_stage[ind & 3u];
+        uint8_t m = is->texmap & (GX2_BIND_MAX_SAMPLERS - 1);
+        if (!seen_map[m]) { seen_map[m] = true; locs[nloc++] = m; }
+        uint8_t tc = is->texcoord & (GX2_BIND_MAX_SAMPLERS - 1);
+        if (!seen_coord[tc]) { seen_coord[tc] = true; ++ntexcoord; }
+    }
 
     // Generate the matching vertex shader.
     static uint8_t vs_buf[512];
     ShaderGenVs vs_cfg = {.has_color = true, .has_color1 = tev_uses_raster_color1(cfg),
-                          .num_texcoords = ntexcoord, .transform_position = transform_position};
+                          .num_texcoords = ntexcoord, .transform_position = transform_position,
+                          .has_fog = cfg->pixel.fog_type != 0};
     if (texgen)
         for (uint32_t k = 0; k < ntexcoord && k < 8; ++k) vs_cfg.texgen[k] = texgen[k];
     size_t vs_size = shader_gen_vs(vs_buf, sizeof(vs_buf), &vs_cfg);

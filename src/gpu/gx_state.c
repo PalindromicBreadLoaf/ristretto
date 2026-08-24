@@ -41,6 +41,18 @@ static GX2CompareFunction to_compare(uint32_t gx_compare) {
     return (GX2CompareFunction)(gx_compare & 7);
 }
 
+GXEfbFormat gx_state_efb_format(const GXRenderState *state) {
+    return (GXEfbFormat)(state->zcompare & 7u);
+}
+
+bool gx_state_efb_has_color(const GXRenderState *state) {
+    return gx_state_efb_format(state) != GX_EFB_Z24;
+}
+
+bool gx_state_efb_has_alpha(const GXRenderState *state) {
+    return gx_state_efb_format(state) == GX_EFB_RGBA6_Z24;
+}
+
 void gx_state_reset(GXRenderState *state) {
     memset(state, 0, sizeof(*state));
     state->scissor_tl = 342u | (342u << 12);
@@ -91,8 +103,8 @@ void gx_state_blend(const GXRenderState *state, GXBlendState *out) {
     const uint32_t logic_idx = (b >> 12) & 0xF;
 
     memset(out, 0, sizeof(*out));
-    out->color_update = (b >> 3) & 1;
-    out->alpha_update = (b >> 4) & 1;
+    out->color_update = ((b >> 3) & 1) && gx_state_efb_has_color(state);
+    out->alpha_update = ((b >> 4) & 1) && gx_state_efb_has_alpha(state);
     out->dual_source_alpha = ((state->constant_alpha >> 8) & 1u) && out->alpha_update &&
                              (state->zcompare & 7u) == 1u;
     out->color_combine = GX2_BLEND_COMBINE_MODE_ADD;
@@ -120,6 +132,12 @@ void gx_state_blend(const GXRenderState *state, GXBlendState *out) {
     } else if (logic_enable) {
         out->logic_op_enable = true;
         out->logic_op = kLogicOp[logic_idx];
+    }
+    if (!gx_state_efb_has_alpha(state)) {
+        if (out->src_color == GX2_BLEND_MODE_DST_ALPHA) out->src_color = GX2_BLEND_MODE_ONE;
+        if (out->src_color == GX2_BLEND_MODE_INV_DST_ALPHA) out->src_color = GX2_BLEND_MODE_ZERO;
+        if (out->dst_color == GX2_BLEND_MODE_DST_ALPHA) out->dst_color = GX2_BLEND_MODE_ONE;
+        if (out->dst_color == GX2_BLEND_MODE_INV_DST_ALPHA) out->dst_color = GX2_BLEND_MODE_ZERO;
     }
     if (out->dual_source_alpha) {
         if (out->src_color == GX2_BLEND_MODE_SRC_ALPHA)
@@ -262,8 +280,8 @@ bool gx_state_take_clear(GXRenderState *state, GXClearState *out) {
     out->color[2] = (float)(state->clear_gb & 0xFFu) / 255.0f;
     out->color[3] = (float)((state->clear_ar >> 8) & 0xFFu) / 255.0f;
     out->depth = (float)(state->clear_z & 0xFFFFFFu) / GX_EFB_DEPTH_MAX;
-    out->color_enable = (state->blendmode & (1u << 3)) != 0;
-    out->alpha_enable = (state->blendmode & (1u << 4)) != 0;
+    out->color_enable = ((state->blendmode & (1u << 3)) != 0) && gx_state_efb_has_color(state);
+    out->alpha_enable = ((state->blendmode & (1u << 4)) != 0) && gx_state_efb_has_alpha(state);
     out->depth_enable = (state->zmode & (1u << 4)) != 0;
     return out->color_enable || out->alpha_enable || out->depth_enable;
 }

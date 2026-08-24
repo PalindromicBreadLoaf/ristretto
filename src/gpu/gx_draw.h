@@ -61,6 +61,7 @@ typedef struct {
     TevStage stage[GX_TEV_MAX_STAGES];
     uint8_t  swap[4][4];
     TevPixelState pixel;
+    TevIndirectStage indirect_stage[4];
     uint8_t  tex_slot[8];   // distinct sampled texcoord slots
     bool     texgen[8];
 } GXDrawShaderSig;

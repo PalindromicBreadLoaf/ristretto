@@ -53,6 +53,17 @@ typedef struct {
     bool     clear_pending;
 } GXRenderState;
 
+typedef enum {
+    GX_EFB_RGB8_Z24 = 0,
+    GX_EFB_RGBA6_Z24 = 1,
+    GX_EFB_RGB565_Z16 = 2,
+    GX_EFB_Z24 = 3,
+    GX_EFB_Y8 = 4,
+    GX_EFB_U8 = 5,
+    GX_EFB_V8 = 6,
+    GX_EFB_YUV420 = 7,
+} GXEfbFormat;
+
 // GX2 depth test pipeline state.
 typedef struct {
     bool test_enable;
@@ -129,6 +140,9 @@ void gx_state_depth(const GXRenderState *state, GXDepthState *out);
 void gx_state_blend(const GXRenderState *state, GXBlendState *out);
 void gx_state_cull(const GXRenderState *state, GXCullState *out);
 void gx_state_alpha_test(const GXRenderState *state, GXAlphaTestState *out);
+GXEfbFormat gx_state_efb_format(const GXRenderState *state);
+bool gx_state_efb_has_color(const GXRenderState *state);
+bool gx_state_efb_has_alpha(const GXRenderState *state);
 
 // Convert the guest XF viewport and BP scissor fields to native EFB coordinates.
 void gx_state_viewport(const GXRenderState *state, const float xf_viewport[6],

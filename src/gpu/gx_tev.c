@@ -8,6 +8,13 @@
 // BP register addresses.
 enum {
     BP_GENMODE    = 0x00,
+    BP_IND_MTX_BASE = 0x06,
+    BP_IND_MTX_LAST = 0x0E,
+    BP_IND_STAGE_BASE = 0x10,
+    BP_IND_STAGE_LAST = 0x1F,
+    BP_IND_SCALE0 = 0x25,
+    BP_IND_SCALE1 = 0x26,
+    BP_IND_REF = 0x27,
     BP_TREF_BASE  = 0x28,  // 0x28..0x2F: two stage orders per register
     BP_TREF_LAST  = 0x2F,
     BP_COMB_BASE  = 0xC0,  // 0xC0..0xDF: colour (even) + alpha (odd) per stage
@@ -16,6 +23,15 @@ enum {
     BP_KSEL_LAST  = 0xFD,
     BP_TEVREG_BASE = 0xE0, // 0xE0..0xE7: four TEV colour/konst register pairs (RA/BG)
     BP_TEVREG_LAST = 0xE7,
+    BP_FOGRANGE_BASE = 0xE8,
+    BP_FOGRANGE_LAST = 0xED,
+    BP_FOGPARAM0 = 0xEE,
+    BP_FOGBMAGNITUDE = 0xEF,
+    BP_FOGBEXPONENT = 0xF0,
+    BP_FOGPARAM3 = 0xF1,
+    BP_FOGCOLOR = 0xF2,
+    BP_ZTEX1 = 0xF4,
+    BP_ZTEX2 = 0xF5,
 };
 
 static inline uint32_t bits(uint32_t v, unsigned lo, unsigned n) {
@@ -25,6 +41,47 @@ static inline uint32_t bits(uint32_t v, unsigned lo, unsigned n) {
 // Sign-extend an 11-bit TEV colour register field.
 static inline int32_t sx11(uint32_t v) {
     return (int32_t)(v << 21) >> 21;
+}
+
+static float fog_float(uint32_t value) {
+    uint32_t bits = ((value >> 19) & 1u) << 31;
+    bits |= ((value >> 11) & 0xFFu) << 23;
+    bits |= (value & 0x7FFu) << 12;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static float indirect_scale(uint32_t scale) {
+    float value = 1.0f;
+    if (scale < 17u)
+        for (uint32_t i = scale; i < 17u; ++i) value *= 0.5f;
+    else
+        for (uint32_t i = 17u; i < scale; ++i) value *= 2.0f;
+    return value;
+}
+
+static void decode_indirect_matrix(TevConfig *cfg, uint32_t row, uint32_t value) {
+    const uint32_t matrix = row / 3u;
+    const uint32_t part = row % 3u;
+    const float a = (float)sx11(bits(value, 0, 11)) / 1024.0f;
+    const float b = (float)sx11(bits(value, 11, 11)) / 1024.0f;
+    uint32_t scale = (uint32_t)cfg->indirect_mtx[matrix][0][3];
+    if (part == 0) {
+        cfg->indirect_mtx[matrix][0][0] = a;
+        cfg->indirect_mtx[matrix][1][0] = b;
+        scale = (scale & ~3u) | bits(value, 22, 2);
+    } else if (part == 1) {
+        cfg->indirect_mtx[matrix][0][1] = a;
+        cfg->indirect_mtx[matrix][1][1] = b;
+        scale = (scale & ~12u) | (bits(value, 22, 2) << 2);
+    } else {
+        cfg->indirect_mtx[matrix][0][2] = a;
+        cfg->indirect_mtx[matrix][1][2] = b;
+        scale = (scale & ~16u) | (bits(value, 22, 1) << 4);
+    }
+    cfg->indirect_mtx[matrix][0][3] = (float)scale;
+    cfg->indirect_mtx[matrix][1][3] = (float)scale;
 }
 
 // Colour combiner
@@ -82,6 +139,29 @@ void gx_tev_apply_bp(TevConfig *cfg, uint8_t reg, uint32_t value) {
         cfg->num_stages = (uint8_t)(bits(value, 10, 4) + 1u);  // stored as count-1
         return;
     }
+    if (reg >= BP_IND_MTX_BASE && reg <= BP_IND_MTX_LAST) {
+        decode_indirect_matrix(cfg, reg - BP_IND_MTX_BASE, value);
+        return;
+    }
+    if (reg >= BP_IND_STAGE_BASE && reg <= BP_IND_STAGE_LAST) {
+        cfg->stage[reg - BP_IND_STAGE_BASE].indirect = value & 0x1FFFFFu;
+        return;
+    }
+    if (reg == BP_IND_REF) {
+        for (uint32_t i = 0; i < 4; ++i) {
+            cfg->indirect_stage[i].texmap = (uint8_t)bits(value, i * 6, 3);
+            cfg->indirect_stage[i].texcoord = (uint8_t)bits(value, i * 6 + 3, 3);
+        }
+        return;
+    }
+    if (reg == BP_IND_SCALE0 || reg == BP_IND_SCALE1) {
+        const uint32_t base = (reg - BP_IND_SCALE0) * 2u;
+        cfg->indirect_stage[base].scale_s = (uint8_t)bits(value, 0, 4);
+        cfg->indirect_stage[base].scale_t = (uint8_t)bits(value, 4, 4);
+        cfg->indirect_stage[base + 1].scale_s = (uint8_t)bits(value, 8, 4);
+        cfg->indirect_stage[base + 1].scale_t = (uint8_t)bits(value, 12, 4);
+        return;
+    }
     if (reg >= BP_TREF_BASE && reg <= BP_TREF_LAST) {
         uint32_t pair = reg - BP_TREF_BASE;
         decode_order(&cfg->stage[pair * 2], &cfg->stage[pair * 2 + 1], value);
@@ -130,6 +210,30 @@ void gx_tev_apply_bp(TevConfig *cfg, uint8_t reg, uint32_t value) {
         }
         return;
     }
+    switch (reg) {
+    case BP_FOGRANGE_BASE:
+        cfg->pixel.fog_range[0] = value;
+        return;
+    case BP_FOGRANGE_BASE + 1: case BP_FOGRANGE_BASE + 2: case BP_FOGRANGE_BASE + 3:
+    case BP_FOGRANGE_BASE + 4: case BP_FOGRANGE_LAST:
+        cfg->pixel.fog_range[reg - BP_FOGRANGE_BASE] = value;
+        return;
+    case BP_FOGPARAM0: cfg->pixel.fog_a = value; return;
+    case BP_FOGBMAGNITUDE: cfg->pixel.fog_b_magnitude = value; return;
+    case BP_FOGBEXPONENT: cfg->pixel.fog_b_shift = value; return;
+    case BP_FOGPARAM3:
+        cfg->pixel.fog_c = value;
+        cfg->pixel.fog_ortho = bits(value, 20, 1) != 0;
+        cfg->pixel.fog_type = (uint8_t)bits(value, 21, 3);
+        return;
+    case BP_FOGCOLOR: cfg->pixel.fog_color = value; return;
+    case BP_ZTEX1: cfg->pixel.ztex_bias = value; return;
+    case BP_ZTEX2:
+        cfg->pixel.ztex_format = (uint8_t)bits(value, 0, 2);
+        cfg->pixel.ztex_op = (uint8_t)bits(value, 2, 2);
+        return;
+    default: return;
+    }
 }
 
 void gx_tev_build_ps_cfile(const TevConfig *cfg, float out[GX_TEV_PS_CFILE_COUNT][4]) {
@@ -144,6 +248,20 @@ void gx_tev_build_ps_cfile(const TevConfig *cfg, float out[GX_TEV_PS_CFILE_COUNT
     out[8][3] = 0.0f;
     out[9][0] = cfg->pixel.rgba6 ? 63.0f : 255.0f;
     out[9][1] = cfg->pixel.rgba6 ? 1.0f / 63.0f : 1.0f / 255.0f;
+    for (uint32_t m = 0; m < 3; ++m) {
+        memcpy(out[10 + m * 2], cfg->indirect_mtx[m][0], 4 * sizeof(float));
+        memcpy(out[11 + m * 2], cfg->indirect_mtx[m][1], 4 * sizeof(float));
+        out[10 + m * 2][3] = out[11 + m * 2][3] =
+            indirect_scale((uint32_t)cfg->indirect_mtx[m][0][3]);
+    }
+    out[16][0] = (float)((cfg->pixel.fog_color >> 16) & 0xFFu) / 255.0f;
+    out[16][1] = (float)((cfg->pixel.fog_color >> 8) & 0xFFu) / 255.0f;
+    out[16][2] = (float)(cfg->pixel.fog_color & 0xFFu) / 255.0f;
+    out[16][3] = (float)(cfg->pixel.ztex_bias & 0xFFFFFFu) / 16777216.0f;
+    out[17][0] = fog_float(cfg->pixel.fog_a);
+    out[17][1] = fog_float(cfg->pixel.fog_c);
+    out[17][2] = (float)(cfg->pixel.fog_b_magnitude & 0xFFFFFFu) / 16777216.0f;
+    out[17][3] = (float)(cfg->pixel.fog_b_shift & 0x1Fu);
 }
 
 // Self test
@@ -270,6 +388,35 @@ int gx_tev_selftest(void) {
     if (cfile[8][0] != 32.0f / 255.0f || cfile[8][1] != 224.0f / 255.0f ||
         cfile[8][2] != 32.0f / 63.0f || cfile[9][0] != 63.0f ||
         cfile[9][1] != 1.0f / 63.0f)
+        return 0;
+
+    // Indirect state BP registers retain the source, scale, matrix, and per-stage control.
+    gx_tev_apply_bp(&cfg, BP_IND_REF, (3u << 0) | (4u << 3) | (2u << 6) | (1u << 9));
+    gx_tev_apply_bp(&cfg, BP_IND_SCALE0, (2u << 0) | (3u << 4) | (4u << 8) | (5u << 12));
+    gx_tev_apply_bp(&cfg, BP_IND_MTX_BASE, (uint32_t)1023u | ((uint32_t)512u << 11) |
+                                      (1u << 22));
+    gx_tev_apply_bp(&cfg, BP_IND_MTX_BASE + 1, (uint32_t)512u | ((uint32_t)256u << 11) |
+                                          (2u << 22));
+    gx_tev_apply_bp(&cfg, BP_IND_MTX_BASE + 2, (uint32_t)128u | ((uint32_t)64u << 11) |
+                                          (1u << 22));
+    gx_tev_apply_bp(&cfg, BP_IND_STAGE_BASE, 1u | (3u << 7) | (1u << 9));
+    if (cfg.indirect_stage[0].texmap != 3 || cfg.indirect_stage[0].texcoord != 4 ||
+        cfg.indirect_stage[0].scale_s != 2 || cfg.indirect_stage[1].scale_t != 5 ||
+        cfg.stage[0].indirect != (1u | (3u << 7) | (1u << 9)) ||
+        cfg.indirect_mtx[0][0][0] != 1023.0f / 1024.0f || cfg.indirect_mtx[0][1][0] != 0.5f ||
+        cfg.indirect_mtx[0][0][1] != 0.5f || cfg.indirect_mtx[0][1][2] != 64.0f / 1024.0f)
+        return 0;
+
+    gx_tev_apply_bp(&cfg, BP_FOGPARAM0, 0x3F800u);
+    gx_tev_apply_bp(&cfg, BP_FOGPARAM3, 0x3F800u | (1u << 20) | (4u << 21));
+    gx_tev_apply_bp(&cfg, BP_FOGCOLOR, 0x112233u);
+    gx_tev_apply_bp(&cfg, BP_ZTEX1, 0x123456u);
+    gx_tev_apply_bp(&cfg, BP_ZTEX2, 2u | (1u << 2));
+    gx_tev_build_ps_cfile(&cfg, cfile);
+    if (cfg.pixel.fog_type != 4 || !cfg.pixel.fog_ortho || cfg.pixel.ztex_format != 2 ||
+        cfg.pixel.ztex_op != 1 || cfg.pixel.ztex_bias != 0x123456u ||
+        cfile[16][0] != 17.0f / 255.0f || cfile[16][2] != 51.0f / 255.0f ||
+        cfile[10][0] != 1.0f || cfile[11][0] != 1.0f)
         return 0;
 
     return 1;
