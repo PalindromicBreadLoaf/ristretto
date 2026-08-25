@@ -36,13 +36,17 @@ enum {
     GX_DRAW_BUF_COUNT = 11,
 };
 
+// Write `size` bytes of an EFB copy back to guest memory at `ea`.
+typedef void (*GXGuestWrite)(void *user, uint32_t ea, const void *src, uint32_t size);
+
 // Host callbacks the pipeline needs.
 typedef struct {
     // Resolve the GX2 texture/sampler bound to a GX texmap the TEV samples.
     GX2Texture *(*get_texture)(void *user, uint8_t texmap);
     GX2Sampler *(*get_sampler)(void *user, uint8_t texmap);
-    GXGuestRead read_guest;
-    void       *user;
+    GXGuestRead  read_guest;
+    GXGuestWrite write_guest;
+    void        *user;
 } GXDrawCallbacks;
 
 // Maximum replay operations retained for a prepared stream.
@@ -82,6 +86,7 @@ typedef struct {
 typedef enum {
     GX_DRAW_RECORD_DRAW,
     GX_DRAW_RECORD_CLEAR,
+    GX_DRAW_RECORD_COPY,
 } GXDrawRecordType;
 
 // One recorded EFB operation.
@@ -103,6 +108,7 @@ typedef struct {
     GXViewportState  viewport;
     GXScissorState   scissor;
     GXClearState     clear;
+    GXCopyState      copy;
     GX2RBuffer       buffer[GX_DRAW_BUF_COUNT];
     uint32_t         buffer_cap[GX_DRAW_BUF_COUNT];
 } GXDrawRecord;

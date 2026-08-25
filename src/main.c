@@ -333,6 +333,11 @@ static const uint8_t *gxReadGuest(void *user, uint32_t ea, uint32_t len) {
     return wii_mem_range(ea, len);
 }
 
+static void gxWriteGuest(void *user, uint32_t ea, const void *src, uint32_t size) {
+    (void)user;
+    wii_mem_write(ea, src, size);
+}
+
 // Read boot.dol off SD into g_dol_buf.
 static void tryLoadDolFromSd(void) {
     if (!ensureSdCardMounted()) {
@@ -402,7 +407,7 @@ static void loadAndRunGuestDol(void) {
     wii_mmio_reset();
 
     gx_submit_shutdown(&g_gx_submit);
-    GXDrawCallbacks gx_callbacks = {.read_guest = gxReadGuest};
+    GXDrawCallbacks gx_callbacks = {.read_guest = gxReadGuest, .write_guest = gxWriteGuest};
     bool capture_gx = gx_submit_init(&g_gx_submit, &gx_callbacks);
     if (capture_gx) {
         if (gx_draw_enable_live_replay(&g_gx_submit.draw))

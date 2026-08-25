@@ -26,6 +26,8 @@ enum {
     GX_BP_ZCOMPARE      = 0x43,
     GX_BP_EFB_TL        = 0x49,
     GX_BP_EFB_WH        = 0x4A,
+    GX_BP_EFB_ADDR      = 0x4B,
+    GX_BP_COPY_STRIDE   = 0x4D,
     GX_BP_CLEAR_AR      = 0x4F,
     GX_BP_CLEAR_GB      = 0x50,
     GX_BP_CLEAR_Z       = 0x51,
@@ -46,11 +48,15 @@ typedef struct {
     uint32_t scissor_offset; // 0x59
     uint32_t efb_tl;         // 0x49
     uint32_t efb_wh;         // 0x4A
+    uint32_t efb_addr;       // 0x4B
+    uint32_t copy_stride;    // 0x4D
     uint32_t clear_ar;       // 0x4F
     uint32_t clear_gb;       // 0x50
     uint32_t clear_z;        // 0x51
+    uint32_t copy_exec;      // 0x52
     uint32_t alpha_compare;  // 0xF3
     bool     clear_pending;
+    bool     copy_pending;
 } GXRenderState;
 
 typedef enum {
@@ -129,6 +135,21 @@ typedef struct {
     bool           depth_enable;
 } GXClearState;
 
+// A pending EFB→memory copy requested by a TRIGGER_EFB_COPY without the clear
+// bit.
+typedef struct {
+    uint32_t src_x;
+    uint32_t src_y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t dst_ea;      // guest destination address
+    uint32_t dst_stride;  // bytes per encoded tile row
+    uint8_t  format;      // GXCopyFormat realFormat
+    bool     intensity;   // store luma instead of raw red for R/RA formats
+    bool     to_xfb;      // YUV XFB copy rather than a texture copy
+    bool     half_scale;  // 2:1 box-filtered downscale
+} GXCopyState;
+
 // Reset all tracked registers to zero.
 void gx_state_reset(GXRenderState *state);
 
@@ -151,6 +172,9 @@ void gx_state_scissor(const GXRenderState *state, GXScissorState *out);
 
 // Consume a clear requested by an EFB-copy BP command.
 bool gx_state_take_clear(GXRenderState *state, GXClearState *out);
+
+// Consume a texture/XFB copy requested by an EFB-copy BP command.
+bool gx_state_take_copy(GXRenderState *state, GXCopyState *out);
 
 int gx_state_selftest(void);
 

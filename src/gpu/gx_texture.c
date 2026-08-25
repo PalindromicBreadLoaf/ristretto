@@ -251,6 +251,150 @@ int gx_texture_decode(uint8_t *dst, const uint8_t *src, int width, int height,
     }
 }
 
+// EFB-copy encode
+GXTextureFormat gx_texture_copy_layout(GXCopyFormat fmt) {
+    switch (fmt) {
+    case GX_COPY_R4:                        return GX_TF_I4;
+    case GX_COPY_R8_1: case GX_COPY_A8:
+    case GX_COPY_R8: case GX_COPY_G8:
+    case GX_COPY_B8:                        return GX_TF_I8;
+    case GX_COPY_RA4:                       return GX_TF_IA4;
+    case GX_COPY_RA8: case GX_COPY_RG8:
+    case GX_COPY_GB8:                       return GX_TF_IA8;
+    case GX_COPY_RGB565:                    return GX_TF_RGB565;
+    case GX_COPY_RGB5A3:                    return GX_TF_RGB5A3;
+    case GX_COPY_RGBA8:                     return GX_TF_RGBA8;
+    default:                                return GX_TF_I8;
+    }
+}
+
+// BT.601 luma from 8-bit RGB (Dolphin TextureEncoder RGB8_to_I).
+static inline uint8_t rgb_to_i(uint8_t r, uint8_t g, uint8_t b) {
+    uint32_t val = 4096u + 66u * r + 129u * g + 25u * b;
+    val >>= 8;
+    return val > 255u ? 255u : (uint8_t)val;
+}
+
+// One-byte grey/single-channel value a copy stores for the given format.
+static inline uint8_t copy_channel(const uint8_t *px, GXCopyFormat fmt, bool intensity) {
+    switch (fmt) {
+    case GX_COPY_A8: return px[3];
+    case GX_COPY_G8: return px[1];
+    case GX_COPY_B8: return px[2];
+    default:         return intensity ? rgb_to_i(px[0], px[1], px[2]) : px[0];
+    }
+}
+
+static inline uint16_t enc_rgb565(const uint8_t *px) {
+    return (uint16_t)(((px[0] >> 3) << 11) | ((px[1] >> 2) << 5) | (px[2] >> 3));
+}
+
+static inline uint16_t enc_rgb5a3(const uint8_t *px) {
+    if (px[3] >= 224) {
+        return (uint16_t)(0x8000u | ((px[0] >> 3) << 10) | ((px[1] >> 3) << 5) | (px[2] >> 3));
+    }
+    return (uint16_t)(((px[3] >> 5) << 12) | ((px[0] >> 4) << 8) | ((px[1] >> 4) << 4) |
+                      (px[2] >> 4));
+}
+
+static inline void wr_be16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+
+// Clamp a sample coordinate to the region and return the source texel.
+static inline const uint8_t *sample(const uint8_t *src, uint32_t src_pitch, int width,
+                                    int height, int x, int y) {
+    if (x >= width) x = width - 1;
+    if (y >= height) y = height - 1;
+    return src + (size_t)y * src_pitch + (size_t)x * 4u;
+}
+
+int gx_texture_encode_copy(uint8_t *dst, const uint8_t *src, int width, int height,
+                           uint32_t src_pitch, GXCopyFormat fmt, bool intensity) {
+    if (!dst || !src || width <= 0 || height <= 0) return 0;
+    const GXTextureFormat layout = gx_texture_copy_layout(fmt);
+    uint8_t *d = dst;
+
+    switch (layout) {
+    case GX_TF_I4:  // R4: 8x8 tiles, two 4-bit texels per byte
+        for (int y = 0; y < height; y += 8)
+            for (int x = 0; x < width; x += 8)
+                for (int iy = 0; iy < 8; iy++)
+                    for (int ix = 0; ix < 4; ix++) {
+                        uint8_t hi = copy_channel(sample(src, src_pitch, width, height,
+                                                         x + ix * 2, y + iy), fmt, intensity);
+                        uint8_t lo = copy_channel(sample(src, src_pitch, width, height,
+                                                         x + ix * 2 + 1, y + iy), fmt, intensity);
+                        *d++ = (uint8_t)((hi & 0xF0u) | (lo >> 4));
+                    }
+        break;
+    case GX_TF_I8:  // R8/A8/single channel: 8x4 tiles, one byte per texel
+        for (int y = 0; y < height; y += 4)
+            for (int x = 0; x < width; x += 8)
+                for (int iy = 0; iy < 4; iy++)
+                    for (int ix = 0; ix < 8; ix++)
+                        *d++ = copy_channel(sample(src, src_pitch, width, height,
+                                                   x + ix, y + iy), fmt, intensity);
+        break;
+    case GX_TF_IA4:  // RA4: 8x4 tiles, high nibble alpha, low nibble luma
+        for (int y = 0; y < height; y += 4)
+            for (int x = 0; x < width; x += 8)
+                for (int iy = 0; iy < 4; iy++)
+                    for (int ix = 0; ix < 8; ix++) {
+                        const uint8_t *px = sample(src, src_pitch, width, height,
+                                                   x + ix, y + iy);
+                        uint8_t lum = intensity ? rgb_to_i(px[0], px[1], px[2]) : px[0];
+                        *d++ = (uint8_t)((px[3] & 0xF0u) | (lum >> 4));
+                    }
+        break;
+    case GX_TF_IA8:  // RA8/RG8/GB8: 4x4 tiles, byte0 = second channel, byte1 = first
+        for (int y = 0; y < height; y += 4)
+            for (int x = 0; x < width; x += 4)
+                for (int iy = 0; iy < 4; iy++)
+                    for (int ix = 0; ix < 4; ix++) {
+                        const uint8_t *px = sample(src, src_pitch, width, height,
+                                                   x + ix, y + iy);
+                        uint8_t lo, hi;  // decoded as a=byte0, i=byte1
+                        if (fmt == GX_COPY_RG8)      { lo = px[1]; hi = px[0]; }
+                        else if (fmt == GX_COPY_GB8) { lo = px[2]; hi = px[1]; }
+                        else { lo = px[3]; hi = intensity ? rgb_to_i(px[0], px[1], px[2]) : px[0]; }
+                        *d++ = lo;
+                        *d++ = hi;
+                    }
+        break;
+    case GX_TF_RGB565:
+        for (int y = 0; y < height; y += 4)
+            for (int x = 0; x < width; x += 4)
+                for (int iy = 0; iy < 4; iy++)
+                    for (int ix = 0; ix < 4; ix++, d += 2)
+                        wr_be16(d, enc_rgb565(sample(src, src_pitch, width, height,
+                                                     x + ix, y + iy)));
+        break;
+    case GX_TF_RGB5A3:
+        for (int y = 0; y < height; y += 4)
+            for (int x = 0; x < width; x += 4)
+                for (int iy = 0; iy < 4; iy++)
+                    for (int ix = 0; ix < 4; ix++, d += 2)
+                        wr_be16(d, enc_rgb5a3(sample(src, src_pitch, width, height,
+                                                     x + ix, y + iy)));
+        break;
+    case GX_TF_RGBA8:  // 4x4 tiles: 32 bytes of A/R pairs then 32 bytes of G/B pairs
+        for (int y = 0; y < height; y += 4)
+            for (int x = 0; x < width; x += 4, d += 64)
+                for (int iy = 0; iy < 4; iy++)
+                    for (int ix = 0; ix < 4; ix++) {
+                        const uint8_t *px = sample(src, src_pitch, width, height,
+                                                   x + ix, y + iy);
+                        uint8_t *ar = d + 8 * iy + ix * 2;
+                        uint8_t *gb = d + 32 + 8 * iy + ix * 2;
+                        ar[0] = px[3]; ar[1] = px[0];
+                        gb[0] = px[1]; gb[1] = px[2];
+                    }
+        break;
+    default:
+        return 0;
+    }
+    return gx_texture_encoded_size(width, height, layout);
+}
+
 typedef struct {
     GXTextureFormat fmt;
     GXTlutFormat    tlutfmt;
@@ -884,6 +1028,51 @@ int gx_texture_selftest(void) {
             return 0;
         }
         gx_texture_cache_destroy(&cache);
+    }
+
+    // EFB-copy encode
+    {
+        uint8_t linear[8 * 8 * 4];
+        for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 8; ++x) {
+                uint8_t *px = linear + (y * 8 + x) * 4;
+                px[0] = (uint8_t)(x * 32 + 7);
+                px[1] = (uint8_t)(y * 32 + 3);
+                px[2] = (uint8_t)((x ^ y) * 16);
+                px[3] = (uint8_t)(x < 4 ? 0xFF : 0x40);
+            }
+
+        uint8_t encoded[8 * 8 * 4];
+        uint8_t decoded[8 * 8 * 4];
+
+        // RGBA8
+        if (gx_texture_encode_copy(encoded, linear, 8, 8, 8 * 4, GX_COPY_RGBA8, false) !=
+            gx_texture_encoded_size(8, 8, GX_TF_RGBA8))
+            return 0;
+        gx_texture_decode(decoded, encoded, 8, 8, GX_TF_RGBA8, NULL, 0);
+        if (memcmp(decoded, linear, sizeof(linear)) != 0) return 0;
+
+        // RGB565
+        gx_texture_encode_copy(encoded, linear, 8, 8, 8 * 4, GX_COPY_RGB565, false);
+        gx_texture_decode(decoded, encoded, 8, 8, GX_TF_RGB565, NULL, 0);
+        for (int i = 0; i < 8 * 8; ++i) {
+            if ((decoded[i * 4 + 0] >> 3) != (linear[i * 4 + 0] >> 3)) return 0;
+            if ((decoded[i * 4 + 1] >> 2) != (linear[i * 4 + 1] >> 2)) return 0;
+            if (decoded[i * 4 + 3] != 0xFF) return 0;
+        }
+
+        // I8
+        gx_texture_encode_copy(encoded, linear, 8, 8, 8 * 4, GX_COPY_R8, false);
+        gx_texture_decode(decoded, encoded, 8, 8, GX_TF_I8, NULL, 0);
+        if (decoded[0] != linear[0]) return 0;
+        gx_texture_encode_copy(encoded, linear, 8, 8, 8 * 4, GX_COPY_R8, true);
+        gx_texture_decode(decoded, encoded, 8, 8, GX_TF_I8, NULL, 0);
+        if (decoded[0] != rgb_to_i(linear[0], linear[1], linear[2])) return 0;
+
+        // IA8
+        gx_texture_encode_copy(encoded, linear, 8, 8, 8 * 4, GX_COPY_RA8, false);
+        gx_texture_decode(decoded, encoded, 8, 8, GX_TF_IA8, NULL, 0);
+        if (decoded[3] != linear[3] || decoded[0] != linear[0]) return 0;
     }
 
     return 1;

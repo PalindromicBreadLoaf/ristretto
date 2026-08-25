@@ -9,6 +9,8 @@
 #include <gx2/context.h>
 #include <gx2/draw.h>
 #include <gx2/enum.h>
+#include <gx2/event.h>
+#include <gx2/mem.h>
 #include <gx2/registers.h>
 #include <gx2/surface.h>
 #include <gx2/utils.h>
@@ -124,8 +126,37 @@ fail:
     return false;
 }
 
+static bool ensure_stage(GXEfb *efb) {
+    if (efb->stage_ready) return true;
+    memset(&efb->stage, 0, sizeof(efb->stage));
+    efb->stage.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+    efb->stage.width = GX_EFB_WIDTH;
+    efb->stage.height = GX_EFB_HEIGHT;
+    efb->stage.depth = 1;
+    efb->stage.mipLevels = 1;
+    efb->stage.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+    efb->stage.aa = GX2_AA_MODE1X;
+    efb->stage.use = GX2_SURFACE_USE_TEXTURE;
+    efb->stage.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    GX2CalcSurfaceSizeAndAlignment(&efb->stage);
+    efb->stage.image = memalign(efb->stage.alignment, efb->stage.imageSize);
+    if (!efb->stage.image) return false;
+    efb->stage_ready = true;
+    return true;
+}
+
+const uint8_t *gx_efb_resolve_color(GXEfb *efb, uint32_t *pitch) {
+    if (!efb || !efb->ready || !ensure_stage(efb)) return NULL;
+    GX2CopySurface(&efb->color.surface, 0, 0, &efb->stage, 0, 0);
+    GX2DrawDone();
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, efb->stage.image, efb->stage.imageSize);
+    if (pitch) *pitch = efb->stage.pitch * 4u;
+    return efb->stage.image;
+}
+
 void gx_efb_shutdown(GXEfb *efb) {
     if (!efb) return;
+    if (efb->stage.image) free(efb->stage.image);
     if (efb->clear_position.elemSize) GX2RDestroyBufferEx(&efb->clear_position, 0);
     if (efb->clear_color.elemSize) GX2RDestroyBufferEx(&efb->clear_color, 0);
     gx2_bind_free(&efb->clear_shader);

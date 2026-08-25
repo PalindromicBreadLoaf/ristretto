@@ -74,11 +74,15 @@ void gx_state_apply_bp(GXRenderState *state, uint8_t reg, uint32_t value) {
     case GX_BP_ZCOMPARE:      state->zcompare = value; break;
     case GX_BP_EFB_TL:        state->efb_tl = value; break;
     case GX_BP_EFB_WH:        state->efb_wh = value; break;
+    case GX_BP_EFB_ADDR:      state->efb_addr = value; break;
+    case GX_BP_COPY_STRIDE:   state->copy_stride = value; break;
     case GX_BP_CLEAR_AR:      state->clear_ar = value; break;
     case GX_BP_CLEAR_GB:      state->clear_gb = value; break;
     case GX_BP_CLEAR_Z:       state->clear_z = value; break;
     case GX_BP_TRIGGER_EFB_COPY:
+        state->copy_exec = value;
         state->clear_pending = (value & (1u << 11)) != 0;
+        state->copy_pending = (value & (1u << 11)) == 0;
         break;
     case GX_BP_SCISSOROFFSET: state->scissor_offset = value; break;
     case GX_BP_ALPHACOMPARE:  state->alpha_compare = value; break;
@@ -286,6 +290,34 @@ bool gx_state_take_clear(GXRenderState *state, GXClearState *out) {
     return out->color_enable || out->alpha_enable || out->depth_enable;
 }
 
+bool gx_state_take_copy(GXRenderState *state, GXCopyState *out) {
+    if (!state->copy_pending) return false;
+    state->copy_pending = false;
+
+    const int32_t x = (int32_t)(state->efb_tl & 0x3FFu);
+    const int32_t y = (int32_t)((state->efb_tl >> 10) & 0x3FFu);
+    const int32_t width = (int32_t)(state->efb_wh & 0x3FFu) + 1;
+    const int32_t height = (int32_t)((state->efb_wh >> 10) & 0x3FFu) + 1;
+    const uint32_t x0 = clamp_u32(x, GX_EFB_WIDTH);
+    const uint32_t y0 = clamp_u32(y, GX_EFB_HEIGHT);
+    const uint32_t x1 = clamp_u32(x + width, GX_EFB_WIDTH);
+    const uint32_t y1 = clamp_u32(y + height, GX_EFB_HEIGHT);
+
+    out->src_x = x0;
+    out->src_y = y0;
+    out->width = x1 > x0 ? x1 - x0 : 0;
+    out->height = y1 > y0 ? y1 - y0 : 0;
+    out->dst_ea = state->efb_addr << 5;
+    out->dst_stride = (state->copy_stride & 0x3FFu) << 5;
+
+    const uint32_t tpf = (state->copy_exec >> 3) & 0xFu;
+    out->format = (uint8_t)((tpf >> 1) | ((tpf & 1u) << 3));
+    out->half_scale = (state->copy_exec >> 9) & 1u;
+    out->to_xfb = (state->copy_exec >> 14) & 1u;
+    out->intensity = (state->copy_exec >> 15) & 1u;
+    return out->width != 0 && out->height != 0;
+}
+
 // Self test
 int gx_state_selftest(void) {
     GXRenderState st;
@@ -400,6 +432,27 @@ int gx_state_selftest(void) {
         !clear.color_enable || !clear.alpha_enable || !clear.depth_enable)
         return 0;
     if (gx_state_take_clear(&st, &clear)) return 0;
+
+    gx_state_apply_bp(&st, GX_BP_EFB_TL, 4u | (8u << 10));
+    gx_state_apply_bp(&st, GX_BP_EFB_WH, 15u | (31u << 10));
+    gx_state_apply_bp(&st, GX_BP_EFB_ADDR, 0x00010000u >> 5);
+    gx_state_apply_bp(&st, GX_BP_COPY_STRIDE, 0);
+    // target_pixel_format=0xC (>>1|<<3 -> realFormat 6 = RGBA8), intensity+xfb clear.
+    gx_state_apply_bp(&st, GX_BP_TRIGGER_EFB_COPY, (0xCu << 3));
+    if (gx_state_take_clear(&st, &clear)) return 0;
+    GXCopyState copy;
+    if (!gx_state_take_copy(&st, &copy) || copy.src_x != 4 || copy.src_y != 8 ||
+        copy.width != 16 || copy.height != 32 || copy.dst_ea != 0x00010000u ||
+        copy.format != 0x6 || copy.to_xfb || copy.intensity || copy.half_scale)
+        return 0;
+    if (gx_state_take_copy(&st, &copy)) return 0;
+
+    // realFormat 8 with intensity + copy-to-xfb + half scale.
+    gx_state_apply_bp(&st, GX_BP_TRIGGER_EFB_COPY,
+                      (0x1u << 3) | (1u << 9) | (1u << 14) | (1u << 15));
+    if (!gx_state_take_copy(&st, &copy) || copy.format != 0x8 || !copy.intensity ||
+        !copy.to_xfb || !copy.half_scale)
+        return 0;
 
     return 1;
 }

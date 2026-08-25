@@ -20,6 +20,7 @@
 // state folding
 
 static void record_clear(GXDrawPipeline *p, const GXClearState *clear);
+static void record_copy(GXDrawPipeline *p, const GXCopyState *copy);
 
 static void refresh_tev_pixel_state(GXDrawPipeline *p) {
     GXAlphaTestState alpha;
@@ -92,6 +93,9 @@ static void on_bp(void *user, uint8_t command, uint32_t value) {
     GXClearState clear;
     if (gx_state_take_clear(&p->render, &clear) && !p->dry_run)
         record_clear(p, &clear);
+    GXCopyState copy;
+    if (gx_state_take_copy(&p->render, &copy) && !p->dry_run)
+        record_copy(p, &copy);
 }
 
 static const uint8_t *resolve_dl(void *user, uint32_t addr, uint32_t size) {
@@ -295,6 +299,17 @@ static void record_clear(GXDrawPipeline *p, const GXClearState *clear) {
     rec->type = GX_DRAW_RECORD_CLEAR;
     rec->clear = *clear;
 }
+
+static void record_copy(GXDrawPipeline *p, const GXCopyState *copy) {
+    if (p->nrecords >= GX_DRAW_MAX_RECORDS) return;
+    GXDrawRecord *rec = &p->record[p->nrecords++];
+    memset(rec, 0, sizeof(*rec));
+    rec->type = GX_DRAW_RECORD_COPY;
+    rec->copy = *copy;
+}
+
+// EFB-copy encode scratch
+static uint8_t g_copy_scratch[GX_EFB_WIDTH * GX_EFB_HEIGHT * 4];
 
 // Decode targets
 static float g_dry_pos[GX_DRAW_DRY_MAX * 3];
@@ -555,6 +570,28 @@ static void apply_state(const GXDrawRecord *rec) {
                           rec->cull.cull_back);
 }
 
+// Resolve the colour buffer and encode a triggered EFB copy into guest memory.
+static void replay_copy(GXDrawPipeline *p, const GXCopyState *copy) {
+    // TODO: YUV XFB copies feed VI/XFB presentations
+    if (copy->to_xfb || copy->half_scale || copy->width == 0 || copy->height == 0) return;
+
+    const GXCopyFormat fmt = (GXCopyFormat)copy->format;
+    const GXTextureFormat layout = gx_texture_copy_layout(fmt);
+    const int size = gx_texture_encoded_size((int)copy->width, (int)copy->height, layout);
+    if (size <= 0 || (size_t)size > sizeof(g_copy_scratch)) return;
+
+    uint32_t pitch = 0;
+    const uint8_t *linear = gx_efb_resolve_color(&p->efb, &pitch);
+    if (!linear) return;
+    const uint8_t *region = linear + (size_t)copy->src_y * pitch + (size_t)copy->src_x * 4u;
+    const int written = gx_texture_encode_copy(g_copy_scratch, region, (int)copy->width,
+                                               (int)copy->height, pitch, fmt, copy->intensity);
+    if (written <= 0) return;
+    if (p->cb.write_guest)
+        p->cb.write_guest(p->cb.user, copy->dst_ea, g_copy_scratch, (uint32_t)written);
+    gx_texture_cache_invalidate_range(&p->texture, copy->dst_ea, (uint32_t)written);
+}
+
 bool gx_draw_replay(GXDrawPipeline *p) {
     if (!p || !p->live_replay || p->nrecords == 0 || !gx_efb_bind(&p->efb)) return false;
 
@@ -562,6 +599,11 @@ bool gx_draw_replay(GXDrawPipeline *p) {
         GXDrawRecord *rec = &p->record[r];
         if (rec->type == GX_DRAW_RECORD_CLEAR) {
             (void)gx_efb_clear(&p->efb, &rec->clear);
+            continue;
+        }
+        if (rec->type == GX_DRAW_RECORD_COPY) {
+            replay_copy(p, &rec->copy);
+            gx_efb_bind(&p->efb);
             continue;
         }
         const GXDrawShaderCacheEntry *entry = &p->shader_cache[rec->shader_cache_index];

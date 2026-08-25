@@ -39,6 +39,23 @@ typedef enum {
     GX_TLUT_RGB5A3 = 0x2,
 } GXTlutFormat;
 
+// EFB-copy destination formats
+typedef enum {
+    GX_COPY_R4     = 0x0,   // I4 tiling, red or intensity
+    GX_COPY_R8_1   = 0x1,   // I8 tiling, red or intensity
+    GX_COPY_RA4    = 0x2,   // IA4 tiling
+    GX_COPY_RA8    = 0x3,   // IA8 tiling
+    GX_COPY_RGB565 = 0x4,
+    GX_COPY_RGB5A3 = 0x5,
+    GX_COPY_RGBA8  = 0x6,
+    GX_COPY_A8     = 0x7,   // I8 tiling, alpha
+    GX_COPY_R8     = 0x8,   // I8 tiling, red
+    GX_COPY_G8     = 0x9,   // I8 tiling, green
+    GX_COPY_B8     = 0xA,   // I8 tiling, blue
+    GX_COPY_RG8    = 0xB,   // IA8 tiling, red+green
+    GX_COPY_GB8    = 0xC,   // IA8 tiling, green+blue
+} GXCopyFormat;
+
 // Every format is decoded to 8-bit UNORM RGBA.
 #define GX_TEXTURE_GX2_FORMAT GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8
 
@@ -108,6 +125,13 @@ int gx_texture_palette_size(GXTextureFormat fmt);
 // Decode an encoded GX texture into a linear RGBA8 surface.
 int gx_texture_decode(uint8_t *dst, const uint8_t *src, int width, int height,
                       GXTextureFormat fmt, const uint8_t *tlut, GXTlutFormat tlutfmt);
+
+// The texture format whose tiled layout an EFB-copy format writes into.
+GXTextureFormat gx_texture_copy_layout(GXCopyFormat fmt);
+
+// Encode a linear RGBA8 image region into an EFB-copy format.
+int gx_texture_encode_copy(uint8_t *dst, const uint8_t *src, int width, int height,
+                           uint32_t src_pitch, GXCopyFormat fmt, bool intensity);
 
 bool gx_texture_cache_init(GXTextureCache *cache, GXTextureGuestRead read_guest, void *user);
 void gx_texture_cache_destroy(GXTextureCache *cache);

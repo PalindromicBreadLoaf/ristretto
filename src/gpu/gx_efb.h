@@ -31,6 +31,8 @@ typedef struct {
     Gx2BoundShader clear_shader;
     GX2RBuffer clear_position;
     GX2RBuffer clear_color;
+    GX2Surface stage;
+    bool stage_ready;
     bool ready;
 } GXEfb;
 
@@ -42,6 +44,10 @@ void gx_efb_apply_viewport(const GXViewportState *viewport);
 void gx_efb_apply_scissor(const GXScissorState *scissor);
 void gx_efb_apply_color_mask(bool color_enable, bool alpha_enable);
 bool gx_efb_clear(GXEfb *efb, const GXClearState *clear);
+
+// Resolve the tiled colour buffer into a linear RGBA8 surface and return a
+// CPU-readable pointer to its pixels.
+const uint8_t *gx_efb_resolve_color(GXEfb *efb, uint32_t *pitch);
 
 #ifdef __cplusplus
 }
