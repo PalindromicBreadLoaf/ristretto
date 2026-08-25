@@ -25,6 +25,22 @@ static inline void yuv_to_rgb(int y, int cb2, int cr2, uint8_t *out) {
     out[3] = 0xFF;
 }
 
+static inline uint8_t rgb_to_y(uint8_t r, uint8_t g, uint8_t b) {
+    return (uint8_t)((66u * r + 129u * g + 25u * b + 4224u) >> 8);
+}
+
+static inline uint8_t rgb_pair_to_cb(const uint8_t *a, const uint8_t *b) {
+    const int sum = -38 * ((int)a[0] + b[0]) - 74 * ((int)a[1] + b[1]) +
+                    112 * ((int)a[2] + b[2]);
+    return clamp8((sum + 65792) >> 9);
+}
+
+static inline uint8_t rgb_pair_to_cr(const uint8_t *a, const uint8_t *b) {
+    const int sum = 112 * ((int)a[0] + b[0]) - 94 * ((int)a[1] + b[1]) -
+                    18 * ((int)a[2] + b[2]);
+    return clamp8((sum + 65792) >> 9);
+}
+
 void xfb_yuv422_to_rgba(const uint8_t *yuv, uint32_t width, uint32_t height,
                         uint32_t src_pitch, uint8_t *rgba, uint32_t dst_pitch) {
     for (uint32_t y = 0; y < height; ++y) {
@@ -43,6 +59,55 @@ void xfb_yuv422_to_rgba(const uint8_t *yuv, uint32_t width, uint32_t height,
             d += 8;
         }
     }
+}
+
+bool xfb_rgba_to_yuv422(const uint8_t *rgba, uint32_t width, uint32_t height,
+                        uint32_t src_pitch, uint8_t *yuv, uint32_t dst_pitch) {
+    const uint32_t pair_bytes = ((width + 1u) >> 1) * 4u;
+    if (!rgba || !yuv || width == 0 || height == 0 || src_pitch < width * 4u ||
+        dst_pitch < pair_bytes)
+        return false;
+
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t *s = rgba + (size_t)y * src_pitch;
+        uint8_t *d = yuv + (size_t)y * dst_pitch;
+        for (uint32_t x = 0; x < width; x += 2) {
+            const uint8_t *a = s + (size_t)x * 4u;
+            const uint8_t *b = s + (size_t)(x + 1u < width ? x + 1u : x) * 4u;
+            d[0] = rgb_to_y(a[0], a[1], a[2]);
+            d[1] = rgb_pair_to_cb(a, b);
+            d[2] = rgb_to_y(b[0], b[1], b[2]);
+            d[3] = rgb_pair_to_cr(a, b);
+            d += 4;
+        }
+    }
+    return true;
+}
+
+bool xfb_rgba8_box_filter_2x(const uint8_t *src, uint32_t width, uint32_t height,
+                             uint32_t src_pitch, uint8_t *dst, uint32_t dst_pitch) {
+    const uint32_t dst_width = (width + 1u) >> 1;
+    const uint32_t dst_height = (height + 1u) >> 1;
+    if (!src || !dst || width == 0 || height == 0 || src_pitch < width * 4u ||
+        dst_pitch < dst_width * 4u)
+        return false;
+
+    for (uint32_t y = 0; y < dst_height; ++y) {
+        const uint32_t y0 = y * 2u;
+        const uint32_t y1 = y0 + 1u < height ? y0 + 1u : y0;
+        uint8_t *d = dst + (size_t)y * dst_pitch;
+        for (uint32_t x = 0; x < dst_width; ++x) {
+            const uint32_t x0 = x * 2u;
+            const uint32_t x1 = x0 + 1u < width ? x0 + 1u : x0;
+            const uint8_t *p00 = src + (size_t)y0 * src_pitch + (size_t)x0 * 4u;
+            const uint8_t *p01 = src + (size_t)y0 * src_pitch + (size_t)x1 * 4u;
+            const uint8_t *p10 = src + (size_t)y1 * src_pitch + (size_t)x0 * 4u;
+            const uint8_t *p11 = src + (size_t)y1 * src_pitch + (size_t)x1 * 4u;
+            for (uint32_t c = 0; c < 4; ++c)
+                d[x * 4u + c] = (uint8_t)((p00[c] + p01[c] + p10[c] + p11[c] + 2u) >> 2);
+        }
+    }
+    return true;
 }
 
 bool xfb_present_selftest(void) {
@@ -65,6 +130,24 @@ bool xfb_present_selftest(void) {
     }
     if (out[1] >= out[0]) {
         ok = false;  // G is pulled below Y by the +Cb term
+    }
+
+    const uint8_t white_pair[8] = {255, 255, 255, 255, 255, 255, 255, 255};
+    uint8_t encoded[4] = {0};
+    if (!xfb_rgba_to_yuv422(white_pair, 2, 1, 8, encoded, 4) ||
+        encoded[0] != 235 || encoded[1] != 128 || encoded[2] != 235 || encoded[3] != 128) {
+        ok = false;
+    }
+
+    const uint8_t source[3 * 3 * 4] = {
+        0, 0, 0, 0,    4, 4, 4, 4,    8, 8, 8, 8,
+        12, 12, 12, 12, 16, 16, 16, 16, 20, 20, 20, 20,
+        24, 24, 24, 24, 28, 28, 28, 28, 32, 32, 32, 32,
+    };
+    uint8_t filtered[2 * 2 * 4] = {0};
+    if (!xfb_rgba8_box_filter_2x(source, 3, 3, 12, filtered, 8) ||
+        filtered[0] != 8 || filtered[4] != 14 || filtered[8] != 26 || filtered[12] != 32) {
+        ok = false;
     }
 
     return ok;

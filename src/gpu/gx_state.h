@@ -28,6 +28,7 @@ enum {
     GX_BP_EFB_WH        = 0x4A,
     GX_BP_EFB_ADDR      = 0x4B,
     GX_BP_COPY_STRIDE   = 0x4D,
+    GX_BP_COPY_Y_SCALE  = 0x4E,
     GX_BP_CLEAR_AR      = 0x4F,
     GX_BP_CLEAR_GB      = 0x50,
     GX_BP_CLEAR_Z       = 0x51,
@@ -50,6 +51,7 @@ typedef struct {
     uint32_t efb_wh;         // 0x4A
     uint32_t efb_addr;       // 0x4B
     uint32_t copy_stride;    // 0x4D
+    uint32_t copy_y_scale;   // 0x4E
     uint32_t clear_ar;       // 0x4F
     uint32_t clear_gb;       // 0x50
     uint32_t clear_z;        // 0x51
@@ -144,10 +146,12 @@ typedef struct {
     uint32_t height;
     uint32_t dst_ea;      // guest destination address
     uint32_t dst_stride;  // bytes per encoded tile row
+    uint32_t y_scale;     // 8.8 source-to-XFB vertical scale
     uint8_t  format;      // GXCopyFormat realFormat
     bool     intensity;   // store luma instead of raw red for R/RA formats
     bool     to_xfb;      // YUV XFB copy rather than a texture copy
     bool     half_scale;  // 2:1 box-filtered downscale
+    bool     scale_invert;
 } GXCopyState;
 
 // Reset all tracked registers to zero.

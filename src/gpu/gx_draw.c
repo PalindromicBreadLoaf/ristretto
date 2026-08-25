@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "gpu/gx_draw.h"
+#include "gpu/xfb_present.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -572,23 +573,63 @@ static void apply_state(const GXDrawRecord *rec) {
 
 // Resolve the colour buffer and encode a triggered EFB copy into guest memory.
 static void replay_copy(GXDrawPipeline *p, const GXCopyState *copy) {
-    // TODO: YUV XFB copies feed VI/XFB presentations
-    if (copy->to_xfb || copy->half_scale || copy->width == 0 || copy->height == 0) return;
-
-    const GXCopyFormat fmt = (GXCopyFormat)copy->format;
-    const GXTextureFormat layout = gx_texture_copy_layout(fmt);
-    const int size = gx_texture_encoded_size((int)copy->width, (int)copy->height, layout);
-    if (size <= 0 || (size_t)size > sizeof(g_copy_scratch)) return;
+    if (copy->width == 0 || copy->height == 0 || !p->cb.write_guest) return;
 
     uint32_t pitch = 0;
     const uint8_t *linear = gx_efb_resolve_color(&p->efb, &pitch);
     if (!linear) return;
     const uint8_t *region = linear + (size_t)copy->src_y * pitch + (size_t)copy->src_x * 4u;
-    const int written = gx_texture_encode_copy(g_copy_scratch, region, (int)copy->width,
-                                               (int)copy->height, pitch, fmt, copy->intensity);
+
+    if (copy->to_xfb) {
+        const uint32_t row_bytes = ((copy->width + 1u) >> 1) * 4u;
+        const uint32_t dst_stride = copy->dst_stride;
+        const uint32_t scale = copy->y_scale ? copy->y_scale : 256u;
+        const uint32_t height = copy->scale_invert
+                                    ? (uint32_t)(((uint64_t)(copy->height - 1u) * 256u) / scale + 1u)
+                                    : (uint32_t)(((uint64_t)(copy->height - 1u) * scale) / 256u + 1u);
+        if (dst_stride < row_bytes || height == 0 || height > GX_EFB_HEIGHT) return;
+        for (uint32_t y = 0; y < height; ++y) {
+            uint32_t src_y = copy->scale_invert
+                                 ? (uint32_t)(((uint64_t)y * scale) / 256u)
+                                 : (uint32_t)(((uint64_t)y * 256u) / scale);
+            if (src_y >= copy->height) src_y = copy->height - 1u;
+            if (!xfb_rgba_to_yuv422(region + (size_t)src_y * pitch, copy->width, 1, pitch,
+                                    g_copy_scratch, row_bytes))
+                return;
+            p->cb.write_guest(p->cb.user, copy->dst_ea + y * dst_stride,
+                              g_copy_scratch, row_bytes);
+        }
+        gx_texture_cache_invalidate_range(&p->texture, copy->dst_ea,
+                                          (height - 1u) * dst_stride + row_bytes);
+        return;
+    }
+
+    const GXCopyFormat fmt = (GXCopyFormat)copy->format;
+    const GXTextureFormat layout = gx_texture_copy_layout(fmt);
+    uint32_t width = copy->width;
+    uint32_t height = copy->height;
+    uint32_t source_pitch = pitch;
+    uint8_t *encoded = g_copy_scratch;
+    if (copy->half_scale) {
+        width = (width + 1u) >> 1;
+        height = (height + 1u) >> 1;
+        const size_t scaled_size = (size_t)width * height * 4u;
+        if (scaled_size * 2u > sizeof(g_copy_scratch) ||
+            !xfb_rgba8_box_filter_2x(region, copy->width, copy->height, pitch,
+                                      g_copy_scratch, width * 4u))
+            return;
+        region = g_copy_scratch;
+        source_pitch = width * 4u;
+        encoded += scaled_size;
+    }
+    const int size = gx_texture_encoded_size((int)width, (int)height, layout);
+    if (size <= 0 || (size_t)size > sizeof(g_copy_scratch) - (size_t)(encoded - g_copy_scratch))
+        return;
+
+    const int written = gx_texture_encode_copy(encoded, region, (int)width,
+                                               (int)height, source_pitch, fmt, copy->intensity);
     if (written <= 0) return;
-    if (p->cb.write_guest)
-        p->cb.write_guest(p->cb.user, copy->dst_ea, g_copy_scratch, (uint32_t)written);
+    p->cb.write_guest(p->cb.user, copy->dst_ea, encoded, (uint32_t)written);
     gx_texture_cache_invalidate_range(&p->texture, copy->dst_ea, (uint32_t)written);
 }
 
