@@ -3,6 +3,7 @@
 
 #include "mem/wii_mmio.h"
 
+#include "audio/wii_audio.h"
 #include "ios/ios_ipc.h"
 #include "mem/wii_vi.h"
 
@@ -25,6 +26,7 @@ void wii_mmio_reset(void) {
     s_wgp_bytes_written = 0;
     s_wgp_bytes_dropped = 0;
     s_ipc_msg = 0;
+    wii_audio_reset();
     wii_vi_reset();
 }
 
@@ -58,6 +60,10 @@ void wii_mmio_write(uint32_t ea, uint64_t value, uint32_t size) {
         wii_vi_write(ea - WII_VI_BASE, (uint32_t)value, size);
         return;
     }
+    if (wii_audio_is_mmio(ea)) {
+        wii_audio_write(ea, (uint32_t)value, size);
+        return;
+    }
     switch (ea) {
     case WII_MMIO_IPC_PPCMSG:
         s_ipc_msg = (uint32_t)value;
@@ -74,6 +80,8 @@ void wii_mmio_write(uint32_t ea, uint64_t value, uint32_t size) {
 uint32_t wii_mmio_read(uint32_t ea, uint32_t size) {
     if (wii_ea_is_vi(ea))
         return wii_vi_read(ea - WII_VI_BASE, size);
+    if (wii_audio_is_mmio(ea))
+        return wii_audio_read(ea, size);
     if (ea == WII_MMIO_IPC_PPCMSG)
         return s_ipc_msg;
     return 0;

@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "boot/boot.h"
+#include "audio/wii_audio.h"
 #include "cpu/cpu_exec.h"
 #include "cpu/ppc_decode.h"
 #include "cpu/ppc_interp.h"
@@ -566,6 +567,7 @@ int main(int argc, char **argv) {
 
     wii_mem_setup_lowmem();
     wii_mem_log_layout();
+    wii_audio_reset();
     WHBLogPrintf("wii_mem selftest: %s", selfTestWiiMemory() ? "PASS" : "FAIL");
     WHBLogPrintf("boot selftest: %s", selfTestBoot() ? "PASS" : "FAIL");
     tryLoadDolFromSd();
@@ -594,6 +596,8 @@ int main(int argc, char **argv) {
     WHBLogPrintf("es_formats selftest: %s", es_formats_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("disc selftest: %s", disc_selftest() ? "PASS" : "FAIL");
     tryMountDiscFromSd();
+    WHBLogPrintf("wii_audio selftest: %s", wii_audio_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("audio: Cafe AX output %s", wii_audio_init() ? "enabled" : "unavailable");
     WHBLogPrintf("wii_mmio selftest: %s", wii_mmio_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("wii_vi selftest: %s", wii_vi_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_fifo selftest: %s", gx_fifo_selftest() ? "PASS" : "FAIL");
@@ -716,6 +720,7 @@ int main(int argc, char **argv) {
     }
 
     while (WHBProcIsRunning()) {
+        wii_audio_tick();
         WHBGfxBeginRender();
 
         if (liveReplayPending) {
@@ -778,6 +783,7 @@ exit:
         disc_close(&g_disc);
     }
     ios_ipc_shutdown();
+    wii_audio_shutdown();
     wii_mem_shutdown();
     WHBGfxShutdown();
     shutdownSdLog();
