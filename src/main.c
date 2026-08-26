@@ -282,6 +282,10 @@ static bool selfTestBoot(void) {
 // A boot.dol read from SD and kept until we run it.
 static uint8_t *g_dol_buf = NULL;
 static long     g_dol_len = 0;
+static DolLoadResult g_disc_dol;
+static bool g_disc_dol_loaded;
+static Disc g_disc;
+static bool g_disc_mounted;
 static GXSubmitter g_gx_submit;
 static FILE *g_sd_log;
 static bool g_sd_mounted;
@@ -388,15 +392,23 @@ static uint32_t g_guest_xfb = 0;
 // Parse the retained boot.dol into guest RAM and run it through the translator to
 // a block budget, then read whatever XFB the guest pointed the VI at.
 static void loadAndRunGuestDol(void) {
-    if (!g_dol_buf)
-        return;
-
     DolLoadResult r;
-    if (!boot_dol_from_buffer(g_dol_buf, (uint32_t)g_dol_len, NULL, &r)) {
-        WHBLogPrint("boot: real DOL failed to load into guest memory");
-        return;
+    if (g_disc_mounted && g_disc.is_wii && g_disc.part_open &&
+        boot_dol_from_disc(&g_disc, &g_disc_dol)) {
+        g_disc_dol_loaded = true;
+        WHBLogPrint("boot: selected main DOL from mounted disc");
     }
-    WHBLogPrintf("boot: real DOL loaded OK entry=0x%08X image=0x%08X..0x%08X (%s)",
+    if (g_disc_dol_loaded) {
+        r = g_disc_dol;
+    } else {
+        if (!g_dol_buf) return;
+        if (!boot_dol_from_buffer(g_dol_buf, (uint32_t)g_dol_len, NULL, &r)) {
+            WHBLogPrint("boot: real DOL failed to load into guest memory");
+            return;
+        }
+    }
+    WHBLogPrintf("boot: %s DOL loaded OK entry=0x%08X image=0x%08X..0x%08X (%s)",
+                 g_disc_dol_loaded ? "disc" : "SD",
                  r.entry_point, r.image_lo, r.image_hi, r.is_wii ? "Wii" : "GC");
 
     if (!wii_mem_fastmem_window()) {
@@ -497,28 +509,33 @@ static bool updateXfbTexture(GX2Texture *texture, uint32_t xfb_ea) {
     return true;
 }
 
-// A disc image kept mounted for the app's lifetime.
-static Disc g_disc;
-static bool g_disc_mounted = false;
-
 static void tryMountDiscFromSd(void) {
     if (!ensureSdCardMounted()) {
         WHBLogPrint("disc: SD mount failed.");
         return;
     }
 
-    char path[256];
-    snprintf(path, sizeof(path), "%s/wiiu/apps/ristretto/game.iso",
-             WHBGetSdCardMountPath());
-
-    if (!disc_open_file(&g_disc, path)) {
-        WHBLogPrintf("disc: no %s. Skipping disc loopback test", path);
+    const char *names[] = {"game.wbfs", "game.iso"};
+    char path[256] = {0};
+    bool opened = false;
+    for (uint32_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        snprintf(path, sizeof(path), "%s/wiiu/apps/ristretto/%s",
+                 WHBGetSdCardMountPath(), names[i]);
+        if (disc_open_file(&g_disc, path)) {
+            opened = true;
+            break;
+        }
+    }
+    if (!opened) {
+        WHBLogPrintf("disc: no game.wbfs or game.iso under %s/wiiu/apps/ristretto",
+                     WHBGetSdCardMountPath());
         return;
     }
 
     g_disc_mounted = true;
     ios_ipc_mount_disc(&g_disc);
-    WHBLogPrintf("disc: mounted id=%s (%s) size=%llu MiB", g_disc.game_id,
+    WHBLogPrintf("disc: mounted %s id=%s (%s) size=%llu MiB",
+                 disc_is_wbfs(&g_disc) ? "WBFS" : "ISO", g_disc.game_id,
                  g_disc.is_wii ? "Wii" : "GC",
                  (unsigned long long)(g_disc.size >> 20));
 
@@ -548,6 +565,7 @@ static void tryMountDiscFromSd(void) {
     memcpy(id, boot, 6);
     WHBLogPrintf("disc: game partition @0x%llx decrypted OK, boot id=%s",
                  (unsigned long long)part, id);
+    WHBLogPrint("boot: mounted disc main DOL will be loaded before guest execution");
 }
 
 int main(int argc, char **argv) {

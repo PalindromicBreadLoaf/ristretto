@@ -18,11 +18,23 @@
 #define DISC_BLOCK_TOTAL      0x8000u   // one on-disc cluster
 #define DISC_BLOCK_HEADER     0x0400u   // hash/IV header
 #define DISC_BLOCK_DATA       0x7C00u   // decrypted payload per cluster
+#define DISC_MAX_BACKING_FILES 10u
 
 typedef struct {
-    FILE          *file;   // file-backed image
+    FILE          *file;   // first file-backed image
     const uint8_t *mem;    // memory-backed image
-    uint64_t       size;   // backing size in bytes
+    uint64_t       size;   // logical disc size in bytes
+
+    FILE     *backing_files[DISC_MAX_BACKING_FILES];
+    uint64_t  backing_base[DISC_MAX_BACKING_FILES];
+    uint64_t  backing_len[DISC_MAX_BACKING_FILES];
+    uint32_t  backing_count;
+    uint64_t  backing_size;
+
+    bool      is_wbfs;
+    uint8_t   wbfs_sector_shift;
+    uint32_t  wbfs_block_count;
+    uint16_t *wbfs_wlba;
 
     bool  valid;           // a recognised disc header was found
     bool  is_wii;          // Wii or GameCube
@@ -41,6 +53,8 @@ void disc_close(Disc *d);
 
 // Raw (unencrypted) read straight from the backing image.
 bool disc_read_raw(Disc *d, uint64_t offset, void *buf, uint32_t len);
+
+bool disc_is_wbfs(const Disc *d);
 
 // Locate the first data partition (type 0). Wii only.
 bool disc_find_game_partition(Disc *d, uint64_t *out_offset);

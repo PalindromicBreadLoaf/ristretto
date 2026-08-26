@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #include "boot/dol.h"
+#include "disc/disc.h"
 
 // Finalises the low-MEM1 boot parameters a game reads at startup.
 
@@ -16,5 +17,8 @@ void boot_apply_params(const DolLoadResult *dol, const char *disc_id6);
 
 bool boot_dol_from_buffer(const void *buf, uint32_t size, const char *disc_id6,
                           DolLoadResult *out);
+
+// Load the game's main DOL directly from an already open, decrypted partition.
+bool boot_dol_from_disc(Disc *disc, DolLoadResult *out);
 
 #endif  // RISTRETTO_BOOT_BOOT_H
