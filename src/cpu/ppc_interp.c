@@ -5,6 +5,7 @@
 #include "cpu/ppc_decode.h"
 #include "mem/wii_memory.h"
 
+#include <coreinit/time.h>
 #include <whb/log.h>
 
 #include <string.h>
@@ -17,8 +18,14 @@
 #define PPC_SPR_CTR   9u
 #define PPC_SPR_SRR0  26u
 #define PPC_SPR_SRR1  27u
+#define PPC_SPR_TBL   268u
+#define PPC_SPR_TBU   269u
+#define PPC_SPR_TBL_W 284u
+#define PPC_SPR_TBU_W 285u
 #define PPC_SPR_SPRG0 272u
 #define PPC_SPR_GQR0  912u
+
+#define WII_TIMEBASE_HZ 60750000u
 
 static void set_cr_field(PpcContext *c, int field, uint8_t val4) {
     int shift = (7 - field) * 4;
@@ -137,6 +144,30 @@ static bool exec_integer_x(PpcContext *c, const PpcInst *in) {
     switch (in->xo) {
     case 266: *rd = a + b; break;                               // add
     case 40:  *rd = b - a; break;                               // subf
+    case 8: {                                                    // subfc
+        uint64_t r = (uint64_t)b + (uint32_t)~a + 1u;
+        *rd = (uint32_t)r;
+        c->xer = (r >> 32) ? (c->xer | XER_CA) : (c->xer & ~XER_CA);
+        break;
+    }
+    case 10: {                                                   // addc
+        uint64_t r = (uint64_t)a + b;
+        *rd = (uint32_t)r;
+        c->xer = (r >> 32) ? (c->xer | XER_CA) : (c->xer & ~XER_CA);
+        break;
+    }
+    case 136: {                                                  // subfe
+        uint64_t r = (uint64_t)b + (uint32_t)~a + ((c->xer & XER_CA) ? 1u : 0u);
+        *rd = (uint32_t)r;
+        c->xer = (r >> 32) ? (c->xer | XER_CA) : (c->xer & ~XER_CA);
+        break;
+    }
+    case 138: {                                                  // adde
+        uint64_t r = (uint64_t)a + b + ((c->xer & XER_CA) ? 1u : 0u);
+        *rd = (uint32_t)r;
+        c->xer = (r >> 32) ? (c->xer | XER_CA) : (c->xer & ~XER_CA);
+        break;
+    }
     case 235: *rd = (uint32_t)((int32_t)a * (int32_t)b); break; // mullw
     case 75:  *rd = (uint32_t)(((int64_t)(int32_t)a * (int32_t)b) >> 32); break;  // mulhw
     case 11:  *rd = (uint32_t)(((uint64_t)a * b) >> 32); break;                   // mulhwu
@@ -204,7 +235,8 @@ static bool exec_integer_x(PpcContext *c, const PpcInst *in) {
 
     // The arithmetic/logical/shift group above falls through to here.
     if (rc) {
-        bool logical = !(in->xo == 266 || in->xo == 40 || in->xo == 235 ||
+        bool logical = !(in->xo == 266 || in->xo == 40 || in->xo == 8 ||
+                         in->xo == 10 || in->xo == 136 || in->xo == 138 || in->xo == 235 ||
                          in->xo == 75 || in->xo == 11 || in->xo == 491 ||
                          in->xo == 459 || in->xo == 104);
         set_cr0(c, (int32_t)(logical ? *rA : *rd));
@@ -212,13 +244,33 @@ static bool exec_integer_x(PpcContext *c, const PpcInst *in) {
     return true;
 }
 
-static uint32_t read_spr(const PpcContext *c, uint32_t spr) {
+static uint64_t wii_timebase_ticks(uint64_t host_ticks) {
+    uint64_t host_hz = OSSecondsToTicks(1);
+    return (host_ticks / host_hz) * WII_TIMEBASE_HZ +
+           ((host_ticks % host_hz) * WII_TIMEBASE_HZ) / host_hz;
+}
+
+static uint64_t read_timebase(PpcContext *c) {
+    uint64_t host_now = (uint64_t)OSGetTime();
+    if (c->timebase_host_ticks == 0)
+        c->timebase_host_ticks = host_now;
+    return c->timebase + wii_timebase_ticks(host_now - c->timebase_host_ticks);
+}
+
+static void write_timebase(PpcContext *c, uint64_t value) {
+    c->timebase = value;
+    c->timebase_host_ticks = (uint64_t)OSGetTime();
+}
+
+static uint32_t read_spr(PpcContext *c, uint32_t spr) {
     switch (spr) {
     case PPC_SPR_XER:  return c->xer;
     case PPC_SPR_LR:   return c->lr;
     case PPC_SPR_CTR:  return c->ctr;
     case PPC_SPR_SRR0: return c->srr0;
     case PPC_SPR_SRR1: return c->srr1;
+    case PPC_SPR_TBL:  return (uint32_t)read_timebase(c);
+    case PPC_SPR_TBU:  return (uint32_t)(read_timebase(c) >> 32);
     default:
         if (spr >= PPC_SPR_SPRG0 && spr < PPC_SPR_SPRG0 + 4u)
             return c->sprg[spr - PPC_SPR_SPRG0];
@@ -235,6 +287,16 @@ static void write_spr(PpcContext *c, uint32_t spr, uint32_t value) {
     case PPC_SPR_CTR:  c->ctr = value; return;
     case PPC_SPR_SRR0: c->srr0 = value; return;
     case PPC_SPR_SRR1: c->srr1 = value; return;
+    case PPC_SPR_TBL_W: {
+        uint64_t tb = read_timebase(c);
+        write_timebase(c, (tb & 0xFFFFFFFF00000000ull) | value);
+        return;
+    }
+    case PPC_SPR_TBU_W: {
+        uint64_t tb = read_timebase(c);
+        write_timebase(c, ((uint64_t)value << 32) | (uint32_t)tb);
+        return;
+    }
     default:
         if (spr >= PPC_SPR_SPRG0 && spr < PPC_SPR_SPRG0 + 4u)
             c->sprg[spr - PPC_SPR_SPRG0] = value;
@@ -526,6 +588,26 @@ bool ppc_interp_selftest(void) {
         ctx.gpr[5] != 0x00002000u) {
         WHBLogPrintf("ppc_interp: virtual rfi failed pc=0x%08X msr=0x%08X r5=0x%08X",
                      ctx.pc, ctx.msr, ctx.gpr[5]);
+        return false;
+    }
+
+    static const uint32_t timebase_code[] = {
+        0x7C9C43A6,  // mttbl r4
+        0x7C7D43A6,  // mttbu r3
+        0x7CAD42E6,  // mftbu r5
+        0x7CCC42E6,  // mftb r6
+    };
+    for (size_t i = 0; i < sizeof timebase_code / sizeof timebase_code[0]; ++i)
+        wii_write_u32(system_ea + (uint32_t)i * 4, timebase_code[i]);
+    memset(&ctx, 0, sizeof ctx);
+    ctx.pc = system_ea;
+    ctx.gpr[3] = 0x12345678u;
+    ctx.gpr[4] = 0x9ABCDEF0u;
+    if (ppc_interp_run(&ctx, system_ea + sizeof timebase_code, 8, &executed) !=
+            PPC_INTERP_STOP || ctx.gpr[5] != 0x12345678u ||
+        ctx.gpr[6] < 0x9ABCDEF0u) {
+        WHBLogPrintf("ppc_interp: timebase hi=0x%08X lo=0x%08X MISMATCH",
+                     ctx.gpr[5], ctx.gpr[6]);
         return false;
     }
 

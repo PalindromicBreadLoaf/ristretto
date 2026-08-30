@@ -45,6 +45,7 @@ bool wii_mem_init(void) {
     // (MEM1 at 0 MEM2 at 0x10000000).
     sWindow = memalign(0x10000, WII_FASTMEM_WINDOW_SIZE);
     if (sWindow) {
+        memset(sWindow, 0, WII_FASTMEM_WINDOW_SIZE);
         sMem1    = sWindow + WII_MEM1_PHYS;
         sMem2    = sWindow + WII_MEM2_PHYS;
         sFastmem = true;
@@ -59,8 +60,10 @@ bool wii_mem_init(void) {
         return false;
     }
 
-    memset(sMem1, 0, WII_MEM1_SIZE);
-    memset(sMem2, 0, WII_MEM2_SIZE);
+    if (!sFastmem) {
+        memset(sMem1, 0, WII_MEM1_SIZE);
+        memset(sMem2, 0, WII_MEM2_SIZE);
+    }
     return true;
 }
 

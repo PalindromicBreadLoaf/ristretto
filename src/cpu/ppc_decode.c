@@ -103,8 +103,8 @@ static void decode_branch_imm(uint32_t w, PpcInst *o) {
 
 static bool integer_x_alu(uint16_t xo) {
     switch (xo) {
-    case 0: case 11: case 19: case 24: case 26: case 28: case 32: case 40:
-    case 60: case 75: case 104: case 124: case 144: case 235: case 266:
+    case 0: case 8: case 10: case 11: case 19: case 24: case 26: case 28: case 32: case 40:
+    case 60: case 75: case 104: case 124: case 136: case 138: case 144: case 235: case 266:
     case 284: case 316: case 412: case 444: case 459: case 476: case 491:
     case 536: case 792: case 824: case 922: case 954:
         return true;
@@ -263,6 +263,7 @@ bool ppc_decode_selftest(void) {
         {"blr",   0x4E800020, PPC_CLASS_BRANCH, PPC_BR_INDIRECT, true,  false, true},
         {"bctr",  0x4E800420, PPC_CLASS_BRANCH, PPC_BR_INDIRECT, true,  false, true},
         {"mflr",  0x7C0802A6, PPC_CLASS_ALU,    PPC_BR_NONE,     false, false, false},
+        {"mftb",  0x7C6C42E6, PPC_CLASS_SYSTEM, PPC_BR_NONE,     false, false, false},
         {"mfmsr", 0x7C6000A6, PPC_CLASS_SYSTEM, PPC_BR_NONE,     false, false, false},
         {"mtsrr0",0x7C7A03A6, PPC_CLASS_SYSTEM, PPC_BR_NONE,     false, false, false},
         {"sync",  0x7C0004AC, PPC_CLASS_SYSTEM, PPC_BR_NONE,     false, false, false},
@@ -289,6 +290,11 @@ bool ppc_decode_selftest(void) {
     ppc_decode(0x7C0802A6, &in);            // mflr r0 -> SPR 8 (LR)
     if (in.spr != 8) {
         WHBLogPrintf("ppc_decode: mflr spr=%u (want 8) MISMATCH", in.spr);
+        return false;
+    }
+    ppc_decode(0x7C6C42E6, &in);            // mftb r3 -> SPR 268 (TBL)
+    if (in.spr != 268) {
+        WHBLogPrintf("ppc_decode: mftb spr=%u (want 268) MISMATCH", in.spr);
         return false;
     }
     ppc_decode(0x48000088, &in);            // b .+0x88

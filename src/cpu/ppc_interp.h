@@ -25,6 +25,8 @@ typedef struct {
     uint32_t sprg[4];
     uint32_t gqr[8];
     uint32_t sr[16];
+    uint64_t timebase;
+    uint64_t timebase_host_ticks;
 } PpcContext;
 
 typedef enum {

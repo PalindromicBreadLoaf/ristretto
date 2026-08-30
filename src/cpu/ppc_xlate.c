@@ -382,31 +382,36 @@ static XBlock *cache_alloc(uint32_t pc) {
     return NULL;   // cache full
 }
 
-// Enough to recognise a memory op whose base register was just loaded with an immediate (lis/li/addi/ori)
-static void track_alu(uint32_t *cval, bool *known, const PpcInst *in) {
+// Enough to recognise a memory op whose base register was just loaded with an immediate (lis/li/addi/ori).
+// A separate conservative bit catches common runtime indexed hardware register bases.
+static void track_alu(uint32_t *cval, bool *known, bool *maybe_mmio, const PpcInst *in) {
     switch (in->primary) {
     case 14:  // addi / li
-        if (in->ra == 0)            { cval[in->rd] = (uint32_t)in->imm; known[in->rd] = true; }
-        else if (known[in->ra])     { cval[in->rd] = cval[in->ra] + (uint32_t)in->imm; known[in->rd] = true; }
-        else                        { known[in->rd] = false; }
+        if (in->ra == 0)            { cval[in->rd] = (uint32_t)in->imm; known[in->rd] = true; maybe_mmio[in->rd] = false; }
+        else if (known[in->ra])     { cval[in->rd] = cval[in->ra] + (uint32_t)in->imm; known[in->rd] = true; maybe_mmio[in->rd] = false; }
+        else                        { known[in->rd] = false; maybe_mmio[in->rd] = maybe_mmio[in->ra]; }
         return;
     case 15:  // addis / lis
-        if (in->ra == 0)            { cval[in->rd] = (uint32_t)in->imm << 16; known[in->rd] = true; }
-        else if (known[in->ra])     { cval[in->rd] = cval[in->ra] + ((uint32_t)in->imm << 16); known[in->rd] = true; }
-        else                        { known[in->rd] = false; }
+        if (in->ra == 0)            { cval[in->rd] = (uint32_t)in->imm << 16; known[in->rd] = true; maybe_mmio[in->rd] = false; }
+        else if (known[in->ra])     { cval[in->rd] = cval[in->ra] + ((uint32_t)in->imm << 16); known[in->rd] = true; maybe_mmio[in->rd] = false; }
+        else                        { known[in->rd] = false; maybe_mmio[in->rd] = maybe_mmio[in->ra]; }
+        if ((uint16_t)in->imm == 0xCC00u || (uint16_t)in->imm == 0xCD00u)
+            maybe_mmio[in->rd] = true;
         return;
     case 24:  // ori
-        if (known[in->rd])          { cval[in->ra] = cval[in->rd] | (uint16_t)in->raw; known[in->ra] = true; }
-        else                        { known[in->ra] = false; }
+        if (known[in->rd])          { cval[in->ra] = cval[in->rd] | (uint16_t)in->raw; known[in->ra] = true; maybe_mmio[in->ra] = false; }
+        else                        { known[in->ra] = false; maybe_mmio[in->ra] = maybe_mmio[in->rd]; }
         return;
     case 25:  // oris
-        if (known[in->rd])          { cval[in->ra] = cval[in->rd] | ((uint32_t)(uint16_t)in->raw << 16); known[in->ra] = true; }
-        else                        { known[in->ra] = false; }
+        if (known[in->rd])          { cval[in->ra] = cval[in->rd] | ((uint32_t)(uint16_t)in->raw << 16); known[in->ra] = true; maybe_mmio[in->ra] = false; }
+        else                        { known[in->ra] = false; maybe_mmio[in->ra] = maybe_mmio[in->rd]; }
         return;
     default:
         // Conservatively drop both possible integer destinations.
         known[in->rd] = false;
         known[in->ra] = false;
+        maybe_mmio[in->rd] = false;
+        maybe_mmio[in->ra] = false;
         return;
     }
 }
@@ -416,7 +421,9 @@ static bool emit_body(uint32_t start_pc, uint32_t *guest_count,
                       TermKind *tk, uint32_t *term_pc, PpcInst *term) {
     uint32_t cval[32];
     bool     known[32];
+    bool     maybe_mmio[32];
     memset(known, 0, sizeof known);
+    memset(maybe_mmio, 0, sizeof maybe_mmio);
 
     for (uint32_t i = 0;; ++i) {
         if (i >= MAX_BLOCK_INSTS) {
@@ -438,7 +445,7 @@ static bool emit_body(uint32_t start_pc, uint32_t *guest_count,
                 *tk = TERM_INTERP; *term_pc = pc; *term = in; *guest_count = i; return true;
             }
             if (!emit(word)) return false;
-            track_alu(cval, known, &in);
+            track_alu(cval, known, maybe_mmio, &in);
             break;
         case PPC_CLASS_FP:
             if (!emit(word)) return false;
@@ -451,14 +458,14 @@ static bool emit_body(uint32_t start_pc, uint32_t *guest_count,
                 if (in.ra == 0)          { ea_known = true; ea = (uint32_t)in.imm; }
                 else if (known[in.ra])   { ea_known = true; ea = cval[in.ra] + (uint32_t)in.imm; }
             }
-            if (ea_known && wii_ea_is_mmio(ea)) {
+            if ((ea_known && wii_ea_is_mmio(ea)) || maybe_mmio[in.ra]) {
                 *tk = TERM_MMIO; *term_pc = pc; *term = in; *guest_count = i; return true;
             }
             if (!emit_mem(&in)) {   // indexed or reserved register
                 *tk = TERM_INTERP; *term_pc = pc; *term = in; *guest_count = i; return true;
             }
-            if (in.class == PPC_CLASS_LOAD && !in.is_fp_mem) known[in.rd] = false;
-            if (in.mem_update) known[in.ra] = false;
+            if (in.class == PPC_CLASS_LOAD && !in.is_fp_mem) { known[in.rd] = false; maybe_mmio[in.rd] = false; }
+            if (in.mem_update) { known[in.ra] = false; maybe_mmio[in.ra] = false; }
             break;
         }
         case PPC_CLASS_SYSTEM:
@@ -672,9 +679,11 @@ static void seed_common(PpcContext *ctx) {
 }
 
 bool ppc_xlate_identity_selftest(void) {
-    // li r3,100 | li r4,7 | mullw r5,r3,r4 | addi r5,r5,5 | fmul f3,f1,f2
+    // li r3,100 | li r4,7 | mullw r5,r3,r4 | addi r5,r5,5 |
+    // addic r10,r3,-1 | subfe r3,r10,r3 | fmul f3,f1,f2
     static const uint32_t block[] = {
-        0x38600064, 0x38800007, 0x7CA321D6, 0x38A50005, 0xFC6100B2,
+        0x38600064, 0x38800007, 0x7CA321D6, 0x38A50005,
+        0x3143FFFF, 0x7C6A1910, 0xFC6100B2,
     };
     const uint32_t pc = 0x80004000;
 
@@ -697,7 +706,7 @@ bool ppc_xlate_identity_selftest(void) {
 
     WHBLogPrintf("cpu_xlate: identity block core=%u built=%uB ran OK",
                  OSGetCodegenCore(), s_len * 4);
-    if (!ctx_equal(&want, &got)) {
+    if (!ctx_equal(&want, &got) || want.gpr[3] != 1 || (want.xer & 0x20000000u) == 0) {
         WHBLogPrintf("cpu_xlate: identity r5 got=%u want=%u f3 got=%d/1000 want=%d/1000 MISMATCH",
                      got.gpr[5], want.gpr[5],
                      (int)(got.fpr[3].d * 1000.0), (int)(want.fpr[3].d * 1000.0));
@@ -910,6 +919,26 @@ bool ppc_xlate_mmio_selftest(void) {
     int32_t result = (int32_t)wii_read_u32(blk + 0x04);
     if (result < 0) {
         WHBLogPrintf("cpu_xlate: mmio ipc dispatch result=%d (want fd>=0)", result);
+        return false;
+    }
+
+    static const uint32_t dynamic_mmio[] = {
+        0x38600000, 0x1CA30014, 0x3D45CD00, 0x394A680C, 0x812A0000, 0x4E800020,
+    };
+    const uint32_t dbase = 0x80007200u;
+    const uint32_t dstop = dbase + (uint32_t)sizeof dynamic_mmio;
+    for (size_t i = 0; i < sizeof dynamic_mmio / sizeof dynamic_mmio[0]; ++i)
+        wii_write_u32(dbase + (uint32_t)i * 4, dynamic_mmio[i]);
+    uint32_t *padding = (uint32_t *)((uint8_t *)wii_mem_fastmem_window() +
+                                     (0xCD00680Cu & WII_FASTMEM_MASK));
+    *padding = 1;
+    PpcContext dc; memset(&dc, 0, sizeof dc);
+    dc.pc = dbase; dc.lr = dstop;
+    r = ppc_xlate_run(&dc, dbase, dstop, 64, &s);
+    *padding = 0;
+    if (r != PPC_XLATE_OK || s.stop != PPC_XSTOP_STOP_PC || dc.gpr[9] != 0) {
+        WHBLogPrintf("cpu_xlate: dynamic mmio routing failed r=%d stop=%d r9=0x%08X",
+                     r, (int)s.stop, dc.gpr[9]);
         return false;
     }
     return true;
