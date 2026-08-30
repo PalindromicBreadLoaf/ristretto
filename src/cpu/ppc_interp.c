@@ -281,6 +281,21 @@ static bool exec_system(PpcContext *c, const PpcInst *in, uint32_t *next) {
     case 598:  // sync
     case 854:  // eieio
         return true;
+    case 54:   // dcbst
+    case 86:   // dcbf
+    case 246:  // dcbtst
+    case 278:  // dcbt
+    case 470:  // dcbi
+    case 758:  // dcba
+    case 982:  // icbi
+        return true;
+    case 1014: { // dcbz
+        uint32_t ea = ((in->ra == 0) ? 0 : c->gpr[in->ra]) + c->gpr[in->rb];
+        ea &= ~31u;
+        for (uint32_t i = 0; i < 32; ++i)
+            wii_write_u8(ea + i, 0);
+        return true;
+    }
     default:
         return false;
     }
@@ -511,6 +526,24 @@ bool ppc_interp_selftest(void) {
         ctx.gpr[5] != 0x00002000u) {
         WHBLogPrintf("ppc_interp: virtual rfi failed pc=0x%08X msr=0x%08X r5=0x%08X",
                      ctx.pc, ctx.msr, ctx.gpr[5]);
+        return false;
+    }
+
+    const uint32_t cache_ea = 0x90008000u;
+    wii_write_u32(cache_ea, 0xFFFFFFFFu);
+    wii_write_u32(cache_ea + 4u, 0xFFFFFFFFu);
+    static const uint32_t cache_code[] = {
+        0x7C0018AC,  // dcbf 0,r3
+        0x7C001FEC,  // dcbz 0,r3
+    };
+    for (size_t i = 0; i < sizeof cache_code / sizeof cache_code[0]; ++i)
+        wii_write_u32(system_ea + (uint32_t)i * 4, cache_code[i]);
+    memset(&ctx, 0, sizeof ctx);
+    ctx.pc = system_ea;
+    ctx.gpr[3] = cache_ea + 12u;
+    if (ppc_interp_run(&ctx, system_ea + sizeof cache_code, 8, &executed) !=
+        PPC_INTERP_STOP || wii_read_u32(cache_ea) != 0 || wii_read_u32(cache_ea + 4u) != 0) {
+        WHBLogPrint("ppc_interp: cache maintenance failed");
         return false;
     }
     return true;

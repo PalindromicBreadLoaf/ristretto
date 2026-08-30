@@ -167,10 +167,21 @@ static bool emit_epilogue(uint32_t ctx_addr) {
 
 static bool gpr_reserved(uint8_t r) { return r == REG_WINDOW || r == REG_SCRATCH; }
 
+static bool cache_noop(const PpcInst *in) {
+    if (in->primary != 31)
+        return false;
+    switch (in->xo) {
+    case 54: case 86: case 246: case 278: case 470: case 758: case 982:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // Rewrite one D-form load/store so its EA resolves onto the fastmem window
 static bool emit_mem(const PpcInst *in) {
-    if (in->mem_indexed || in->mem_update)
-        return false;   // TODO: indexed and update forms
+    if (in->mem_indexed)
+        return false;
     if (gpr_reserved(in->ra) || (!in->is_fp_mem && gpr_reserved(in->rd)))
         return false;
 
@@ -191,6 +202,8 @@ static bool emit_mem(const PpcInst *in) {
     ok &= emit(op_addi(REG_SCRATCH, in->ra, in->imm & 0xFFFF));
     ok &= emit(OP_MASK_ALIAS);
     ok &= emit(enc_x(31, in->rd, REG_WINDOW, REG_SCRATCH, xo));
+    if (in->mem_update)
+        ok &= emit(op_addi(in->ra, in->ra, in->imm & 0xFFFF));
     return ok;
 }
 
@@ -214,6 +227,10 @@ static PpcXlateResult emit_block(const uint32_t *guest, uint32_t count) {
         case PPC_CLASS_LOAD:
         case PPC_CLASS_STORE:
             if (!emit_mem(&in))
+                return PPC_XLATE_UNSUPPORTED;
+            break;
+        case PPC_CLASS_SYSTEM:
+            if (!cache_noop(&in))
                 return PPC_XLATE_UNSUPPORTED;
             break;
         default:
@@ -437,13 +454,18 @@ static bool emit_body(uint32_t start_pc, uint32_t *guest_count,
             if (ea_known && wii_ea_is_mmio(ea)) {
                 *tk = TERM_MMIO; *term_pc = pc; *term = in; *guest_count = i; return true;
             }
-            if (!emit_mem(&in)) {   // indexed / update / reserved reg
+            if (!emit_mem(&in)) {   // indexed or reserved register
                 *tk = TERM_INTERP; *term_pc = pc; *term = in; *guest_count = i; return true;
             }
             if (in.class == PPC_CLASS_LOAD && !in.is_fp_mem) known[in.rd] = false;
             if (in.mem_update) known[in.ra] = false;
             break;
         }
+        case PPC_CLASS_SYSTEM:
+            if (!cache_noop(&in)) {
+                *tk = TERM_INTERP; *term_pc = pc; *term = in; *guest_count = i; return true;
+            }
+            break;
         default:   // BRANCH / SYSTEM / PS
             *tk = TERM_INTERP; *term_pc = pc; *term = in; *guest_count = i; return true;
         }
@@ -738,6 +760,34 @@ bool ppc_xlate_memblock_selftest(void) {
     if (!ctx_equal(&want, &got) || got_w != want_w || got_d != want_d) {
         WHBLogPrintf("cpu_xlate: memblock r4 got=0x%08X want=0x%08X mem@0xC0001000 got=0x%08X want=0x%08X MISMATCH",
                      got.gpr[4], want.gpr[4], got_w, want_w);
+        return false;
+    }
+
+    static const uint32_t update_block[] = {
+        0x3C60C000, 0x60631000, 0x7C0018AC, 0x94630004, 0x84A30004,
+    };
+    const uint32_t update_pc = 0x80005100u;
+    wii_write_u32(0xC0001004u, 0);
+    wii_write_u32(0xC0001008u, 0x11223344u);
+    PpcContext update_want; memset(&update_want, 0, sizeof update_want);
+    update_want.pc = update_pc;
+    for (size_t i = 0; i < sizeof update_block / sizeof update_block[0]; ++i)
+        wii_write_u32(update_pc + (uint32_t)i * 4, update_block[i]);
+    if (ppc_interp_run(&update_want, update_pc + sizeof update_block, 32, &executed) !=
+        PPC_INTERP_STOP) {
+        WHBLogPrint("cpu_xlate: update form oracle did not reach block end");
+        return false;
+    }
+    uint32_t update_store = wii_read_u32(0xC0001004u);
+    wii_write_u32(0xC0001004u, 0);
+
+    PpcContext update_got; memset(&update_got, 0, sizeof update_got);
+    r = ppc_xlate_run_block(&update_got, update_pc, update_block,
+                            sizeof update_block / sizeof update_block[0]);
+    if (r != PPC_XLATE_OK || !ctx_equal(&update_want, &update_got) ||
+        wii_read_u32(0xC0001004u) != update_store) {
+        WHBLogPrintf("cpu_xlate: update form translation failed r=%d r3=0x%08X r5=0x%08X",
+                     r, update_got.gpr[3], update_got.gpr[5]);
         return false;
     }
     return true;
