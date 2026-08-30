@@ -101,6 +101,18 @@ static void decode_branch_imm(uint32_t w, PpcInst *o) {
     }
 }
 
+static bool integer_x_alu(uint16_t xo) {
+    switch (xo) {
+    case 0: case 11: case 19: case 24: case 26: case 28: case 32: case 40:
+    case 60: case 75: case 104: case 124: case 144: case 235: case 266:
+    case 284: case 316: case 412: case 444: case 459: case 476: case 491:
+    case 536: case 792: case 824: case 922: case 954:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool ppc_decode(uint32_t word, PpcInst *out) {
     memset(out, 0, sizeof *out);
     out->raw     = word;
@@ -180,11 +192,13 @@ bool ppc_decode(uint32_t word, PpcInst *out) {
         if (indexed_mem(xo, out))
             return true;
         if (xo == 339 || xo == 467) {            // mfspr / mtspr
-            out->class = PPC_CLASS_ALU;
             out->spr   = decode_spr(word);
+            out->class = (out->spr == 1 || out->spr == 8 || out->spr == 9)
+                       ? PPC_CLASS_ALU : PPC_CLASS_SYSTEM;
             return true;
         }
-        out->class = PPC_CLASS_ALU;
+        // Opcode 31 includes privileged register, cache, and TLB operations.
+        out->class = integer_x_alu(xo) ? PPC_CLASS_ALU : PPC_CLASS_SYSTEM;
         return true;
     }
 
@@ -249,6 +263,9 @@ bool ppc_decode_selftest(void) {
         {"blr",   0x4E800020, PPC_CLASS_BRANCH, PPC_BR_INDIRECT, true,  false, true},
         {"bctr",  0x4E800420, PPC_CLASS_BRANCH, PPC_BR_INDIRECT, true,  false, true},
         {"mflr",  0x7C0802A6, PPC_CLASS_ALU,    PPC_BR_NONE,     false, false, false},
+        {"mfmsr", 0x7C6000A6, PPC_CLASS_SYSTEM, PPC_BR_NONE,     false, false, false},
+        {"mtsrr0",0x7C7A03A6, PPC_CLASS_SYSTEM, PPC_BR_NONE,     false, false, false},
+        {"sync",  0x7C0004AC, PPC_CLASS_SYSTEM, PPC_BR_NONE,     false, false, false},
         {"fmuls", 0xEC2100B2, PPC_CLASS_FP,     PPC_BR_NONE,     false, false, false},
         {"fmul",  0xFC6100B2, PPC_CLASS_FP,     PPC_BR_NONE,     false, false, false},
         {"ps_mul",0x10210072, PPC_CLASS_PS,     PPC_BR_NONE,     false, false, false},

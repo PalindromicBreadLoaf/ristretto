@@ -17,6 +17,14 @@ typedef struct {
     uint32_t lr;
     uint32_t ctr;
     uint32_t pc;
+
+    // Virtual privileged state.
+    uint32_t msr;
+    uint32_t srr0;
+    uint32_t srr1;
+    uint32_t sprg[4];
+    uint32_t gqr[8];
+    uint32_t sr[16];
 } PpcContext;
 
 typedef enum {

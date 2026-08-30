@@ -439,14 +439,17 @@ static void loadAndRunGuestDol(void) {
     ctx.gpr[1] = 0x817E8000u;   // provisional stack near the MEM1 arena top
     ctx.lr     = 0;
 
+    WHBLogPrint("guest: entering translator");
     PpcXlateSession s;
     PpcXlateResult xr = ppc_xlate_run(&ctx, r.entry_point, 1u, GUEST_MAX_BLOCKS, &s);
     WHBLogPrintf("guest: entry=0x%08X xlate=%d stop=%d blocks=%u hits=%u misses=%u",
                  r.entry_point, (int)xr, (int)s.stop,
                  s.blocks_run, s.cache_hits, s.cache_misses);
     if (s.stop == PPC_XSTOP_FAULT)
-        WHBLogPrintf("guest: faulted @0x%08X class=%u (translator/HLE coverage gap)",
-                     s.last_pc, s.last_class);
+        WHBLogPrintf("guest: faulted @0x%08X word=0x%08X class=%u",
+                     s.last_pc, s.last_word, s.last_class);
+    else if (s.stop == PPC_XSTOP_BUDGET)
+        WHBLogPrintf("guest: block budget reached @0x%08X", s.last_pc);
 
     if (capture_gx) {
         wii_mmio_set_wgp_sink(NULL, NULL);

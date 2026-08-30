@@ -38,6 +38,7 @@ typedef struct {
     PpcXlateStop stop;
     uint32_t first_gx_write_ea;   // valid when stop == PPC_XSTOP_GX_WRITE
     uint32_t last_pc;             // guest PC of the faulting instruction (FAULT)
+    uint32_t last_word;           // guest instruction word at last_pc (FAULT)
     uint8_t  last_class;          // PpcClass of the faulting instruction (FAULT)
 } PpcXlateSession;
 

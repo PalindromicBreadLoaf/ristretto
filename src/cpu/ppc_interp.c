@@ -12,6 +12,14 @@
 // XER carry bit
 #define XER_CA 0x20000000u
 
+#define PPC_SPR_XER   1u
+#define PPC_SPR_LR    8u
+#define PPC_SPR_CTR   9u
+#define PPC_SPR_SRR0  26u
+#define PPC_SPR_SRR1  27u
+#define PPC_SPR_SPRG0 272u
+#define PPC_SPR_GQR0  912u
+
 static void set_cr_field(PpcContext *c, int field, uint8_t val4) {
     int shift = (7 - field) * 4;
     c->cr = (c->cr & ~(0xFu << shift)) | ((uint32_t)val4 << shift);
@@ -171,13 +179,17 @@ static bool exec_integer_x(PpcContext *c, const PpcInst *in) {
     }
     case 0:   cmp_field(c, (in->raw >> 23) & 7, a, b, true);  return true;  // cmp
     case 32:  cmp_field(c, (in->raw >> 23) & 7, a, b, false); return true;  // cmpl
-    case 339:                                                  // mfspr
-        c->gpr[in->rd] = (in->spr == 8) ? c->lr : (in->spr == 9) ? c->ctr
-                       : (in->spr == 1) ? c->xer : 0;
+    case 339:                                                 // mfspr
+        if (in->spr == PPC_SPR_XER) c->gpr[in->rd] = c->xer;
+        else if (in->spr == PPC_SPR_LR) c->gpr[in->rd] = c->lr;
+        else if (in->spr == PPC_SPR_CTR) c->gpr[in->rd] = c->ctr;
+        else return false;
         return true;
-    case 467:                                                  // mtspr
-        if (in->spr == 8) c->lr = s; else if (in->spr == 9) c->ctr = s;
-        else if (in->spr == 1) c->xer = s;
+    case 467:                                                 // mtspr
+        if (in->spr == PPC_SPR_XER) c->xer = s;
+        else if (in->spr == PPC_SPR_LR) c->lr = s;
+        else if (in->spr == PPC_SPR_CTR) c->ctr = s;
+        else return false;
         return true;
     case 19:  c->gpr[in->rd] = c->cr; return true;             // mfcr
     case 144: {                                                // mtcrf
@@ -198,6 +210,80 @@ static bool exec_integer_x(PpcContext *c, const PpcInst *in) {
         set_cr0(c, (int32_t)(logical ? *rA : *rd));
     }
     return true;
+}
+
+static uint32_t read_spr(const PpcContext *c, uint32_t spr) {
+    switch (spr) {
+    case PPC_SPR_XER:  return c->xer;
+    case PPC_SPR_LR:   return c->lr;
+    case PPC_SPR_CTR:  return c->ctr;
+    case PPC_SPR_SRR0: return c->srr0;
+    case PPC_SPR_SRR1: return c->srr1;
+    default:
+        if (spr >= PPC_SPR_SPRG0 && spr < PPC_SPR_SPRG0 + 4u)
+            return c->sprg[spr - PPC_SPR_SPRG0];
+        if (spr >= PPC_SPR_GQR0 && spr < PPC_SPR_GQR0 + 8u)
+            return c->gqr[spr - PPC_SPR_GQR0];
+        return 0;
+    }
+}
+
+static void write_spr(PpcContext *c, uint32_t spr, uint32_t value) {
+    switch (spr) {
+    case PPC_SPR_XER:  c->xer = value; return;
+    case PPC_SPR_LR:   c->lr = value; return;
+    case PPC_SPR_CTR:  c->ctr = value; return;
+    case PPC_SPR_SRR0: c->srr0 = value; return;
+    case PPC_SPR_SRR1: c->srr1 = value; return;
+    default:
+        if (spr >= PPC_SPR_SPRG0 && spr < PPC_SPR_SPRG0 + 4u)
+            c->sprg[spr - PPC_SPR_SPRG0] = value;
+        else if (spr >= PPC_SPR_GQR0 && spr < PPC_SPR_GQR0 + 8u)
+            c->gqr[spr - PPC_SPR_GQR0] = value;
+        return;
+    }
+}
+
+static bool exec_system(PpcContext *c, const PpcInst *in, uint32_t *next) {
+    if (in->primary == 19) {
+        if (in->xo == 50) {  // rfi
+            c->msr = c->srr1;
+            *next = c->srr0 & ~3u;
+            return true;
+        }
+        if (in->xo == 150)  // isync
+            return true;
+        return false;
+    }
+
+    if (in->primary != 31)
+        return false;
+
+    switch (in->xo) {
+    case 83:   // mfmsr
+        c->gpr[in->rd] = c->msr;
+        return true;
+    case 146:  // mtmsr
+        c->msr = c->gpr[in->rd];
+        return true;
+    case 210:  // mtsr
+        c->sr[in->ra & 15u] = c->gpr[in->rd];
+        return true;
+    case 339:  // mfspr
+        c->gpr[in->rd] = read_spr(c, in->spr);
+        return true;
+    case 467:  // mtspr
+        write_spr(c, in->spr, c->gpr[in->rd]);
+        return true;
+    case 595:  // mfsr
+        c->gpr[in->rd] = c->sr[in->ra & 15u];
+        return true;
+    case 598:  // sync
+    case 854:  // eieio
+        return true;
+    default:
+        return false;
+    }
 }
 
 static bool exec_fp(PpcContext *c, const PpcInst *in) {
@@ -348,6 +434,9 @@ PpcInterpResult ppc_interp_run(PpcContext *ctx, uint32_t stop_pc,
             ok = (in.primary == 31) ? exec_integer_x(ctx, &in)
                                     : exec_integer_d(ctx, &in);
             break;
+        case PPC_CLASS_SYSTEM:
+            ok = exec_system(ctx, &in, &next);
+            break;
         default:
             ok = false;   // PS / SYSTEM / ILLEGAL
             break;
@@ -401,6 +490,27 @@ bool ppc_interp_selftest(void) {
         WHBLogPrintf("ppc_interp: r5=%u r7=%u mem=%u f3=%d/10 out=%d/10 MISMATCH",
                      ctx.gpr[5], ctx.gpr[7], wii_read_u32(0x90000010),
                      (int)ctx.fpr[3].d, (int)out.d);
+        return false;
+    }
+    static const uint32_t system_code[] = {
+        0x7C7A03A6,  // mtsrr0 r3
+        0x7C9B03A6,  // mtsrr1 r4
+        0x4C000064,  // rfi
+        0x7CA000A6,  // mfmsr r5
+    };
+    const uint32_t system_ea = 0x90007000;
+    for (size_t i = 0; i < sizeof system_code / sizeof system_code[0]; ++i)
+        wii_write_u32(system_ea + (uint32_t)i * 4, system_code[i]);
+
+    memset(&ctx, 0, sizeof ctx);
+    ctx.pc = system_ea;
+    ctx.gpr[3] = system_ea + 12u;
+    ctx.gpr[4] = 0x00002000u;
+    if (ppc_interp_run(&ctx, system_ea + 16u, 8, &executed) != PPC_INTERP_STOP ||
+        ctx.pc != system_ea + 16u || ctx.msr != 0x00002000u ||
+        ctx.gpr[5] != 0x00002000u) {
+        WHBLogPrintf("ppc_interp: virtual rfi failed pc=0x%08X msr=0x%08X r5=0x%08X",
+                     ctx.pc, ctx.msr, ctx.gpr[5]);
         return false;
     }
     return true;

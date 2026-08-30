@@ -582,6 +582,7 @@ static void session_run(void) {
                 if (!ppc_decode(wii_read_u32(b->term_pc), &fi)) fi.class = PPC_CLASS_ILLEGAL;
                 s_session.stop = PPC_XSTOP_FAULT;
                 s_session.last_pc = b->term_pc;
+                s_session.last_word = wii_read_u32(b->term_pc);
                 s_session.last_class = (uint8_t)fi.class;
                 return;
             }
@@ -590,6 +591,7 @@ static void session_run(void) {
         }
         }
     }
+    s_session.last_pc = pc;
 }
 
 static int sessionThreadEntry(int argc, const char **argv) {
