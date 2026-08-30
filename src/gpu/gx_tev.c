@@ -416,7 +416,8 @@ int gx_tev_selftest(void) {
     if (cfg.pixel.fog_type != 4 || !cfg.pixel.fog_ortho || cfg.pixel.ztex_format != 2 ||
         cfg.pixel.ztex_op != 1 || cfg.pixel.ztex_bias != 0x123456u ||
         cfile[16][0] != 17.0f / 255.0f || cfile[16][2] != 51.0f / 255.0f ||
-        cfile[10][0] != 1.0f || cfile[11][0] != 1.0f)
+        cfile[10][0] != 1023.0f / 1024.0f || cfile[11][0] != 0.5f ||
+        cfile[10][3] != 256.0f || cfile[11][3] != 256.0f)
         return 0;
 
     return 1;

@@ -828,6 +828,7 @@ int gx_draw_selftest(void) {
         gx_draw_shutdown(&p);
         return 0;
     }
+    gx_draw_reset_state(&p);
 
     const uint32_t vcd_lo = (1u << 9) | (1u << 13);  // pos Direct, col0 Direct
     const uint32_t vcd_hi = 0x00000001;              // tex0 Direct

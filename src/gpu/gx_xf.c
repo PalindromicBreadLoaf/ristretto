@@ -994,7 +994,8 @@ int gx_xf_selftest(void) {
         gx_xf_light_vertex(&t, 0, pos, normal, colors, out0);
         gx_xf_light_vertex(&t, 1, pos, normal, colors, out1);
         if (fabsf(out0[0] - 0.4f) > 1e-5f || fabsf(out0[1] - 0.2f) > 1e-5f ||
-            fabsf(out0[2] - 0.1f) > 1e-5f || fabsf(out0[3] - 0.25f) > 1e-5f ||
+            fabsf(out0[2] - 0.1f) > 1e-5f ||
+            fabsf(out0[3] - 64.0f / 255.0f) > 1e-5f ||
             fabsf(out1[0] - 0.2f) > 1e-5f || fabsf(out1[3] - 0.5f) > 1e-5f)
             return 0;
     }

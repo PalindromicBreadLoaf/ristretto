@@ -920,8 +920,10 @@ void tev_shader_gen_ps_shape(const TevConfig *cfg, Gx2PsShape *out)
             out->input_semantics[inputs] = (uint8_t)inputs;  // consecutive param ids
             ++inputs;
         }
-    if (cfg->pixel.fog_type != 0)
-        out->input_semantics[inputs++] = (uint8_t)inputs;
+    if (cfg->pixel.fog_type != 0) {
+        out->input_semantics[inputs] = (uint8_t)inputs;
+        ++inputs;
+    }
     out->num_inputs = inputs;
     out->num_gprs = a.num_gprs;
     out->stack_size = 0;

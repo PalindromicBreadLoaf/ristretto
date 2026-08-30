@@ -335,6 +335,7 @@ int gx_state_selftest(void) {
         return 0;
 
     // BLENDMODE
+    gx_state_apply_bp(&st, GX_BP_ZCOMPARE, GX_EFB_RGBA6_Z24);
     gx_state_apply_bp(&st, GX_BP_BLENDMODE,
                       (1u) | (1u << 3) | (1u << 4) | (5u << 5) | (4u << 8));
     GXBlendState blend;
@@ -398,7 +399,7 @@ int gx_state_selftest(void) {
 
     gx_state_apply_bp(&st, GX_BP_ZCOMPARE, 1u);
     gx_state_apply_bp(&st, GX_BP_CONSTANTALPHA, 0x80u | (1u << 8));
-    gx_state_apply_bp(&st, GX_BP_BLENDMODE, (1u << 3) | (1u << 4) | (4u << 8));
+    gx_state_apply_bp(&st, GX_BP_BLENDMODE, 1u | (1u << 3) | (1u << 4) | (4u << 8));
     gx_state_blend(&st, &blend);
     if (!blend.dual_source_alpha || blend.src_color != GX2_BLEND_MODE_SRC1_ALPHA)
         return 0;
@@ -411,6 +412,7 @@ int gx_state_selftest(void) {
     if (scissor.x != 0 || scissor.y != 0 || scissor.width != 640 || scissor.height != 528)
         return 0;
 
+    gx_state_apply_bp(&st, GX_BP_SCISSOROFFSET, 0);
     const float xf_viewport[6] = {320.0f, -264.0f, GX_EFB_DEPTH_MAX,
                                   320.0f, 264.0f, GX_EFB_DEPTH_MAX};
     GXViewportState viewport;
