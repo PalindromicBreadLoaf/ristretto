@@ -29,11 +29,11 @@ static bool direct_mem(uint8_t op, PpcInst *o) {
         {34, 1, false, false, false}, {35, 1, false, true,  false},  // lbz  lbzu
         {40, 2, false, false, false}, {41, 2, false, true,  false},  // lhz  lhzu
         {42, 2, false, false, false}, {43, 2, false, true,  false},  // lha  lhau
-        {46, 4, false, false, false},                                // lmw
+        {46, 0, false, false, false},                                // lmw
         {36, 4, true,  false, false}, {37, 4, true,  true,  false},  // stw  stwu
         {38, 1, true,  false, false}, {39, 1, true,  true,  false},  // stb  stbu
         {44, 2, true,  false, false}, {45, 2, true,  true,  false},  // sth  sthu
-        {47, 4, true,  false, false},                                // stmw
+        {47, 0, true,  false, false},                                // stmw
         {48, 4, false, false, true},  {49, 4, false, true,  true},   // lfs  lfsu
         {50, 8, false, false, true},  {51, 8, false, true,  true},   // lfd  lfdu
         {52, 4, true,  false, true},  {53, 4, true,  true,  true},   // stfs stfsu
@@ -104,7 +104,8 @@ static void decode_branch_imm(uint32_t w, PpcInst *o) {
 static bool integer_x_alu(uint16_t xo) {
     switch (xo) {
     case 0: case 8: case 10: case 11: case 19: case 24: case 26: case 28: case 32: case 40:
-    case 60: case 75: case 104: case 124: case 136: case 138: case 144: case 235: case 266:
+    case 60: case 75: case 104: case 124: case 136: case 138: case 144: case 200: case 202:
+    case 232: case 234: case 235: case 266:
     case 284: case 316: case 412: case 444: case 459: case 476: case 491:
     case 536: case 792: case 824: case 922: case 954:
         return true;
@@ -191,9 +192,9 @@ bool ppc_decode(uint32_t word, PpcInst *out) {
         out->xo = xo;
         if (indexed_mem(xo, out))
             return true;
-        if (xo == 339 || xo == 467) {            // mfspr / mtspr
+        if (xo == 339 || xo == 371 || xo == 467) { // mfspr / mftb / mtspr
             out->spr   = decode_spr(word);
-            out->class = (out->spr == 1 || out->spr == 8 || out->spr == 9)
+            out->class = (xo == 339 && (out->spr == 1 || out->spr == 8 || out->spr == 9))
                        ? PPC_CLASS_ALU : PPC_CLASS_SYSTEM;
             return true;
         }
@@ -264,6 +265,7 @@ bool ppc_decode_selftest(void) {
         {"bctr",  0x4E800420, PPC_CLASS_BRANCH, PPC_BR_INDIRECT, true,  false, true},
         {"mflr",  0x7C0802A6, PPC_CLASS_ALU,    PPC_BR_NONE,     false, false, false},
         {"mftb",  0x7C6C42E6, PPC_CLASS_SYSTEM, PPC_BR_NONE,     false, false, false},
+        {"crclr", 0x4CC63182, PPC_CLASS_SYSTEM, PPC_BR_NONE,     false, false, false},
         {"mfmsr", 0x7C6000A6, PPC_CLASS_SYSTEM, PPC_BR_NONE,     false, false, false},
         {"mtsrr0",0x7C7A03A6, PPC_CLASS_SYSTEM, PPC_BR_NONE,     false, false, false},
         {"sync",  0x7C0004AC, PPC_CLASS_SYSTEM, PPC_BR_NONE,     false, false, false},

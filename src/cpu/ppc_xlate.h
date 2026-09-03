@@ -56,6 +56,8 @@ bool ppc_xlate_memblock_selftest(void);
 
 bool ppc_xlate_branch_selftest(void);
 
+bool ppc_xlate_interrupt_selftest(void);
+
 bool ppc_xlate_mmio_selftest(void);
 
 bool ppc_xlate_entry_selftest(void);

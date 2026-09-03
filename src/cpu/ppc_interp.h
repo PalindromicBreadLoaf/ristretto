@@ -27,6 +27,10 @@ typedef struct {
     uint32_t sr[16];
     uint64_t timebase;
     uint64_t timebase_host_ticks;
+    int32_t  decrementer;
+    uint64_t decrementer_host_ticks;
+    bool     decrementer_armed;
+    bool     decrementer_exception_pending;
 } PpcContext;
 
 typedef enum {
@@ -39,6 +43,9 @@ typedef enum {
 // max_insts instructions have run.
 PpcInterpResult ppc_interp_run(PpcContext *ctx, uint32_t stop_pc,
                                uint32_t max_insts, uint32_t *executed);
+
+bool ppc_decrementer_pending(PpcContext *ctx);
+void ppc_decrementer_acknowledge_exception(PpcContext *ctx);
 
 // Self test
 bool ppc_interp_selftest(void);

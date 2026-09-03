@@ -55,8 +55,8 @@ typedef struct {
     bool     is_mem;
     bool     is_fp_mem;     // memory op targets an FPR
     bool     mem_update;    // update form
-    bool     mem_indexed;   // indexed form (EA = rA + rB) rather than rA + D
-    uint8_t  mem_size;      // 1/2/4/8 bytes
+    bool     mem_indexed;   // indexed form
+    uint8_t  mem_size;      // 1/2/4/8 bytes, or 0 for lmw/stmw
 
     bool     writes_pc;     // control leaves this instruction non-sequentially
     bool     ends_block;    // basic block terminates at this instruction

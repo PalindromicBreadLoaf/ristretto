@@ -3,12 +3,14 @@
 
 #include "cpu/ppc_xlate.h"
 
+#include "audio/wii_audio.h"
 #include "cpu/ppc_decode.h"
 #include "cpu/ppc_interp.h"
 #include "gpu/gx_fifo.h"
 #include "ios/ios_ipc.h"
 #include "mem/wii_memory.h"
 #include "mem/wii_mmio.h"
+#include "mem/wii_vi.h"
 
 #include <coreinit/cache.h>
 #include <coreinit/codegen.h>
@@ -40,6 +42,11 @@ _Static_assert(offsetof(PpcContext, ctr) == 396, "ctr at 396");
 // r30/r31 are reserved by the prologue/epilogue.
 #define REG_WINDOW 30
 #define REG_SCRATCH 31
+
+#define PPC_MSR_EE               0x00008000u
+#define PPC_EXTERNAL_VECTOR      0x80000500u
+#define PPC_DECREMENTER_VECTOR   0x80000900u
+#define VI_FIELD_BLOCK_INTERVAL  2048u
 
 // Host non-volatile state saved across a block.
 // r13..r31 and f14..f31 are the EABI non-volatiles
@@ -167,6 +174,11 @@ static bool emit_epilogue(uint32_t ctx_addr) {
 
 static bool gpr_reserved(uint8_t r) { return r == REG_WINDOW || r == REG_SCRATCH; }
 
+static bool alu_uses_reserved_gpr(const PpcInst *in) {
+    return gpr_reserved(in->rd) || gpr_reserved(in->ra) ||
+           (in->primary == 31 && gpr_reserved(in->rb));
+}
+
 static bool cache_noop(const PpcInst *in) {
     if (in->primary != 31)
         return false;
@@ -180,7 +192,7 @@ static bool cache_noop(const PpcInst *in) {
 
 // Rewrite one D-form load/store so its EA resolves onto the fastmem window
 static bool emit_mem(const PpcInst *in) {
-    if (in->mem_indexed)
+    if (in->mem_indexed || in->mem_size == 0)
         return false;
     if (gpr_reserved(in->ra) || (!in->is_fp_mem && gpr_reserved(in->rd)))
         return false;
@@ -215,7 +227,7 @@ static PpcXlateResult emit_block(const uint32_t *guest, uint32_t count) {
 
         switch (in.class) {
         case PPC_CLASS_ALU:
-            if (gpr_reserved(in.rd) || gpr_reserved(in.ra))
+            if (alu_uses_reserved_gpr(&in))
                 return PPC_XLATE_UNSUPPORTED;
             if (!emit(guest[i]))
                 return PPC_XLATE_ERROR;
@@ -357,6 +369,34 @@ static bool          s_run_to_gx;
 static PpcXlateSession s_session;
 static PpcXlateResult  s_session_status;
 
+static bool take_external_interrupt(PpcContext *c, uint32_t *pc) {
+    if (!(c->msr & PPC_MSR_EE) || !wii_mmio_irq_pending())
+        return false;
+
+    if (wii_read_u32(PPC_EXTERNAL_VECTOR) == 0)
+        return false;
+
+    c->srr0 = *pc;
+    c->srr1 = c->msr;
+    c->msr &= ~PPC_MSR_EE;
+    c->pc = PPC_EXTERNAL_VECTOR;
+    *pc = PPC_EXTERNAL_VECTOR;
+    return true;
+}
+
+static bool take_decrementer_interrupt(PpcContext *c, uint32_t *pc) {
+    if (!(c->msr & PPC_MSR_EE) || !ppc_decrementer_pending(c))
+        return false;
+
+    ppc_decrementer_acknowledge_exception(c);
+    c->srr0 = *pc;
+    c->srr1 = c->msr;
+    c->msr &= ~PPC_MSR_EE;
+    c->pc = PPC_DECREMENTER_VECTOR;
+    *pc = PPC_DECREMENTER_VECTOR;
+    return true;
+}
+
 static XBlock *cache_find(uint32_t pc) {
     uint32_t i = (pc >> 2) % XCACHE_CAP;
     for (uint32_t n = 0; n < XCACHE_CAP; ++n) {
@@ -399,20 +439,24 @@ static void track_alu(uint32_t *cval, bool *known, bool *maybe_mmio, const PpcIn
             maybe_mmio[in->rd] = true;
         return;
     case 24:  // ori
-        if (known[in->rd])          { cval[in->ra] = cval[in->rd] | (uint16_t)in->raw; known[in->ra] = true; maybe_mmio[in->ra] = false; }
+        if (known[in->rd])          { cval[in->ra] = cval[in->rd] | (uint16_t)in->raw; known[in->ra] = true; maybe_mmio[in->ra] = maybe_mmio[in->rd]; }
         else                        { known[in->ra] = false; maybe_mmio[in->ra] = maybe_mmio[in->rd]; }
         return;
     case 25:  // oris
-        if (known[in->rd])          { cval[in->ra] = cval[in->rd] | ((uint32_t)(uint16_t)in->raw << 16); known[in->ra] = true; maybe_mmio[in->ra] = false; }
+        if (known[in->rd])          { cval[in->ra] = cval[in->rd] | ((uint32_t)(uint16_t)in->raw << 16); known[in->ra] = true; maybe_mmio[in->ra] = maybe_mmio[in->rd]; }
         else                        { known[in->ra] = false; maybe_mmio[in->ra] = maybe_mmio[in->rd]; }
         return;
     default:
-        // Conservatively drop both possible integer destinations.
+        {
+        bool any_mmio = false;
+        for (uint32_t r = 0; r < 32; ++r)
+            any_mmio |= maybe_mmio[r];
         known[in->rd] = false;
         known[in->ra] = false;
-        maybe_mmio[in->rd] = false;
-        maybe_mmio[in->ra] = false;
+        maybe_mmio[in->rd] |= any_mmio;
+        maybe_mmio[in->ra] |= any_mmio;
         return;
+        }
     }
 }
 
@@ -423,7 +467,8 @@ static bool emit_body(uint32_t start_pc, uint32_t *guest_count,
     bool     known[32];
     bool     maybe_mmio[32];
     memset(known, 0, sizeof known);
-    memset(maybe_mmio, 0, sizeof maybe_mmio);
+    for (uint32_t r = 0; r < 32; ++r)
+        maybe_mmio[r] = wii_ea_is_mmio(s_ctx->gpr[r]);
 
     for (uint32_t i = 0;; ++i) {
         if (i >= MAX_BLOCK_INSTS) {
@@ -441,7 +486,7 @@ static bool emit_body(uint32_t start_pc, uint32_t *guest_count,
 
         switch (in.class) {
         case PPC_CLASS_ALU:
-            if (gpr_reserved(in.rd) || gpr_reserved(in.ra)) {
+            if (alu_uses_reserved_gpr(&in)) {
                 *tk = TERM_INTERP; *term_pc = pc; *term = in; *guest_count = i; return true;
             }
             if (!emit(word)) return false;
@@ -452,6 +497,9 @@ static bool emit_body(uint32_t start_pc, uint32_t *guest_count,
             break;
         case PPC_CLASS_LOAD:
         case PPC_CLASS_STORE: {
+            if (in.mem_size == 0) {
+                *tk = TERM_INTERP; *term_pc = pc; *term = in; *guest_count = i; return true;
+            }
             bool ea_known = false;
             uint32_t ea = 0;
             if (!in.mem_indexed) {
@@ -512,7 +560,13 @@ static void service_mmio(PpcContext *c, const PpcInst *in) {
             if (size == 8) c->fpr[in->rd].u = (uint64_t)v << 32;
             else { float f; uint32_t bits = v; memcpy(&f, &bits, 4); c->fpr[in->rd].d = (double)f; }
         } else {
-            if (size == 1) v &= 0xFF; else if (size == 2) v &= 0xFFFF;
+            if (size == 1) {
+                v &= 0xFF;
+            } else if (size == 2) {
+                bool sign = in->primary == 42 || in->primary == 43 ||
+                            in->xo == 343 || in->xo == 375;
+                v = sign ? (uint32_t)(int32_t)(int16_t)v : v & 0xFFFFu;
+            }
             c->gpr[in->rd] = v;
         }
     }
@@ -577,12 +631,20 @@ static void session_run(void) {
     s_codegen_bump = 0;
     s_session.stop = PPC_XSTOP_BUDGET;
     s_session_status = PPC_XLATE_OK;
-
     PpcContext *c = s_ctx;
     uint32_t pc = s_entry;
 
     while (s_session.blocks_run < s_max_blocks) {
-        if (pc == s_stop) { s_session.stop = PPC_XSTOP_STOP_PC; return; }
+        if (pc == s_stop) {
+            c->pc = pc;
+            s_session.stop = PPC_XSTOP_STOP_PC;
+            return;
+        }
+
+        if (s_session.blocks_run && (s_session.blocks_run % VI_FIELD_BLOCK_INTERVAL) == 0)
+            wii_vi_tick_vblank();
+        if (!take_external_interrupt(c, &pc))
+            take_decrementer_interrupt(c, &pc);
 
         XBlock *b = get_block(pc);
         if (!b) return;
@@ -600,11 +662,24 @@ static void session_run(void) {
         case TERM_MMIO:
             c->pc = b->term_pc;
             if (service_mmio_run(c)) { s_session.stop = PPC_XSTOP_GX_WRITE; return; }
+            if (c->pc == b->term_pc) {
+                uint32_t ex = 0;
+                uint32_t nostop = b->term_pc + 2;
+                if (ppc_interp_run(c, nostop, 1, &ex) == PPC_INTERP_ILLEGAL || ex == 0) {
+                    PpcInst fi;
+                    if (!ppc_decode(wii_read_u32(b->term_pc), &fi)) fi.class = PPC_CLASS_ILLEGAL;
+                    s_session.stop = PPC_XSTOP_FAULT;
+                    s_session.last_pc = b->term_pc;
+                    s_session.last_word = wii_read_u32(b->term_pc);
+                    s_session.last_class = (uint8_t)fi.class;
+                    return;
+                }
+            }
             pc = c->pc;
             break;
         case TERM_INTERP: {
             c->pc = b->term_pc;
-            uint32_t nostop = b->term_pc + 2;   // 4-aligned PC can never equal this
+            uint32_t nostop = b->term_pc + 2;
             uint32_t ex = 0;
             if (ppc_interp_run(c, nostop, 1, &ex) == PPC_INTERP_ILLEGAL || ex == 0) {
                 PpcInst fi;
@@ -620,6 +695,7 @@ static void session_run(void) {
         }
         }
     }
+    c->pc = pc;
     s_session.last_pc = pc;
 }
 
@@ -680,10 +756,11 @@ static void seed_common(PpcContext *ctx) {
 
 bool ppc_xlate_identity_selftest(void) {
     // li r3,100 | li r4,7 | mullw r5,r3,r4 | addi r5,r5,5 |
-    // addic r10,r3,-1 | subfe r3,r10,r3 | fmul f3,f1,f2
+    // addic r10,r3,-1 | subfe r3,r10,r3 | addze/addme/subfze/subfme | fmul f3,f1,f2
     static const uint32_t block[] = {
         0x38600064, 0x38800007, 0x7CA321D6, 0x38A50005,
-        0x3143FFFF, 0x7C6A1910, 0xFC6100B2,
+        0x3143FFFF, 0x7C6A1910, 0x7C830194, 0x7CA301D4,
+        0x7CC30190, 0x7CE301D0, 0xFC6100B2,
     };
     const uint32_t pc = 0x80004000;
 
@@ -706,10 +783,18 @@ bool ppc_xlate_identity_selftest(void) {
 
     WHBLogPrintf("cpu_xlate: identity block core=%u built=%uB ran OK",
                  OSGetCodegenCore(), s_len * 4);
-    if (!ctx_equal(&want, &got) || want.gpr[3] != 1 || (want.xer & 0x20000000u) == 0) {
+    if (!ctx_equal(&want, &got) || want.gpr[3] != 1 || want.gpr[4] != 2 ||
+        want.gpr[5] != 0 || want.gpr[6] != 0xFFFFFFFFu || want.gpr[7] != 0xFFFFFFFDu ||
+        (want.xer & 0x20000000u) == 0) {
         WHBLogPrintf("cpu_xlate: identity r5 got=%u want=%u f3 got=%d/1000 want=%d/1000 MISMATCH",
                      got.gpr[5], want.gpr[5],
                      (int)(got.fpr[3].d * 1000.0), (int)(want.fpr[3].d * 1000.0));
+        return false;
+    }
+
+    static const uint32_t reserved_source[] = {0x7CA3F214};  // add r5,r3,r30
+    if (emit_block(reserved_source, 1) != PPC_XLATE_UNSUPPORTED) {
+        WHBLogPrint("cpu_xlate: reserved rB was emitted");
         return false;
     }
     return true;
@@ -844,6 +929,44 @@ bool ppc_xlate_branch_selftest(void) {
     return true;
 }
 
+bool ppc_xlate_interrupt_selftest(void) {
+    wii_mmio_reset();
+    wii_write_u32(PPC_EXTERNAL_VECTOR, 0x4E800020u);
+    uint32_t di0 = (1u << 28) | (240u << 16) | 430u;
+    wii_mmio_write(WII_VI_BASE + WII_VI_DISPLAY_INT_0, di0, 4);
+    wii_mmio_write(WII_MMIO_PI_INTMR, WII_MMIO_PI_VI, 4);
+    wii_vi_tick_vblank();
+
+    PpcContext c;
+    memset(&c, 0, sizeof c);
+    c.msr = PPC_MSR_EE | 0x00002000u;
+    uint32_t pc = 0x80001234u;
+    bool took = take_external_interrupt(&c, &pc);
+    bool ok = took && pc == PPC_EXTERNAL_VECTOR && c.pc == PPC_EXTERNAL_VECTOR &&
+              c.srr0 == 0x80001234u && c.srr1 == (PPC_MSR_EE | 0x00002000u) &&
+              !(c.msr & PPC_MSR_EE);
+    if (!ok)
+        WHBLogPrintf("cpu_xlate: external interrupt delivery failed took=%d pc=%08X srr0=%08X",
+                     took, pc, c.srr0);
+
+    memset(&c, 0, sizeof c);
+    c.msr = PPC_MSR_EE | 0x00002000u;
+    c.decrementer = -1;
+    c.decrementer_exception_pending = true;
+    pc = 0x80005678u;
+    took = take_decrementer_interrupt(&c, &pc);
+    ok &= took && pc == PPC_DECREMENTER_VECTOR && c.pc == PPC_DECREMENTER_VECTOR &&
+          c.srr0 == 0x80005678u && c.srr1 == (PPC_MSR_EE | 0x00002000u) &&
+          !(c.msr & PPC_MSR_EE) && !ppc_decrementer_pending(&c);
+    if (!ok)
+        WHBLogPrintf("cpu_xlate: decrementer interrupt delivery failed took=%d pc=%08X srr0=%08X",
+                     took, pc, c.srr0);
+
+    wii_write_u32(PPC_EXTERNAL_VECTOR, 0);
+    wii_mmio_reset();
+    return ok;
+}
+
 // MMIO/lowmem trap routing
 static int      s_bp_calls;
 static uint8_t  s_bp_cmd;
@@ -939,6 +1062,24 @@ bool ppc_xlate_mmio_selftest(void) {
     if (r != PPC_XLATE_OK || s.stop != PPC_XSTOP_STOP_PC || dc.gpr[9] != 0) {
         WHBLogPrintf("cpu_xlate: dynamic mmio routing failed r=%d stop=%d r9=0x%08X",
                      r, (int)s.stop, dc.gpr[9]);
+        return false;
+    }
+
+    wii_mmio_reset();
+    wii_mmio_write(WII_DSP_ARAM_DMA_CNT_LO, 0x20, 2);
+    static const uint32_t signed_mmio[] = {
+        0x3C60CC00, 0x60635004, 0xA9230000, 0x4E800020,
+    };
+    const uint32_t sbase = 0x80007300u;
+    const uint32_t sstop = sbase + (uint32_t)sizeof signed_mmio;
+    for (size_t i = 0; i < sizeof signed_mmio / sizeof signed_mmio[0]; ++i)
+        wii_write_u32(sbase + (uint32_t)i * 4, signed_mmio[i]);
+    PpcContext sc; memset(&sc, 0, sizeof sc);
+    sc.pc = sbase; sc.lr = sstop;
+    r = ppc_xlate_run(&sc, sbase, sstop, 64, &s);
+    if (r != PPC_XLATE_OK || s.stop != PPC_XSTOP_STOP_PC || sc.gpr[9] != 0xFFFF8000u) {
+        WHBLogPrintf("cpu_xlate: signed mmio load failed r=%d stop=%d r9=0x%08X",
+                     r, (int)s.stop, sc.gpr[9]);
         return false;
     }
     return true;
