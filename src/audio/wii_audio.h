@@ -16,7 +16,12 @@
 #define WII_AI_INTERRUPT_TIMING     (WII_AI_BASE + 0x0Cu)
 
 #define WII_DSP_BASE                0xCC005000u
+#define WII_DSP_MAILBOX_HI          (WII_DSP_BASE + 0x00u)
+#define WII_DSP_MAILBOX_LO          (WII_DSP_BASE + 0x02u)
+#define WII_DSP_CPU_MAILBOX_HI      (WII_DSP_BASE + 0x04u)
+#define WII_DSP_CPU_MAILBOX_LO      (WII_DSP_BASE + 0x06u)
 #define WII_DSP_CONTROL             (WII_DSP_BASE + 0x0Au)
+#define WII_DSP_ARAM_DMA_CNT_LO     (WII_DSP_BASE + 0x2Au)
 #define WII_DSP_AUDIO_DMA_START_HI  (WII_DSP_BASE + 0x30u)
 #define WII_DSP_AUDIO_DMA_START_LO  (WII_DSP_BASE + 0x32u)
 #define WII_DSP_AUDIO_DMA_BLOCKS    (WII_DSP_BASE + 0x34u)

@@ -5,6 +5,7 @@
 
 #include "audio/wii_audio.h"
 #include "ios/ios_ipc.h"
+#include "mem/wii_si.h"
 #include "mem/wii_vi.h"
 
 #include <string.h>
@@ -18,15 +19,36 @@ static uint32_t s_wgp_bytes_dropped;
 static WiiWgpSink s_wgp_sink;
 static void *s_wgp_sink_user;
 
-// Latched Hollywood IPC message
+// Latched Hollywood IPC mailbox state.
 static uint32_t s_ipc_msg;
+static uint32_t s_ipc_arm_msg;
+static uint32_t s_ipc_status;
+static uint32_t s_ipc_interrupt_enable;
+static WiiIpcStats s_ipc_stats;
+static uint32_t s_pi_int_mask;
+
+static uint32_t pi_int_cause(void) {
+    uint32_t cause = 0;
+    if (wii_si_irq_pending()) cause |= WII_MMIO_PI_SI;
+    if (wii_vi_irq_pending()) cause |= WII_MMIO_PI_VI;
+    if ((s_ipc_status & WII_MMIO_IPC_CTRL_Y2) &&
+        (s_ipc_interrupt_enable & WII_MMIO_IPC_CTRL_IY2))
+        cause |= WII_MMIO_PI_IPC;
+    return cause;
+}
 
 void wii_mmio_reset(void) {
     s_wgp_len = 0;
     s_wgp_bytes_written = 0;
     s_wgp_bytes_dropped = 0;
     s_ipc_msg = 0;
+    s_ipc_arm_msg = 0;
+    s_ipc_status = 0;
+    s_ipc_interrupt_enable = 0;
+    memset(&s_ipc_stats, 0, sizeof s_ipc_stats);
+    s_pi_int_mask = 0;
     wii_audio_reset();
+    wii_si_reset();
     wii_vi_reset();
 }
 
@@ -64,13 +86,34 @@ void wii_mmio_write(uint32_t ea, uint64_t value, uint32_t size) {
         wii_audio_write(ea, (uint32_t)value, size);
         return;
     }
+    if (wii_si_is_mmio(ea)) {
+        wii_si_write(ea, (uint32_t)value, size);
+        return;
+    }
     switch (ea) {
+    case WII_MMIO_PI_INTMR:
+        s_pi_int_mask = (uint32_t)value;
+        return;
     case WII_MMIO_IPC_PPCMSG:
         s_ipc_msg = (uint32_t)value;
         return;
     case WII_MMIO_IPC_PPCCTRL:
-        if (value & WII_MMIO_IPC_CTRL_X1)
+        s_ipc_interrupt_enable = (uint32_t)value &
+                                 (WII_MMIO_IPC_CTRL_IY1 | WII_MMIO_IPC_CTRL_IY2);
+        if ((value & WII_MMIO_IPC_CTRL_Y2) && s_ipc_arm_msg != 0) {
+            s_ipc_arm_msg = 0;
+            s_ipc_status &= ~WII_MMIO_IPC_CTRL_Y2;
+            s_ipc_stats.acknowledgements++;
+        }
+        if (value & WII_MMIO_IPC_CTRL_Y1)
+            s_ipc_status &= ~WII_MMIO_IPC_CTRL_Y1;
+        if (value & WII_MMIO_IPC_CTRL_X1) {
             ios_ipc_dispatch(s_ipc_msg);
+            s_ipc_arm_msg = s_ipc_msg;
+            s_ipc_status |= WII_MMIO_IPC_CTRL_Y1 | WII_MMIO_IPC_CTRL_Y2;
+            s_ipc_stats.requests++;
+            s_ipc_stats.replies++;
+        }
         return;
     default:
         return;   // unmodelled register
@@ -82,9 +125,23 @@ uint32_t wii_mmio_read(uint32_t ea, uint32_t size) {
         return wii_vi_read(ea - WII_VI_BASE, size);
     if (wii_audio_is_mmio(ea))
         return wii_audio_read(ea, size);
+    if (wii_si_is_mmio(ea))
+        return wii_si_read(ea, size);
+    if (ea == WII_MMIO_PI_INTSR)
+        return pi_int_cause();
+    if (ea == WII_MMIO_PI_INTMR)
+        return s_pi_int_mask;
     if (ea == WII_MMIO_IPC_PPCMSG)
         return s_ipc_msg;
+    if (ea == WII_MMIO_IPC_PPCCTRL)
+        return s_ipc_status | s_ipc_interrupt_enable;
+    if (ea == WII_MMIO_IPC_ARMMSG)
+        return s_ipc_arm_msg;
     return 0;
+}
+
+bool wii_mmio_irq_pending(void) {
+    return (pi_int_cause() & s_pi_int_mask) != 0;
 }
 
 void wii_mmio_set_wgp_sink(WiiWgpSink sink, void *user) {
@@ -104,6 +161,10 @@ WiiWgpStats wii_mmio_wgp_stats(void) {
         .bytes_captured = s_wgp_len,
         .bytes_dropped = s_wgp_bytes_dropped,
     };
+}
+
+WiiIpcStats wii_mmio_ipc_stats(void) {
+    return s_ipc_stats;
 }
 
 typedef struct {
@@ -135,6 +196,49 @@ bool wii_mmio_selftest(void) {
               memcmp(sink.bytes, data, 6) == 0;
 
     wii_mmio_set_wgp_sink(NULL, NULL);
+    wii_mmio_reset();
+
+    uint32_t di0 = (1u << 28) | (240u << 16);
+    wii_mmio_write(WII_VI_BASE + WII_VI_DISPLAY_INT_0, di0, 4);
+    wii_mmio_write(WII_MMIO_PI_INTMR, WII_MMIO_PI_VI, 4);
+    wii_vi_tick_vblank();
+    if (!(wii_mmio_read(WII_MMIO_PI_INTSR, 4) & WII_MMIO_PI_VI) ||
+        !wii_mmio_irq_pending()) {
+        wii_mmio_reset();
+        return false;
+    }
+    wii_mmio_reset();
+
+    wii_mmio_write(WII_MMIO_IPC_PPCCTRL,
+                   WII_MMIO_IPC_CTRL_IY1 | WII_MMIO_IPC_CTRL_IY2, 4);
+    wii_mmio_write(WII_MMIO_PI_INTMR, WII_MMIO_PI_IPC, 4);
+    wii_mmio_write(WII_MMIO_IPC_PPCMSG, 0x90000000u, 4);
+    wii_mmio_write(WII_MMIO_IPC_PPCCTRL,
+                   WII_MMIO_IPC_CTRL_IY1 | WII_MMIO_IPC_CTRL_IY2 |
+                   WII_MMIO_IPC_CTRL_X1, 4);
+    WiiIpcStats ipc = wii_mmio_ipc_stats();
+    if (wii_mmio_read(WII_MMIO_IPC_ARMMSG, 4) != 0x90000000u ||
+        !(wii_mmio_read(WII_MMIO_PI_INTSR, 4) & WII_MMIO_PI_IPC) ||
+        !wii_mmio_irq_pending() || ipc.requests != 1 || ipc.replies != 1) {
+        wii_mmio_reset();
+        return false;
+    }
+    wii_mmio_write(WII_MMIO_IPC_PPCCTRL,
+                   WII_MMIO_IPC_CTRL_IY1 | WII_MMIO_IPC_CTRL_IY2 |
+                   WII_MMIO_IPC_CTRL_Y2, 4);
+    ipc = wii_mmio_ipc_stats();
+    if (wii_mmio_irq_pending() || ipc.acknowledgements != 1 ||
+        !(wii_mmio_read(WII_MMIO_IPC_PPCCTRL, 4) & WII_MMIO_IPC_CTRL_Y1)) {
+        wii_mmio_reset();
+        return false;
+    }
+    wii_mmio_write(WII_MMIO_IPC_PPCCTRL,
+                   WII_MMIO_IPC_CTRL_IY1 | WII_MMIO_IPC_CTRL_IY2 |
+                   WII_MMIO_IPC_CTRL_Y1, 4);
+    if (wii_mmio_read(WII_MMIO_IPC_PPCCTRL, 4) & WII_MMIO_IPC_CTRL_Y1) {
+        wii_mmio_reset();
+        return false;
+    }
     wii_mmio_reset();
     return ok;
 }

@@ -34,15 +34,14 @@ static void wr32(uint32_t off, uint32_t v) {
 static uint32_t fb_xfb_addr(uint32_t off) {
     uint32_t v   = rd32(off);
     uint32_t fbb = v & 0x00FFFFFFu;
-    bool     poff = (v >> 28) & 1u;
+    bool     poff = (rd32(WII_VI_FB_LEFT_TOP_HI) >> 28) & 1u;
     return poff ? (fbb << 5) : fbb;
 }
 
-// Writing a set CLRPOFF field clears POFF.
 static void fb_apply_clrpoff(uint32_t off) {
     uint32_t v = rd32(off);
-    if ((v >> 29) & 0x7u)
-        wr32(off, v & ~(1u << 28));
+    if (off == WII_VI_FB_LEFT_TOP_HI && (v & 0x80000000u))
+        wr32(WII_VI_FB_LEFT_TOP_HI, v & ~(1u << 28));
 }
 
 // Display interrupt register
@@ -55,8 +54,9 @@ void wii_vi_reset(void) {
     memset(s_regs, 0, sizeof(s_regs));
     s_field_top   = true;
     s_field_count = 0;
-    for (uint32_t i = 0; i < WII_VI_NUM_DISPLAY_INT; ++i)
-        wr32(di_off(i), 1u << 28);
+    wr16(WII_VI_VERTICAL_TIMING, 6u);
+    wr16(WII_VI_CONTROL, 1u);
+    wr32(WII_VI_DISPLAY_INT_0, (1u << 28) | (263u << 16) | 430u);
 }
 
 void wii_vi_write(uint32_t offset, uint32_t value, uint32_t size) {
@@ -77,8 +77,6 @@ void wii_vi_write(uint32_t offset, uint32_t value, uint32_t size) {
 
     if (offset == WII_VI_FB_LEFT_TOP_HI)
         fb_apply_clrpoff(WII_VI_FB_LEFT_TOP_HI);
-    else if (offset == WII_VI_FB_LEFT_BOTTOM_HI)
-        fb_apply_clrpoff(WII_VI_FB_LEFT_BOTTOM_HI);
 }
 
 uint32_t wii_vi_read(uint32_t offset, uint32_t size) {
@@ -122,7 +120,7 @@ bool wii_vi_tick_vblank(void) {
         uint32_t off = di_off(i);
         uint32_t v   = rd32(off);
         uint32_t vct = di_vct(v);
-        if (vct != 0 && vct <= lines)
+        if (di_mask(v) && vct <= lines)
             wr32(off, v | (1u << 31));  // set IR_INT
     }
 
@@ -162,7 +160,7 @@ bool wii_vi_selftest(void) {
         ok = false;  // top field should scan the top XFB
     }
 
-    wii_vi_write(WII_VI_FB_LEFT_BOTTOM_HI, 0x00301E00u, 4);
+    wii_vi_write(WII_VI_FB_LEFT_BOTTOM_HI, 0x00301E00u >> 5, 4);
     if (wii_vi_xfb_bottom() != 0x00301E00u) {
         ok = false;
     }

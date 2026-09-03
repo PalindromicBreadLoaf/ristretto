@@ -26,6 +26,7 @@
 
 #define DSP_CTRL_AID       (1u << 3)
 #define DSP_CTRL_AID_MASK  (1u << 4)
+#define DSP_CTRL_ARAM      (1u << 5)
 
 typedef struct {
     uint32_t ai_control;
@@ -33,6 +34,8 @@ typedef struct {
     uint32_t ai_counter;
     uint32_t ai_interrupt_timing;
     uint16_t dsp_control;
+    uint16_t dsp_mailbox_hi;
+    uint16_t dsp_mailbox_lo;
     uint32_t dma_config_source;
     uint32_t dma_source;
     uint16_t dma_blocks;
@@ -216,6 +219,11 @@ static void write16(uint32_t ea, uint16_t value) {
         s_audio.dsp_control = (s_audio.dsp_control & ~(DSP_CTRL_AID_MASK | (1u << 2))) |
                               (value & (DSP_CTRL_AID_MASK | (1u << 2)));
         return;
+    case WII_DSP_ARAM_DMA_CNT_LO:
+        s_audio.dsp_control |= DSP_CTRL_ARAM;
+        s_audio.dsp_mailbox_hi = 0x8000u;
+        s_audio.dsp_mailbox_lo = 0;
+        return;
     case WII_DSP_AUDIO_DMA_START_HI:
         s_audio.dma_config_source = (s_audio.dma_config_source & 0x0000FFFFu) |
                                     ((uint32_t)(value & 0x1FFFu) << 16);
@@ -281,6 +289,10 @@ void wii_audio_write(uint32_t ea, uint32_t value, uint32_t size) {
 static uint16_t read16(uint32_t ea) {
     uint32_t value = 0;
     switch (ea) {
+    case WII_DSP_MAILBOX_HI: value = s_audio.dsp_mailbox_hi; break;
+    case WII_DSP_MAILBOX_LO: value = s_audio.dsp_mailbox_lo; break;
+    case WII_DSP_CPU_MAILBOX_HI: value = s_audio.dsp_mailbox_hi; break;
+    case WII_DSP_CPU_MAILBOX_LO: value = s_audio.dsp_mailbox_lo; break;
     case WII_DSP_CONTROL: value = s_audio.dsp_control; break;
     case WII_DSP_AUDIO_DMA_START_HI: value = s_audio.dma_config_source >> 16; break;
     case WII_DSP_AUDIO_DMA_START_LO: value = s_audio.dma_config_source & 0xFFFFu; break;
@@ -354,6 +366,9 @@ bool wii_audio_selftest(void) {
               (wii_audio_read(WII_AI_CONTROL, 4) & AI_CTRL_AIINT) != 0 &&
               (wii_audio_read(WII_DSP_CONTROL, 2) & DSP_CTRL_AID) != 0 &&
               wii_audio_read(WII_DSP_AUDIO_DMA_REMAINING, 2) == 0;
+    wii_audio_write(WII_DSP_ARAM_DMA_CNT_LO, 0x20, 2);
+    ok &= (wii_audio_read(WII_DSP_CONTROL, 2) & DSP_CTRL_ARAM) != 0 &&
+          wii_audio_read(WII_DSP_CPU_MAILBOX_HI, 2) == 0x8000u;
     wii_audio_reset();
     return ok;
 }

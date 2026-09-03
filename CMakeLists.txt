@@ -42,6 +42,7 @@ add_executable(ristretto
     src/ios/mocha.c
     src/mem/wii_memory.c
     src/mem/wii_mmio.c
+    src/mem/wii_si.c
     src/mem/wii_vi.c
 )
 
