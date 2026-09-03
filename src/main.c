@@ -388,11 +388,48 @@ static uint32_t g_guest_xfb = 0;
 // Wii NTSC/PAL 640x480 is the common XFB geometry.
 #define XFB_WIDTH  640u
 #define XFB_HEIGHT 480u
-#define GUEST_SLICE_BLOCKS 200000u
-#define GUEST_MAX_SLICES   12u
+#define GUEST_STARTUP_SLICE_BLOCKS 200000u
+#define GUEST_STARTUP_MAX_SLICES   12u
+#define GUEST_FRAME_SLICE_BLOCKS   2049u
 
-// Parse the retained boot.dol into guest RAM and run it through the translator to
-// a block budget, then read whatever XFB the guest pointed the VI at.
+typedef struct {
+    PpcContext context;
+    uint64_t   blocks_run;
+    uint32_t   slices_run;
+    bool       active;
+    bool       capture_gx;
+} GuestRun;
+
+static GuestRun g_guest_run;
+
+static void runGuestSlice(uint32_t block_budget) {
+    if (!g_guest_run.active)
+        return;
+
+    PpcXlateSession session;
+    PpcXlateResult result = ppc_xlate_run(&g_guest_run.context,
+                                          g_guest_run.context.pc, 1u,
+                                          block_budget, &session);
+    g_guest_run.blocks_run += session.blocks_run;
+    ++g_guest_run.slices_run;
+    if (result != PPC_XLATE_OK) {
+        WHBLogPrintf("guest: translator stopped with status %d", result);
+        g_guest_run.active = false;
+    } else if (session.stop == PPC_XSTOP_FAULT) {
+        WHBLogPrintf("guest: faulted @0x%08X word=0x%08X class=%u",
+                     session.last_pc, session.last_word, session.last_class);
+        g_guest_run.active = false;
+    } else if (session.stop != PPC_XSTOP_BUDGET) {
+        WHBLogPrintf("guest: translator stopped at 0x%08X (stop=%d)",
+                     g_guest_run.context.pc, session.stop);
+        g_guest_run.active = false;
+    }
+
+    uint32_t xfb = wii_vi_current_xfb();
+    if (xfb)
+        g_guest_xfb = xfb;
+}
+
 static void loadAndRunGuestDol(void) {
     DolLoadResult r;
     if (g_disc_mounted && g_disc.is_wii && g_disc.part_open &&
@@ -435,38 +472,19 @@ static void loadAndRunGuestDol(void) {
         WHBLogPrint("gx: failed to initialise write-gather submission");
     }
 
-    PpcContext ctx;
-    memset(&ctx, 0, sizeof ctx);
-    ctx.pc     = r.entry_point;
-    ctx.gpr[1] = 0x817E8000u;   // provisional stack near the MEM1 arena top
-    ctx.lr     = 0;
+    memset(&g_guest_run, 0, sizeof g_guest_run);
+    g_guest_run.context.pc     = r.entry_point;
+    g_guest_run.context.gpr[1] = 0x817E8000u; // provisional stack near the MEM1 arena top
+    g_guest_run.active         = true;
+    g_guest_run.capture_gx     = capture_gx;
 
-    PpcXlateSession s;
-    PpcXlateResult xr = PPC_XLATE_OK;
-    for (uint32_t slice = 0; slice < GUEST_MAX_SLICES; ++slice) {
-        xr = ppc_xlate_run(&ctx, ctx.pc, 1u, GUEST_SLICE_BLOCKS, &s);
-        if (xr != PPC_XLATE_OK || s.stop != PPC_XSTOP_BUDGET)
-            break;
-    }
-    if (xr != PPC_XLATE_OK)
-        WHBLogPrintf("guest: translator stopped with status %d", xr);
-    else if (s.stop == PPC_XSTOP_FAULT)
-        WHBLogPrintf("guest: faulted @0x%08X word=0x%08X class=%u",
-                     s.last_pc, s.last_word, s.last_class);
+    for (uint32_t slice = 0; slice < GUEST_STARTUP_MAX_SLICES && g_guest_run.active; ++slice)
+        runGuestSlice(GUEST_STARTUP_SLICE_BLOCKS);
 
-    if (capture_gx) {
-        wii_mmio_set_wgp_sink(NULL, NULL);
-        GXSubmitStats gx_stats = gx_submit_stats(&g_gx_submit);
-        if (gx_stats.failed)
-            WHBLogPrintf("gx: submission stopped after %u rejected WGP bytes",
-                         gx_stats.rejected_bytes);
-    }
-
-    uint32_t xfb = wii_vi_current_xfb();
-    if (xfb)
-        g_guest_xfb = xfb;
-    else
-        WHBLogPrint("guest: VI configured no XFB; showing test shader instead");
+    if (!g_guest_xfb)
+        WHBLogPrint("guest: VI configured no XFB. Showing test shader.");
+    else if (g_guest_run.active)
+        WHBLogPrint("guest: frame scheduler armed");
 }
 
 // A linear RGBA8 texture to receive the converted XFB.
@@ -721,9 +739,9 @@ int main(int argc, char **argv) {
     GX2PixelShader  *ps = useGenerated ? &bound.ps : group.pixelShader;
     uint32_t samplerLoc = ps->samplerVars[0].location;
 
-    const bool haveLiveGuestReplay = g_gx_submit.draw.live_replay &&
-                                     g_gx_submit.draw.nrecords != 0;
-    bool liveReplayPending = haveLiveGuestReplay;
+    bool guest_frame_started = false;
+    bool guest_replay_submitted = false;
+    bool guest_replay_failed = false;
 
     // Present XFB instead of the test shader.
     bool presentGuest = false;
@@ -740,14 +758,33 @@ int main(int argc, char **argv) {
 
     while (WHBProcIsRunning()) {
         wii_audio_tick();
+
+        if (g_guest_run.active) {
+            if (guest_frame_started)
+                gx_submit_begin_frame(&g_gx_submit);
+            guest_frame_started = true;
+            runGuestSlice(GUEST_FRAME_SLICE_BLOCKS);
+        }
+
+        if (presentGuest && g_guest_xfb)
+            presentGuest = updateXfbTexture(&xfbTexture, g_guest_xfb);
+
+        const bool liveReplayPending = g_guest_run.capture_gx &&
+                                       g_gx_submit.draw.live_replay &&
+                                       g_gx_submit.draw.nrecords != 0;
         WHBGfxBeginRender();
 
         if (liveReplayPending) {
             const bool replayed = gx_draw_replay(&g_gx_submit.draw);
             GX2ContextState *tv_context = WHBGfxGetTVContextState();
             if (tv_context) GX2SetContextState(tv_context);
-            WHBLogPrintf("gx: live EFB replay %s", replayed ? "submitted" : "failed");
-            liveReplayPending = false;
+            if (replayed && !guest_replay_submitted) {
+                WHBLogPrint("gx: live EFB replay submitted");
+                guest_replay_submitted = true;
+            } else if (!replayed && !guest_replay_failed) {
+                WHBLogPrint("gx: live EFB replay failed");
+                guest_replay_failed = true;
+            }
         }
 
         WHBGfxBeginRenderTV();
@@ -778,6 +815,22 @@ int main(int argc, char **argv) {
 
 exit:
     WHBLogPrint("Exiting...");
+    if (g_guest_run.slices_run) {
+        WHBLogPrintf("guest: scheduler slices=%u blocks=%llu active=%u xfb=%08X",
+                     g_guest_run.slices_run,
+                     (unsigned long long)g_guest_run.blocks_run,
+                     g_guest_run.active, g_guest_xfb);
+    }
+    if (g_guest_run.capture_gx) {
+        GXSubmitStats gx_stats = gx_submit_stats(&g_gx_submit);
+        WHBLogPrintf("gx: WGP=%llu decoded=%llu pending=%u prims=%u verts=%u",
+                     (unsigned long long)gx_stats.bytes_received,
+                     (unsigned long long)gx_stats.bytes_decoded,
+                     gx_stats.pending_bytes, gx_stats.primitives, gx_stats.vertices);
+        if (gx_stats.failed)
+            WHBLogPrintf("gx: submission stopped after %u rejected WGP bytes",
+                         gx_stats.rejected_bytes);
+    }
     wii_mmio_set_wgp_sink(NULL, NULL);
     if (procui_shutdown)
         gx_submit_shutdown_after_gpu_idle(&g_gx_submit);
