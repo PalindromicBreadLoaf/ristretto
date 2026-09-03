@@ -51,6 +51,7 @@
 #include "ios/ios_ipc.h"
 #include "mem/wii_memory.h"
 #include "mem/wii_mmio.h"
+#include "mem/wii_si.h"
 #include "mem/wii_vi.h"
 
 // PoC for a fixed-function pipeline via GX2.
@@ -387,7 +388,8 @@ static uint32_t g_guest_xfb = 0;
 // Wii NTSC/PAL 640x480 is the common XFB geometry.
 #define XFB_WIDTH  640u
 #define XFB_HEIGHT 480u
-#define GUEST_MAX_BLOCKS 200000u
+#define GUEST_SLICE_BLOCKS 200000u
+#define GUEST_MAX_SLICES   12u
 
 // Parse the retained boot.dol into guest RAM and run it through the translator to
 // a block budget, then read whatever XFB the guest pointed the VI at.
@@ -439,39 +441,32 @@ static void loadAndRunGuestDol(void) {
     ctx.gpr[1] = 0x817E8000u;   // provisional stack near the MEM1 arena top
     ctx.lr     = 0;
 
-    WHBLogPrint("guest: entering translator");
     PpcXlateSession s;
-    PpcXlateResult xr = ppc_xlate_run(&ctx, r.entry_point, 1u, GUEST_MAX_BLOCKS, &s);
-    WHBLogPrintf("guest: entry=0x%08X xlate=%d stop=%d blocks=%u hits=%u misses=%u",
-                 r.entry_point, (int)xr, (int)s.stop,
-                 s.blocks_run, s.cache_hits, s.cache_misses);
-    if (s.stop == PPC_XSTOP_FAULT)
+    PpcXlateResult xr = PPC_XLATE_OK;
+    for (uint32_t slice = 0; slice < GUEST_MAX_SLICES; ++slice) {
+        xr = ppc_xlate_run(&ctx, ctx.pc, 1u, GUEST_SLICE_BLOCKS, &s);
+        if (xr != PPC_XLATE_OK || s.stop != PPC_XSTOP_BUDGET)
+            break;
+    }
+    if (xr != PPC_XLATE_OK)
+        WHBLogPrintf("guest: translator stopped with status %d", xr);
+    else if (s.stop == PPC_XSTOP_FAULT)
         WHBLogPrintf("guest: faulted @0x%08X word=0x%08X class=%u",
                      s.last_pc, s.last_word, s.last_class);
-    else if (s.stop == PPC_XSTOP_BUDGET)
-        WHBLogPrintf("guest: block budget reached @0x%08X", s.last_pc);
 
     if (capture_gx) {
         wii_mmio_set_wgp_sink(NULL, NULL);
         GXSubmitStats gx_stats = gx_submit_stats(&g_gx_submit);
-        WiiWgpStats wgp_stats = wii_mmio_wgp_stats();
-        WHBLogPrintf("gx: WGP=%llu decoded=%llu pending=%u prims=%u verts=%u capture=%u/%llu",
-                     (unsigned long long)gx_stats.bytes_received,
-                     (unsigned long long)gx_stats.bytes_decoded, gx_stats.pending_bytes,
-                     gx_stats.primitives, gx_stats.vertices, wgp_stats.bytes_captured,
-                     (unsigned long long)wgp_stats.bytes_written);
         if (gx_stats.failed)
             WHBLogPrintf("gx: submission stopped after %u rejected WGP bytes",
                          gx_stats.rejected_bytes);
     }
 
     uint32_t xfb = wii_vi_current_xfb();
-    if (xfb) {
+    if (xfb)
         g_guest_xfb = xfb;
-        WHBLogPrintf("guest: VI scan-out XFB @0x%08X (physical MEM1)", xfb);
-    } else {
+    else
         WHBLogPrint("guest: VI configured no XFB; showing test shader instead");
-    }
 }
 
 // A linear RGBA8 texture to receive the converted XFB.
@@ -600,10 +595,12 @@ int main(int argc, char **argv) {
     cpu_ps_probe_all();
     cpu_privilege_probe_all();
     WHBLogPrintf("cpu_xlate selftest: decoder %s", ppc_decode_selftest() ? "PASS" : "FAIL");
-    WHBLogPrintf("cpu_xlate selftest: interp %s", ppc_interp_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("cpu_xlate selftest: interp/conditional-branches %s",
+                 ppc_interp_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("cpu_xlate selftest: identity-block %s", ppc_xlate_identity_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("cpu_xlate selftest: memblock %s", ppc_xlate_memblock_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("cpu_xlate selftest: branches %s", ppc_xlate_branch_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("cpu_xlate selftest: interrupts %s", ppc_xlate_interrupt_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("cpu_xlate selftest: mmio %s", ppc_xlate_mmio_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("cpu_xlate selftest: entry %s", ppc_xlate_entry_selftest() ? "PASS" : "FAIL");
     switch (ios_ipc_selftest()) {
@@ -620,6 +617,7 @@ int main(int argc, char **argv) {
     WHBLogPrintf("wii_audio selftest: %s", wii_audio_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("audio: Cafe AX output %s", wii_audio_init() ? "enabled" : "unavailable");
     WHBLogPrintf("wii_mmio selftest: %s", wii_mmio_selftest() ? "PASS" : "FAIL");
+    WHBLogPrintf("wii_si selftest: %s", wii_si_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("wii_vi selftest: %s", wii_vi_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_fifo selftest: %s", gx_fifo_selftest() ? "PASS" : "FAIL");
     WHBLogPrintf("gx_state selftest: %s", gx_state_selftest() ? "PASS" : "FAIL");
