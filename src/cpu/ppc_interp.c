@@ -8,10 +8,15 @@
 #include <coreinit/time.h>
 #include <whb/log.h>
 
+#include <limits.h>
+#include <math.h>
 #include <string.h>
 
 // XER carry bit
 #define XER_CA 0x20000000u
+#define PPC_MSR_EE 0x00008000u
+#define PPC_MSR_PR 0x00004000u
+#define PPC_SYSTEMCALL_VECTOR 0x80000C00u
 
 #define PPC_SPR_XER   1u
 #define PPC_SPR_DEC   22u
@@ -380,8 +385,13 @@ static void write_spr(PpcContext *c, uint32_t spr, uint32_t value) {
 }
 
 static bool exec_system(PpcContext *c, const PpcInst *in, uint32_t *next) {
-    if (in->primary == 17)  // sc
+    if (in->primary == 17) {  // sc
+        c->srr0 = c->pc + 4u;
+        c->srr1 = c->msr;
+        c->msr &= ~(PPC_MSR_EE | PPC_MSR_PR);
+        *next = PPC_SYSTEMCALL_VECTOR;
         return true;
+    }
 
     if (in->primary == 19) {
         if (in->xo == 50) {  // rfi
@@ -520,6 +530,7 @@ static bool exec_mem(PpcContext *c, const PpcInst *in) {
                 uint32_t bits = wii_read_u32(ea);
                 float f; memcpy(&f, &bits, 4);
                 c->fpr[in->rd].d = (double)f;
+                c->ps1[in->rd] = (double)f;
             }
         } else {
             uint32_t v;
@@ -552,6 +563,159 @@ static bool exec_mem(PpcContext *c, const PpcInst *in) {
     if (in->mem_update)
         c->gpr[in->ra] = ea;
     return true;
+}
+
+static float ps_dequant_scale(uint8_t scale) {
+    return scale <= 31 ? 1.0f / (float)(1ull << scale)
+                       : (float)(1ull << (64u - scale));
+}
+
+static float ps_quant_scale(uint8_t scale) {
+    return scale <= 31 ? (float)(1ull << scale)
+                       : 1.0f / (float)(1ull << (64u - scale));
+}
+
+static float ps_load_float(uint32_t ea) {
+    uint32_t bits = wii_read_u32(ea);
+    float value;
+    memcpy(&value, &bits, sizeof value);
+    return value;
+}
+
+static void ps_store_float(uint32_t ea, double value) {
+    float single = (float)value;
+    uint32_t bits;
+    memcpy(&bits, &single, sizeof bits);
+    wii_write_u32(ea, bits);
+}
+
+static double ps_load_quantized(uint32_t ea, uint8_t type, uint8_t scale) {
+    float factor = ps_dequant_scale(scale);
+    switch (type) {
+    case 0: return ps_load_float(ea);
+    case 4: return (double)((float)wii_read_u8(ea) * factor);
+    case 5: return (double)((float)wii_read_u16(ea) * factor);
+    case 6: return (double)((float)(int8_t)wii_read_u8(ea) * factor);
+    case 7: return (double)((float)(int16_t)wii_read_u16(ea) * factor);
+    default: return 0.0;
+    }
+}
+
+static uint32_t ps_quant_size(uint8_t type) {
+    return type == 0 || type == 5 || type == 7 ? 4u >> (type != 0) : 1u;
+}
+
+static void ps_store_quantized(uint32_t ea, uint8_t type, uint8_t scale, double value) {
+    if (type == 0) {
+        ps_store_float(ea, value);
+        return;
+    }
+
+    float scaled = (float)value * ps_quant_scale(scale);
+    switch (type) {
+    case 4: {
+        uint8_t v = scaled <= 0.0f ? 0u : scaled >= UCHAR_MAX ? UCHAR_MAX : (uint8_t)scaled;
+        wii_write_u8(ea, v);
+        break;
+    }
+    case 5: {
+        uint16_t v = scaled <= 0.0f ? 0u : scaled >= USHRT_MAX ? USHRT_MAX : (uint16_t)scaled;
+        wii_write_u16(ea, v);
+        break;
+    }
+    case 6: {
+        int8_t v = scaled <= SCHAR_MIN ? SCHAR_MIN : scaled >= SCHAR_MAX ? SCHAR_MAX : (int8_t)scaled;
+        wii_write_u8(ea, (uint8_t)v);
+        break;
+    }
+    case 7: {
+        int16_t v = scaled <= SHRT_MIN ? SHRT_MIN : scaled >= SHRT_MAX ? SHRT_MAX : (int16_t)scaled;
+        wii_write_u16(ea, (uint16_t)v);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static bool exec_psq(PpcContext *c, const PpcInst *in) {
+    const bool indexed = in->mem_indexed;
+    uint32_t ea = indexed ? ((in->ra ? c->gpr[in->ra] : 0u) + c->gpr[in->rb])
+                          : ((in->ra ? c->gpr[in->ra] : 0u) + (uint32_t)in->imm);
+    const bool store = in->ps_op == 60 || in->ps_op == 61 || in->ps_op == 7 || in->ps_op == 39;
+    uint32_t gqr = c->gqr[in->ps_i];
+    uint8_t type = store ? (uint8_t)(gqr & 7u) : (uint8_t)((gqr >> 16) & 7u);
+    uint8_t scale = store ? (uint8_t)((gqr >> 8) & 0x3Fu) : (uint8_t)((gqr >> 24) & 0x3Fu);
+    if (type == 1 || type == 2 || type == 3)
+        return false;
+
+    uint32_t size = ps_quant_size(type);
+    if (store) {
+        ps_store_quantized(ea, type, scale, c->fpr[in->rd].d);
+        if (!in->ps_w)
+            ps_store_quantized(ea + size, type, scale, c->ps1[in->rd]);
+    } else {
+        c->fpr[in->rd].d = ps_load_quantized(ea, type, scale);
+        c->ps1[in->rd] = in->ps_w ? 1.0 : ps_load_quantized(ea + size, type, scale);
+    }
+    if (in->mem_update)
+        c->gpr[in->ra] = ea;
+    return true;
+}
+
+static void ps_set(PpcContext *c, uint8_t fd, double a, double b) {
+    c->fpr[fd].d = (double)(float)a;
+    c->ps1[fd] = (double)(float)b;
+}
+
+static void ps_compare(PpcContext *c, uint8_t field, double a, double b) {
+    uint8_t result = isnan(a) || isnan(b) ? 1u : a < b ? 8u : a > b ? 4u : 2u;
+    set_cr_field(c, field, result);
+}
+
+static bool exec_ps(PpcContext *c, const PpcInst *in) {
+    if (in->is_mem)
+        return exec_psq(c, in);
+
+    uint8_t fd = in->rd, fa = in->ra, fb = in->rb, fc = (in->raw >> 6) & 31u;
+    double a0 = c->fpr[fa].d, a1 = c->ps1[fa];
+    double b0 = c->fpr[fb].d, b1 = c->ps1[fb];
+    double c0 = c->fpr[fc].d, c1 = c->ps1[fc];
+    switch (in->xo) {
+    case 0: ps_compare(c, (in->raw >> 23) & 7u, a0, b0); return true;
+    case 32: ps_compare(c, (in->raw >> 23) & 7u, a0, b0); return true;
+    case 64: ps_compare(c, (in->raw >> 23) & 7u, a1, b1); return true;
+    case 96: ps_compare(c, (in->raw >> 23) & 7u, a1, b1); return true;
+    case 40: ps_set(c, fd, -b0, -b1); return true;
+    case 72: ps_set(c, fd, b0, b1); return true;
+    case 136: ps_set(c, fd, -fabs(b0), -fabs(b1)); return true;
+    case 264: ps_set(c, fd, fabs(b0), fabs(b1)); return true;
+    case 528: ps_set(c, fd, a0, b0); return true;
+    case 560: ps_set(c, fd, a0, b1); return true;
+    case 592: ps_set(c, fd, a1, b0); return true;
+    case 624: ps_set(c, fd, a1, b1); return true;
+    default: break;
+    }
+    switch ((in->raw >> 1) & 31u) {
+    case 10: ps_set(c, fd, a0 + b1, c1); return true;
+    case 11: ps_set(c, fd, c0, a0 + b1); return true;
+    case 12: ps_set(c, fd, a0 * c0, a1 * c0); return true;
+    case 13: ps_set(c, fd, a0 * c1, a1 * c1); return true;
+    case 14: ps_set(c, fd, a0 * c0 + b0, a1 * c0 + b1); return true;
+    case 15: ps_set(c, fd, a0 * c1 + b0, a1 * c1 + b1); return true;
+    case 18: ps_set(c, fd, a0 / b0, a1 / b1); return true;
+    case 20: ps_set(c, fd, a0 - b0, a1 - b1); return true;
+    case 21: ps_set(c, fd, a0 + b0, a1 + b1); return true;
+    case 23: ps_set(c, fd, a0 >= -0.0 ? c0 : b0, a1 >= -0.0 ? c1 : b1); return true;
+    case 24: ps_set(c, fd, 1.0 / b0, 1.0 / b1); return true;
+    case 25: ps_set(c, fd, a0 * c0, a1 * c1); return true;
+    case 26: ps_set(c, fd, 1.0 / sqrt(b0), 1.0 / sqrt(b1)); return true;
+    case 28: ps_set(c, fd, a0 * c0 - b0, a1 * c1 - b1); return true;
+    case 29: ps_set(c, fd, a0 * c0 + b0, a1 * c1 + b1); return true;
+    case 30: ps_set(c, fd, b0 - a0 * c0, b1 - a1 * c1); return true;
+    case 31: ps_set(c, fd, -(a0 * c0 + b0), -(a1 * c1 + b1)); return true;
+    default: return false;
+    }
 }
 
 // Returns the branch target, or leaves *taken false to fall through.
@@ -614,6 +778,9 @@ PpcInterpResult ppc_interp_run(PpcContext *ctx, uint32_t stop_pc,
         case PPC_CLASS_FP:
             ok = exec_fp(ctx, &in);
             break;
+        case PPC_CLASS_PS:
+            ok = exec_ps(ctx, &in);
+            break;
         case PPC_CLASS_ALU:
             ok = (in.primary == 31) ? exec_integer_x(ctx, &in)
                                     : exec_integer_d(ctx, &in);
@@ -622,7 +789,7 @@ PpcInterpResult ppc_interp_run(PpcContext *ctx, uint32_t stop_pc,
             ok = exec_system(ctx, &in, &next);
             break;
         default:
-            ok = false;   // PS / SYSTEM / ILLEGAL
+            ok = false;
             break;
         }
 
@@ -798,7 +965,6 @@ bool ppc_interp_selftest(void) {
     static const uint32_t cache_code[] = {
         0x7C0018AC,  // dcbf 0,r3
         0x7C001FEC,  // dcbz 0,r3
-        0x44000002,  // sc
     };
     for (size_t i = 0; i < sizeof cache_code / sizeof cache_code[0]; ++i)
         wii_write_u32(system_ea + (uint32_t)i * 4, cache_code[i]);
@@ -808,6 +974,40 @@ bool ppc_interp_selftest(void) {
     if (ppc_interp_run(&ctx, system_ea + sizeof cache_code, 8, &executed) !=
         PPC_INTERP_STOP || wii_read_u32(cache_ea) != 0 || wii_read_u32(cache_ea + 4u) != 0) {
         WHBLogPrint("ppc_interp: cache maintenance failed");
+        return false;
+    }
+
+    static const uint32_t syscall_vector[] = {
+        0x7C9A02A6,  // mfsrr0 r4
+        0x38630005,  // addi r3,r3,5
+        0x4C000064,  // rfi
+    };
+    uint32_t saved_vector[sizeof syscall_vector / sizeof syscall_vector[0]];
+    for (size_t i = 0; i < sizeof syscall_vector / sizeof syscall_vector[0]; ++i) {
+        saved_vector[i] = wii_read_u32(PPC_SYSTEMCALL_VECTOR + (uint32_t)i * 4u);
+        wii_write_u32(PPC_SYSTEMCALL_VECTOR + (uint32_t)i * 4u, syscall_vector[i]);
+    }
+    static const uint32_t syscall_code[] = {
+        0x44000002,  // sc
+        0x38630001,  // addi r3,r3,1
+    };
+    for (size_t i = 0; i < sizeof syscall_code / sizeof syscall_code[0]; ++i)
+        wii_write_u32(system_ea + (uint32_t)i * 4u, syscall_code[i]);
+    memset(&ctx, 0, sizeof ctx);
+    ctx.pc = system_ea;
+    ctx.gpr[3] = 1;
+    ctx.msr = PPC_MSR_EE | PPC_MSR_PR | 0x00002000u;
+    const uint32_t syscall_msr = ctx.msr;
+    bool syscall_ok = ppc_interp_run(&ctx, system_ea + sizeof syscall_code, 8, &executed) ==
+                          PPC_INTERP_STOP &&
+                      ctx.gpr[3] == 7 && ctx.gpr[4] == system_ea + 4u &&
+                      ctx.srr0 == system_ea + 4u && ctx.srr1 == syscall_msr &&
+                      ctx.msr == syscall_msr;
+    for (size_t i = 0; i < sizeof syscall_vector / sizeof syscall_vector[0]; ++i)
+        wii_write_u32(PPC_SYSTEMCALL_VECTOR + (uint32_t)i * 4u, saved_vector[i]);
+    if (!syscall_ok) {
+        WHBLogPrintf("ppc_interp: system call vector failed pc=%08X r3=%08X r4=%08X msr=%08X",
+                     ctx.pc, ctx.gpr[3], ctx.gpr[4], ctx.msr);
         return false;
     }
 
@@ -830,6 +1030,32 @@ bool ppc_interp_selftest(void) {
         wii_read_u32(multi_dst) != 0xA0B0C000u ||
         wii_read_u32(multi_dst + 12u) != 0xA0B0C003u) {
         WHBLogPrint("ppc_interp: lmw/stmw failed");
+        return false;
+    }
+
+    static const uint32_t ps_code[] = {
+        0xE0230000,  // psq_l f1,0(r3),0,0
+        0x10410072,  // ps_mul f2,f1,f1
+        0xF0430004,  // psq_st f2,4(r3),0,0
+        0xE0638000,  // psq_l f3,0(r3),1,0
+    };
+    const uint32_t ps_data = 0x9000A000u;
+    wii_write_u8(ps_data, 8);
+    wii_write_u8(ps_data + 1u, 16);
+    for (size_t i = 0; i < sizeof ps_code / sizeof ps_code[0]; ++i)
+        wii_write_u32(system_ea + (uint32_t)i * 4u, ps_code[i]);
+    memset(&ctx, 0, sizeof ctx);
+    ctx.pc = system_ea;
+    ctx.gpr[3] = ps_data;
+    ctx.gqr[0] = 0x00040006u;  // store S8, load U8
+    if (ppc_interp_run(&ctx, system_ea + sizeof ps_code, 8, &executed) != PPC_INTERP_STOP ||
+        ctx.fpr[1].d != 8.0 || ctx.ps1[1] != 16.0 || ctx.fpr[2].d != 64.0 ||
+        ctx.ps1[2] != 256.0 || wii_read_u8(ps_data + 4u) != 64u ||
+        wii_read_u8(ps_data + 5u) != 127u || ctx.fpr[3].d != 8.0 || ctx.ps1[3] != 1.0) {
+        WHBLogPrintf("ppc_interp: paired-single quantization failed f1=%d,%d f2=%d,%d f3=%d,%d store=%u,%u",
+                     (int)ctx.fpr[1].d, (int)ctx.ps1[1], (int)ctx.fpr[2].d, (int)ctx.ps1[2],
+                     (int)ctx.fpr[3].d, (int)ctx.ps1[3], wii_read_u8(ps_data + 4u),
+                     wii_read_u8(ps_data + 5u));
         return false;
     }
     return true;

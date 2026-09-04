@@ -127,10 +127,20 @@ bool ppc_decode(uint32_t word, PpcInst *out) {
     uint8_t op = out->primary;
 
     switch (op) {
-    case 4:   // Gekko/Broadway paired-single family
+    case 4: { // Gekko/Broadway paired-single family
         out->class = PPC_CLASS_PS;
         out->xo    = (word >> 1) & 0x3FF;
+        uint8_t ps_op = (word >> 1) & 0x3Fu;
+        if (ps_op == 6 || ps_op == 7 || ps_op == 38 || ps_op == 39) {
+            out->is_mem      = true;
+            out->mem_indexed = true;
+            out->mem_update  = ps_op == 38 || ps_op == 39;
+            out->ps_w        = (word >> 10) & 1u;
+            out->ps_i        = (word >> 7) & 7u;
+            out->ps_op       = ps_op;
+        }
         return true;
+    }
 
     case 7:   // mulli
     case 8:   // subfic
@@ -211,19 +221,23 @@ bool ppc_decode(uint32_t word, PpcInst *out) {
 
     case 56:  // psq_l
     case 57:  // psq_lu
-        out->class      = PPC_CLASS_LOAD;
+        out->class      = PPC_CLASS_PS;
         out->is_mem     = true;
-        out->is_fp_mem  = true;
         out->mem_update = (op == 57);
-        out->mem_size   = 8;
+        out->imm        = sign_extend(word & 0xFFFu, 12);
+        out->ps_w       = (word >> 15) & 1u;
+        out->ps_i       = (word >> 12) & 7u;
+        out->ps_op      = op;
         return true;
     case 60:  // psq_st
     case 61:  // psq_stu
-        out->class      = PPC_CLASS_STORE;
+        out->class      = PPC_CLASS_PS;
         out->is_mem     = true;
-        out->is_fp_mem  = true;
         out->mem_update = (op == 61);
-        out->mem_size   = 8;
+        out->imm        = sign_extend(word & 0xFFFu, 12);
+        out->ps_w       = (word >> 15) & 1u;
+        out->ps_i       = (word >> 12) & 7u;
+        out->ps_op      = op;
         return true;
 
     default:
@@ -272,6 +286,7 @@ bool ppc_decode_selftest(void) {
         {"fmuls", 0xEC2100B2, PPC_CLASS_FP,     PPC_BR_NONE,     false, false, false},
         {"fmul",  0xFC6100B2, PPC_CLASS_FP,     PPC_BR_NONE,     false, false, false},
         {"ps_mul",0x10210072, PPC_CLASS_PS,     PPC_BR_NONE,     false, false, false},
+        {"psq_l", 0xE0230000, PPC_CLASS_PS,     PPC_BR_NONE,     false, true,  false},
     };
 
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
@@ -312,6 +327,18 @@ bool ppc_decode_selftest(void) {
     ppc_decode(0xC8260020, &in);            // lfd f1, 0x20(r6)
     if (!in.is_fp_mem || in.mem_size != 8 || in.imm != 0x20 || in.ra != 6) {
         WHBLogPrint("ppc_decode: lfd operand decode MISMATCH");
+        return false;
+    }
+    ppc_decode(0xE023A004, &in);  // psq_l f1,4(r3),1,2
+    if (in.class != PPC_CLASS_PS || in.imm != 4 || !in.ps_w || in.ps_i != 2 ||
+        in.mem_update || !in.is_mem) {
+        WHBLogPrint("ppc_decode: psq_l operand decode MISMATCH");
+        return false;
+    }
+    ppc_decode(0x104327CE, &in);  // psq_stux f2,r3,r4,1,7
+    if (in.class != PPC_CLASS_PS || !in.mem_indexed || !in.mem_update || !in.ps_w ||
+        in.ps_i != 7 || in.ps_op != 39) {
+        WHBLogPrint("ppc_decode: psq_stux operand decode MISMATCH");
         return false;
     }
     return true;

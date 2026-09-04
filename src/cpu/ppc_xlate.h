@@ -31,6 +31,15 @@ typedef enum {
     PPC_XSTOP_FAULT,       // an instruction neither translator nor interpreter handles
 } PpcXlateStop;
 
+#define PPC_XLATE_TRANSFER_TRACE 24u
+
+typedef struct {
+    uint32_t pc;
+    uint32_t word;
+    uint32_t target;
+    uint32_t lr;
+} PpcXlateTransfer;
+
 typedef struct {
     uint32_t blocks_run;
     uint32_t cache_hits;
@@ -40,6 +49,11 @@ typedef struct {
     uint32_t last_pc;             // guest PC of the faulting instruction (FAULT)
     uint32_t last_word;           // guest instruction word at last_pc (FAULT)
     uint8_t  last_class;          // PpcClass of the faulting instruction (FAULT)
+    uint32_t last_transfer_pc;    // most recent guest control-transfer instruction
+    uint32_t last_transfer_word;
+    uint32_t last_transfer_target;
+    uint32_t transfer_count;
+    PpcXlateTransfer transfers[PPC_XLATE_TRANSFER_TRACE];
 } PpcXlateSession;
 
 // Pass as `stop_pc` to run until the first write-gather-pipe (GX) write.

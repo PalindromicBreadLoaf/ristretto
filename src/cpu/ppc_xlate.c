@@ -622,6 +622,24 @@ static XBlock *get_block(uint32_t pc) {
     return b;
 }
 
+static void record_transfer(const XBlock *b, const PpcContext *c) {
+    PpcXlateSession *s = &s_session;
+    if (s->transfer_count == PPC_XLATE_TRANSFER_TRACE) {
+        memmove(s->transfers, s->transfers + 1,
+                (PPC_XLATE_TRANSFER_TRACE - 1u) * sizeof(s->transfers[0]));
+        --s->transfer_count;
+    }
+    s->transfers[s->transfer_count++] = (PpcXlateTransfer){
+        .pc = b->term_pc,
+        .word = b->term.raw,
+        .target = c->pc,
+        .lr = c->lr,
+    };
+    s->last_transfer_pc = b->term_pc;
+    s->last_transfer_word = b->term.raw;
+    s->last_transfer_target = c->pc;
+}
+
 static void session_run(void) {
     OSGetCodegenVirtAddrRange(&s_area, &s_area_size);
     if (!s_area || !wii_mem_fastmem_window()) { s_session_status = PPC_XLATE_UNAVAILABLE; return; }
@@ -689,6 +707,9 @@ static void session_run(void) {
                 s_session.last_word = wii_read_u32(b->term_pc);
                 s_session.last_class = (uint8_t)fi.class;
                 return;
+            }
+            if (b->term.class == PPC_CLASS_BRANCH || b->term.writes_pc) {
+                record_transfer(b, c);
             }
             pc = c->pc;
             break;

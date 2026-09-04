@@ -58,6 +58,11 @@ typedef struct {
     bool     mem_indexed;   // indexed form
     uint8_t  mem_size;      // 1/2/4/8 bytes, or 0 for lmw/stmw
 
+    // Paired-single quantized load/store controls.
+    uint8_t  ps_w;
+    uint8_t  ps_i;
+    uint8_t  ps_op;
+
     bool     writes_pc;     // control leaves this instruction non-sequentially
     bool     ends_block;    // basic block terminates at this instruction
 } PpcInst;
