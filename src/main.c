@@ -699,7 +699,7 @@ static void loadAndRunGuestDol(void) {
 
     uint32_t launch_entry = r.entry_point;
     if (g_disc_dol_loaded && !runDiscApploader(&g_disc, &g_guest_run.context, &launch_entry))
-        WHBLogPrint("boot: apploader failed);
+        WHBLogPrint("boot: apploader failed");
     g_guest_run.context.pc     = launch_entry;
     g_guest_run.active         = true;
     g_guest_run.capture_gx     = capture_gx;

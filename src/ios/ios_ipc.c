@@ -151,13 +151,48 @@ bool ios_ipc_vwii_nand_available(void) {
 // when SLCCMPT is unavailable.
 
 // ES ioctls actually issued by early boot.
+#define IOCTL_ES_LAUNCH       0x08
+#define IOCTL_ES_GETVIEWCNT   0x12
+#define IOCTL_ES_GETVIEWS     0x13
 #define IOCTL_ES_GETTITLEID  0x20
 #define IOCTL_ES_GETTITLEDIR 0x1D
 #define IOCTL_ES_GETSTOREDTMDSIZE 0x34
 #define IOCTL_ES_GETSTOREDTMD 0x35
 
+#define IOS_TITLE_TYPE 0x00000001u
+#define IOS_TMD_SIZE 0x1E4u
+#define IOS_TMD_TITLE_ID_OFFSET 0x18Cu
+#define IOS_TICKET_VIEW_SIZE 0xD8u
+#define IOS_TICKET_VIEW_TITLE_ID_OFFSET 0x10u
+#define IOS_VERSION_LOWMEM 0x80003140u
+
 // Placeholder boot title
-#define IOS_STUB_TITLE_ID 0x0000000152545354ULL  // 'RTST' in the low word
+#define IOS_STUB_TITLE_ID 0x0000000152545354ULL  // 'RTST'
+
+static const uint16_t kKnownIosVersions[] = {
+    4, 9, 11, 12, 13, 14, 15, 17, 20, 21, 22, 28, 30, 31, 33, 34,
+    35, 36, 37, 38, 40, 41, 43, 45, 46, 48, 50, 51, 52, 53, 55, 56,
+    57, 58, 59, 60, 61, 62, 70, 80, 257,
+};
+
+static bool es_is_known_ios_title(uint64_t title_id) {
+    if ((title_id >> 32) != IOS_TITLE_TYPE)
+        return false;
+
+    const uint32_t version = (uint32_t)title_id;
+    for (uint32_t i = 0; i < sizeof(kKnownIosVersions) / sizeof(kKnownIosVersions[0]); ++i)
+        if (kKnownIosVersions[i] == version) return true;
+    return false;
+}
+
+static void es_write_ios_tmd(uint32_t dst_ea, uint64_t title_id) {
+    uint8_t tmd[IOS_TMD_SIZE] = {0};
+    tmd[1] = 1;
+    tmd[3] = 1;
+    for (uint32_t i = 0; i < 8; ++i)
+        tmd[IOS_TMD_TITLE_ID_OFFSET + i] = (uint8_t)(title_id >> (56 - i * 8));
+    wii_mem_write(dst_ea, tmd, sizeof(tmd));
+}
 
 static int32_t es_ioctl(int32_t fd, uint32_t request,
                         uint32_t in_ea, uint32_t in_len,
@@ -189,18 +224,78 @@ static bool es_tmd_path(uint64_t title_id, char *path, size_t path_cap) {
     return written >= 0 && (size_t)written < path_cap;
 }
 
+static int32_t es_get_ticket_view_count(const IosIoVector *vectors,
+                                        uint32_t in_count, uint32_t io_count) {
+    if (in_count != 1 || io_count != 1 || vectors[0].size < 8 || vectors[1].size < 4 ||
+        !wii_mem_range(vectors[0].addr, 8) || !wii_mem_range(vectors[1].addr, 4))
+        return IOS_IPC_EINVAL;
+
+    const uint64_t title_id = wii_read_u64(vectors[0].addr);
+    if (!es_is_known_ios_title(title_id)) return IOS_IPC_ENOENT;
+    wii_write_u32(vectors[1].addr, 1);
+    return IOS_IPC_SUCCESS;
+}
+
+static int32_t es_get_ticket_views(const IosIoVector *vectors,
+                                   uint32_t in_count, uint32_t io_count) {
+    if (in_count != 2 || io_count != 1 || vectors[0].size < 8 || vectors[1].size < 4 ||
+        !wii_mem_range(vectors[0].addr, 8) || !wii_mem_range(vectors[1].addr, 4))
+        return IOS_IPC_EINVAL;
+
+    const uint64_t title_id = wii_read_u64(vectors[0].addr);
+    const uint32_t requested_views = wii_read_u32(vectors[1].addr);
+    if (!es_is_known_ios_title(title_id)) return IOS_IPC_ENOENT;
+    if (requested_views == 0) return IOS_IPC_SUCCESS;
+    if (vectors[2].size < IOS_TICKET_VIEW_SIZE ||
+        !wii_mem_range(vectors[2].addr, IOS_TICKET_VIEW_SIZE))
+        return IOS_IPC_EINVAL;
+
+    uint8_t view[IOS_TICKET_VIEW_SIZE] = {0};
+    for (uint32_t i = 0; i < 8; ++i)
+        view[IOS_TICKET_VIEW_TITLE_ID_OFFSET + i] = (uint8_t)(title_id >> (56 - i * 8));
+    wii_mem_write(vectors[2].addr, view, sizeof(view));
+    return IOS_IPC_SUCCESS;
+}
+
+static int32_t es_launch_ios(const IosIoVector *vectors,
+                             uint32_t in_count, uint32_t io_count) {
+    if (in_count != 2 || io_count != 0 || vectors[0].size < 8 ||
+        vectors[1].size < IOS_TICKET_VIEW_SIZE || !wii_mem_range(vectors[0].addr, 8) ||
+        !wii_mem_range(vectors[1].addr, IOS_TICKET_VIEW_SIZE))
+        return IOS_IPC_EINVAL;
+
+    const uint64_t title_id = wii_read_u64(vectors[0].addr);
+    if (!es_is_known_ios_title(title_id)) return IOS_IPC_ENOENT;
+
+    const uint32_t version = (uint32_t)title_id;
+    wii_write_u32(IOS_VERSION_LOWMEM, version);
+    WHBLogPrintf("ios: reloaded IOS%u", version);
+    return IOS_IPC_SUCCESS;
+}
+
 static int32_t es_ioctlv(int32_t fd, uint32_t request,
                          uint32_t in_count, uint32_t io_count,
                          const IosIoVector *vectors) {
     (void)fd;
-    if (!s_vwii_nand.ready) return IOS_IPC_EINVAL;
+    if (request == IOCTL_ES_GETVIEWCNT)
+        return es_get_ticket_view_count(vectors, in_count, io_count);
+    if (request == IOCTL_ES_GETVIEWS)
+        return es_get_ticket_views(vectors, in_count, io_count);
+    if (request == IOCTL_ES_LAUNCH)
+        return es_launch_ios(vectors, in_count, io_count);
 
     if (request == IOCTL_ES_GETSTOREDTMDSIZE) {
         if (in_count != 1 || io_count != 1 || vectors[0].size < 8 || vectors[1].size < 4 ||
             !wii_mem_range(vectors[0].addr, 8) || !wii_mem_range(vectors[1].addr, 4))
             return IOS_IPC_EINVAL;
+        const uint64_t title_id = wii_read_u64(vectors[0].addr);
+        if (es_is_known_ios_title(title_id)) {
+            wii_write_u32(vectors[1].addr, IOS_TMD_SIZE);
+            return IOS_IPC_SUCCESS;
+        }
+        if (!s_vwii_nand.ready) return IOS_IPC_ENOENT;
         char path[IOS_MAX_PATH];
-        if (!es_tmd_path(wii_read_u64(vectors[0].addr), path, sizeof(path))) return IOS_IPC_EINVAL;
+        if (!es_tmd_path(title_id, path, sizeof(path))) return IOS_IPC_EINVAL;
         FSAFileHandle file = 0;
         uint32_t size = 0;
         int32_t rc = vwii_open_file(path, &file, &size);
@@ -215,8 +310,16 @@ static int32_t es_ioctlv(int32_t fd, uint32_t request,
             !wii_mem_range(vectors[0].addr, 8) || !wii_mem_range(vectors[1].addr, 4) ||
             !wii_mem_range(vectors[2].addr, vectors[2].size))
             return IOS_IPC_EINVAL;
+        const uint64_t title_id = wii_read_u64(vectors[0].addr);
+        if (es_is_known_ios_title(title_id)) {
+            if (wii_read_u32(vectors[1].addr) < IOS_TMD_SIZE || vectors[2].size < IOS_TMD_SIZE)
+                return IOS_IPC_EINVAL;
+            es_write_ios_tmd(vectors[2].addr, title_id);
+            return IOS_IPC_SUCCESS;
+        }
+        if (!s_vwii_nand.ready) return IOS_IPC_ENOENT;
         char path[IOS_MAX_PATH];
-        if (!es_tmd_path(wii_read_u64(vectors[0].addr), path, sizeof(path))) return IOS_IPC_EINVAL;
+        if (!es_tmd_path(title_id, path, sizeof(path))) return IOS_IPC_EINVAL;
         FSAFileHandle file = 0;
         uint32_t size = 0;
         int32_t rc = vwii_open_file(path, &file, &size);
@@ -230,7 +333,7 @@ static int32_t es_ioctlv(int32_t fd, uint32_t request,
         if (rc != (int32_t)size) return rc;
         EsTmdInfo info;
         void *raw_tmd = wii_mem_range(vectors[2].addr, size);
-        if (!es_tmd_parse(raw_tmd, size, &info) || info.title_id != wii_read_u64(vectors[0].addr))
+        if (!es_tmd_parse(raw_tmd, size, &info) || info.title_id != title_id)
             return IOS_IPC_EINVAL;
         return IOS_IPC_SUCCESS;
     }
@@ -754,6 +857,7 @@ int32_t ios_ipc_dispatch(uint32_t block) {
 #define ST_BLOCK 0x90200000u  // scratch command block in MEM2
 #define ST_BUF   0x90200100u  // scratch data buffers
 #define ST_VECS  0x90200400u  // scratch ioctlv vector array
+#define ST_IOS_TMD 0x90201000u
 
 static void build_open(uint32_t path_ea, int32_t mode) {
     wii_write_u32(ST_BLOCK + IPC_OFF_CMD, IOS_CMD_OPEN);
@@ -842,6 +946,7 @@ bool ios_ipc_vwii_nand_selftest(void) {
 IosIpcSelfTestResult ios_ipc_selftest(void) {
     ios_ipc_init();
     bool ok = true;
+    const uint32_t prior_ios_version = wii_read_u32(IOS_VERSION_LOWMEM);
 
     // Unknown device
     if (open_dev("/dev/nope") != IOS_IPC_ENOENT) {
@@ -866,6 +971,93 @@ IosIpcSelfTestResult ios_ipc_selftest(void) {
         if (rc != IOS_IPC_SUCCESS || wii_read_u64(ST_BUF) != IOS_STUB_TITLE_ID) {
             WHBLogPrintf("ios_ipc: ES GETTITLEID wrong (rc=%d id=0x%016llX)",
                          rc, (unsigned long long)wii_read_u64(ST_BUF));
+            ok = false;
+        }
+
+        const uint64_t ios58_title = 0x000000010000003AULL;
+        const uint64_t invalid_ios_title = 0x00000001000000A7ULL;
+        const uint32_t count_ea = ST_BUF + 0x10;
+        const uint32_t view_ea = ST_BUF + 0x100;
+        const uint32_t tmd_ea = ST_IOS_TMD;
+
+        wii_write_u64(ST_BUF, ios58_title);
+        wii_write_u32(ST_VECS + 0x00, ST_BUF);      wii_write_u32(ST_VECS + 0x04, 8);
+        wii_write_u32(ST_VECS + 0x08, count_ea);    wii_write_u32(ST_VECS + 0x0C, 4);
+        wii_write_u32(ST_BLOCK + IPC_OFF_CMD, IOS_CMD_IOCTLV);
+        wii_write_u32(ST_BLOCK + IPC_OFF_FD, (uint32_t)es_fd);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG0, IOCTL_ES_GETVIEWCNT);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG1, 1);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG2, 1);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG3, ST_VECS);
+        rc = ios_ipc_dispatch(ST_BLOCK);
+        if (rc != IOS_IPC_SUCCESS || wii_read_u32(count_ea) != 1) {
+            WHBLogPrintf("ios_ipc: IOS58 view count wrong (rc=%d count=%u)",
+                         rc, wii_read_u32(count_ea));
+            ok = false;
+        }
+
+        wii_write_u32(ST_VECS + 0x00, ST_BUF);      wii_write_u32(ST_VECS + 0x04, 8);
+        wii_write_u32(ST_VECS + 0x08, count_ea);    wii_write_u32(ST_VECS + 0x0C, 4);
+        wii_write_u32(ST_VECS + 0x10, view_ea);
+        wii_write_u32(ST_VECS + 0x14, IOS_TICKET_VIEW_SIZE);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG0, IOCTL_ES_GETVIEWS);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG1, 2);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG2, 1);
+        rc = ios_ipc_dispatch(ST_BLOCK);
+        if (rc != IOS_IPC_SUCCESS ||
+            wii_read_u64(view_ea + IOS_TICKET_VIEW_TITLE_ID_OFFSET) != ios58_title) {
+            WHBLogPrintf("ios_ipc: IOS58 view wrong (rc=%d title=0x%016llX)", rc,
+                         (unsigned long long)wii_read_u64(view_ea + IOS_TICKET_VIEW_TITLE_ID_OFFSET));
+            ok = false;
+        }
+
+        wii_write_u32(ST_VECS + 0x00, ST_BUF);      wii_write_u32(ST_VECS + 0x04, 8);
+        wii_write_u32(ST_VECS + 0x08, view_ea);
+        wii_write_u32(ST_VECS + 0x0C, IOS_TICKET_VIEW_SIZE);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG0, IOCTL_ES_LAUNCH);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG1, 2);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG2, 0);
+        rc = ios_ipc_dispatch(ST_BLOCK);
+        if (rc != IOS_IPC_SUCCESS || wii_read_u32(IOS_VERSION_LOWMEM) != 58) {
+            WHBLogPrintf("ios_ipc: IOS58 launch wrong (rc=%d version=%u)", rc,
+                         wii_read_u32(IOS_VERSION_LOWMEM));
+            ok = false;
+        }
+
+        wii_write_u32(ST_VECS + 0x00, ST_BUF);      wii_write_u32(ST_VECS + 0x04, 8);
+        wii_write_u32(ST_VECS + 0x08, count_ea);    wii_write_u32(ST_VECS + 0x0C, 4);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG0, IOCTL_ES_GETSTOREDTMDSIZE);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG1, 1);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG2, 1);
+        rc = ios_ipc_dispatch(ST_BLOCK);
+        if (rc != IOS_IPC_SUCCESS || wii_read_u32(count_ea) != IOS_TMD_SIZE) {
+            WHBLogPrintf("ios_ipc: IOS58 TMD size wrong (rc=%d size=%u)",
+                         rc, wii_read_u32(count_ea));
+            ok = false;
+        }
+
+        wii_write_u32(ST_VECS + 0x00, ST_BUF);      wii_write_u32(ST_VECS + 0x04, 8);
+        wii_write_u32(ST_VECS + 0x08, count_ea);    wii_write_u32(ST_VECS + 0x0C, 4);
+        wii_write_u32(ST_VECS + 0x10, tmd_ea);
+        wii_write_u32(ST_VECS + 0x14, IOS_TMD_SIZE);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG0, IOCTL_ES_GETSTOREDTMD);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG1, 2);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG2, 1);
+        rc = ios_ipc_dispatch(ST_BLOCK);
+        EsTmdInfo tmd_info;
+        if (rc != IOS_IPC_SUCCESS || !es_tmd_parse(wii_mem_ptr(tmd_ea), IOS_TMD_SIZE, &tmd_info) ||
+            tmd_info.title_id != ios58_title) {
+            WHBLogPrintf("ios_ipc: IOS58 TMD wrong (rc=%d)", rc);
+            ok = false;
+        }
+
+        wii_write_u64(ST_BUF, invalid_ios_title);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG0, IOCTL_ES_GETVIEWCNT);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG1, 1);
+        wii_write_u32(ST_BLOCK + IPC_OFF_ARG2, 1);
+        rc = ios_ipc_dispatch(ST_BLOCK);
+        if (rc != IOS_IPC_ENOENT) {
+            WHBLogPrintf("ios_ipc: invalid IOS view count wrong (rc=%d)", rc);
             ok = false;
         }
     }
@@ -919,5 +1111,6 @@ IosIpcSelfTestResult ios_ipc_selftest(void) {
         }
     }
 
+    wii_write_u32(IOS_VERSION_LOWMEM, prior_ios_version);
     return ok ? IOS_IPC_SELFTEST_PASS : IOS_IPC_SELFTEST_FAIL;
 }
