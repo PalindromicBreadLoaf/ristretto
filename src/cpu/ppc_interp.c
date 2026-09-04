@@ -30,6 +30,10 @@
 #define PPC_SPR_TBU_W 285u
 #define PPC_SPR_SPRG0 272u
 #define PPC_SPR_GQR0  912u
+#define PPC_SPR_HID0  1008u
+#define PPC_SPR_HID1  1009u
+#define PPC_SPR_HID2  920u
+#define PPC_SPR_HID4  1011u
 
 #define WII_TIMEBASE_HZ 60750000u
 
@@ -343,6 +347,10 @@ static uint32_t read_spr(PpcContext *c, uint32_t spr) {
     case PPC_SPR_SRR1: return c->srr1;
     case PPC_SPR_TBL:  return (uint32_t)read_timebase(c);
     case PPC_SPR_TBU:  return (uint32_t)(read_timebase(c) >> 32);
+    case PPC_SPR_HID0: return c->hid0;
+    case PPC_SPR_HID1: return c->hid1;
+    case PPC_SPR_HID2: return c->hid2;
+    case PPC_SPR_HID4: return c->hid4;
     default:
         if (spr >= PPC_SPR_SPRG0 && spr < PPC_SPR_SPRG0 + 4u)
             return c->sprg[spr - PPC_SPR_SPRG0];
@@ -365,6 +373,10 @@ static void write_spr(PpcContext *c, uint32_t spr, uint32_t value) {
     case PPC_SPR_CTR:  c->ctr = value; return;
     case PPC_SPR_SRR0: c->srr0 = value; return;
     case PPC_SPR_SRR1: c->srr1 = value; return;
+    case PPC_SPR_HID0: c->hid0 = value; return;
+    case PPC_SPR_HID1: c->hid1 = value; return;
+    case PPC_SPR_HID2: c->hid2 = value; return;
+    case PPC_SPR_HID4: c->hid4 = value; return;
     case PPC_SPR_TBL_W: {
         uint64_t tb = read_timebase(c);
         write_timebase(c, (tb & 0xFFFFFFFF00000000ull) | value);
@@ -862,6 +874,23 @@ bool ppc_interp_selftest(void) {
         ctx.gpr[5] != 0x00002000u) {
         WHBLogPrintf("ppc_interp: virtual rfi failed pc=0x%08X msr=0x%08X r5=0x%08X",
                      ctx.pc, ctx.msr, ctx.gpr[5]);
+        return false;
+    }
+
+    static const uint32_t hid_code[] = {
+        0x7C93FAA6,  // mfspr r4,HID4
+        0x7C73FBA6,  // mtspr HID4,r3
+    };
+    for (size_t i = 0; i < sizeof hid_code / sizeof hid_code[0]; ++i)
+        wii_write_u32(system_ea + (uint32_t)i * 4, hid_code[i]);
+    memset(&ctx, 0, sizeof ctx);
+    ctx.pc = system_ea;
+    ctx.hid4 = 0x83900000u;
+    ctx.gpr[3] = 0x12345678u;
+    if (ppc_interp_run(&ctx, system_ea + sizeof hid_code, 8, &executed) != PPC_INTERP_STOP ||
+        ctx.gpr[4] != 0x83900000u || ctx.hid4 != 0x12345678u) {
+        WHBLogPrintf("ppc_interp: HID4 read/write failed r4=%08X hid4=%08X",
+                     ctx.gpr[4], ctx.hid4);
         return false;
     }
 

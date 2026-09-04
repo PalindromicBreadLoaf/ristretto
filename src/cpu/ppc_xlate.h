@@ -67,6 +67,8 @@ typedef struct {
 PpcXlateResult ppc_xlate_run(PpcContext *ctx, uint32_t entry_pc, uint32_t stop_pc,
                              uint32_t max_blocks, PpcXlateSession *out);
 
+void ppc_xlate_invalidate_cache(void);
+
 bool ppc_xlate_identity_selftest(void);
 
 bool ppc_xlate_memblock_selftest(void);

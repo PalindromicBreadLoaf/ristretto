@@ -25,6 +25,10 @@ typedef struct {
     uint32_t sprg[4];
     uint32_t gqr[8];
     uint32_t sr[16];
+    uint32_t hid0;
+    uint32_t hid1;
+    uint32_t hid2;
+    uint32_t hid4;
     double   ps1[32];
     uint64_t timebase;
     uint64_t timebase_host_ticks;

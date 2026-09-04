@@ -362,6 +362,11 @@ typedef struct {
 static XBlock   s_cache[XCACHE_CAP];
 static uint32_t s_codegen_bump;
 
+void ppc_xlate_invalidate_cache(void) {
+    memset(s_cache, 0, sizeof s_cache);
+    s_codegen_bump = 0;
+}
+
 // Session parameters and results
 static PpcContext   *s_ctx;
 static uint32_t      s_entry, s_stop, s_max_blocks;
