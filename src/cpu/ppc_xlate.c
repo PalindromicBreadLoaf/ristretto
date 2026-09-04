@@ -624,6 +624,19 @@ static XBlock *get_block(uint32_t pc) {
 
 static void record_transfer(const XBlock *b, const PpcContext *c) {
     PpcXlateSession *s = &s_session;
+    if (s->transfer_count) {
+        PpcXlateTransfer *last = &s->transfers[s->transfer_count - 1u];
+        if (last->pc == b->term_pc && last->word == b->term.raw &&
+            last->target == c->pc && last->lr == c->lr &&
+            last->sp == c->gpr[1]) {
+            last->r3 = c->gpr[3];
+            ++last->repeats;
+            s->last_transfer_pc = b->term_pc;
+            s->last_transfer_word = b->term.raw;
+            s->last_transfer_target = c->pc;
+            return;
+        }
+    }
     if (s->transfer_count == PPC_XLATE_TRANSFER_TRACE) {
         memmove(s->transfers, s->transfers + 1,
                 (PPC_XLATE_TRANSFER_TRACE - 1u) * sizeof(s->transfers[0]));
@@ -634,6 +647,9 @@ static void record_transfer(const XBlock *b, const PpcContext *c) {
         .word = b->term.raw,
         .target = c->pc,
         .lr = c->lr,
+        .sp = c->gpr[1],
+        .r3 = c->gpr[3],
+        .repeats = 1u,
     };
     s->last_transfer_pc = b->term_pc;
     s->last_transfer_word = b->term.raw;

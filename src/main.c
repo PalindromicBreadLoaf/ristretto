@@ -251,6 +251,7 @@ static bool selfTestBoot(void) {
     uint8_t dol[TEST_DOL_SIZE];
     uint32_t size = buildSyntheticDol(dol);
 
+    memset(wii_mem_ptr(TEST_BSS_EA), 0xA5, 0x40);
     DolLoadResult r;
     if (!boot_dol_from_buffer(dol, size, "RTST01", &r)) {
         WHBLogPrint("boot selftest: dol_load rejected a valid image");
@@ -265,7 +266,8 @@ static bool selfTestBoot(void) {
     }
     if (wii_read_u32(TEST_TEXT_EA) != 0x7C13FBA6 ||
         wii_read_u32(TEST_TEXT_EA + 4) != 0xDEADBEEF ||
-        wii_read_u32(TEST_DATA_EA) != 0xCAFEB0BA) {
+        wii_read_u32(TEST_DATA_EA) != 0xCAFEB0BA ||
+        wii_read_u32(TEST_BSS_EA) != 0 || wii_read_u32(TEST_BSS_EA + 0x3Cu) != 0) {
         WHBLogPrint("boot selftest: section bytes did not land in guest memory");
         ok = false;
     }
@@ -335,6 +337,8 @@ static bool selfTestDiscBoot(void) {
         wii_read_u32(0x80000038) != expected_fst_ea ||
         wii_read_u32(0x8000003C) != FST_SIZE ||
         wii_read_u32(0x80000030) != expected_arena_lo ||
+        memcmp(wii_mem_ptr(0x80003180), "RTST", 4) != 0 ||
+        wii_read_u32(0x80003194) != 0 || wii_read_u32(0x80003198) != 0 ||
         memcmp(wii_mem_ptr(expected_fst_ea), expected_fst, sizeof(expected_fst)) != 0 ||
         wii_read_u32(TEST_TEXT_EA) != 0x7C13FBA6 ||
         wii_read_u32(TEST_DATA_EA) != 0xCAFEB0BA) {
@@ -459,6 +463,8 @@ static uint32_t g_guest_xfb = 0;
 #define GUEST_STARTUP_SLICE_BLOCKS 200000u
 #define GUEST_STARTUP_MAX_SLICES   12u
 #define GUEST_FRAME_SLICE_BLOCKS   2049u
+#define WII_BOOT_STACK             0x816FFFF0u
+#define WII_BOOT_MSR               0x00002032u
 
 typedef struct {
     PpcContext context;
@@ -493,8 +499,9 @@ static void runGuestSlice(uint32_t block_budget) {
                          g_guest_run.context.ctr);
         for (uint32_t i = 0; i < session.transfer_count; ++i) {
             const PpcXlateTransfer *transfer = &session.transfers[i];
-            WHBLogPrintf("guest: transfer[%u] @0x%08X word=0x%08X -> 0x%08X lr=0x%08X",
-                         i, transfer->pc, transfer->word, transfer->target, transfer->lr);
+            WHBLogPrintf("guest: transfer[%u] @0x%08X word=0x%08X -> 0x%08X lr=0x%08X sp=0x%08X r3=0x%08X x%u",
+                         i, transfer->pc, transfer->word, transfer->target, transfer->lr,
+                         transfer->sp, transfer->r3, transfer->repeats);
         }
         WHBLogPrintf("guest: fault state r3=0x%08X r4=0x%08X r1=0x%08X cr=0x%08X msr=0x%08X",
                      g_guest_run.context.gpr[3], g_guest_run.context.gpr[4],
@@ -556,9 +563,12 @@ static void loadAndRunGuestDol(void) {
 
     memset(&g_guest_run, 0, sizeof g_guest_run);
     g_guest_run.context.pc     = r.entry_point;
-    g_guest_run.context.gpr[1] = 0x817E8000u; // provisional stack near the MEM1 arena top
+    g_guest_run.context.gpr[1] = WII_BOOT_STACK;
+    g_guest_run.context.msr    = WII_BOOT_MSR;
     g_guest_run.active         = true;
     g_guest_run.capture_gx     = capture_gx;
+    WHBLogPrintf("guest: boot stack=0x%08X msr=0x%08X",
+                 g_guest_run.context.gpr[1], g_guest_run.context.msr);
 
     for (uint32_t slice = 0; slice < GUEST_STARTUP_MAX_SLICES && g_guest_run.active; ++slice)
         runGuestSlice(GUEST_STARTUP_SLICE_BLOCKS);
