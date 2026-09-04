@@ -21,4 +21,7 @@ bool boot_dol_from_buffer(const void *buf, uint32_t size, const char *disc_id6,
 // Load the game's main DOL directly from an already open, decrypted partition.
 bool boot_dol_from_disc(Disc *disc, DolLoadResult *out);
 
+// Load the partition apploader image at its Wii BS2 address and return its entry point.
+bool boot_apploader_from_disc(Disc *disc, uint32_t *entry_point);
+
 #endif  // RISTRETTO_BOOT_BOOT_H

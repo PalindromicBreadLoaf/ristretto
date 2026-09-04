@@ -127,7 +127,7 @@ bool ppc_decode(uint32_t word, PpcInst *out) {
     uint8_t op = out->primary;
 
     switch (op) {
-    case 4: { // Gekko/Broadway paired-single family
+    case 4: { // Paired-single family
         out->class = PPC_CLASS_PS;
         out->xo    = (word >> 1) & 0x3FF;
         uint8_t ps_op = (word >> 1) & 0x3Fu;

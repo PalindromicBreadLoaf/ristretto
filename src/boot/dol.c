@@ -125,8 +125,8 @@ bool dol_load(const void *buf, uint32_t size, DolLoadResult *out) {
     }
 
     *out = r;
-    WHBLogPrintf("dol: loaded %u sections, entry=0x%08X image=0x%08X..0x%08X %s",
+    WHBLogPrintf("dol: loaded %u sections, entry=0x%08X image=0x%08X..0x%08X bss=0x%08X+0x%X %s",
                  r.section_count, r.entry_point, r.image_lo, r.image_hi,
-                 r.is_wii ? "(Wii)" : "(GC)");
+                 r.bss_address, r.bss_size, r.is_wii ? "(Wii)" : "(GC)");
     return true;
 }
