@@ -17,6 +17,10 @@
 #define OSBOOTINFO_FST_ADDR  0x00000038u
 #define OSBOOTINFO_FST_SIZE  0x0000003Cu
 
+#define OSBOOTINFO_DISC_ID_CHECK  0x00003180u
+#define OSBOOTINFO_PART_TYPE      0x00003194u
+#define OSBOOTINFO_PART_OFFSET    0x00003198u
+
 #define DISC_BOOT_DOL_OFFSET 0x420u
 #define DISC_BOOT_FST_OFFSET 0x424u
 #define DISC_BOOT_FST_SIZE   0x428u
@@ -91,6 +95,19 @@ static bool boot_load_fst(Disc *disc, const uint8_t *boot, const DolLoadResult *
     return true;
 }
 
+static bool boot_apply_disc_runtime(const Disc *disc) {
+    if ((disc->part_offset >> 2) > UINT32_MAX) {
+        WHBLogPrintf("boot: partition offset 0x%llX cannot fit low memory",
+                     (unsigned long long)disc->part_offset);
+        return false;
+    }
+    for (uint32_t i = 0; i < 4; ++i)
+        wii_write_u8(OSBOOTINFO_DISC_ID_CHECK + i, (uint8_t)disc->game_id[i]);
+    wii_write_u32(OSBOOTINFO_PART_TYPE, 0);  // data partition
+    wii_write_u32(OSBOOTINFO_PART_OFFSET, (uint32_t)(disc->part_offset >> 2));
+    return true;
+}
+
 bool boot_dol_from_disc(Disc *disc, DolLoadResult *out) {
     if (!disc || !out || !disc->part_open) return false;
 
@@ -124,7 +141,7 @@ bool boot_dol_from_disc(Disc *disc, DolLoadResult *out) {
     }
     const bool read_ok = disc_read_partition(disc, dol_offset, dol, dol_size);
     const bool load_ok = read_ok && boot_dol_from_buffer(dol, dol_size, disc->game_id, out) &&
-                         boot_load_fst(disc, boot, out);
+                         boot_load_fst(disc, boot, out) && boot_apply_disc_runtime(disc);
     free(dol);
     return load_ok;
 }

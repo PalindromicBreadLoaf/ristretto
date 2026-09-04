@@ -3,6 +3,8 @@
 
 #include "boot/dol.h"
 
+#include <string.h>
+
 #include <whb/log.h>
 
 #include "mem/wii_memory.h"
@@ -65,6 +67,16 @@ bool dol_load(const void *buf, uint32_t size, DolLoadResult *out) {
     r.image_lo    = 0xFFFFFFFFu;
     r.image_hi    = 0;
 
+    if (h.bss_size) {
+        void *bss = wii_mem_range(h.bss_address, h.bss_size);
+        if (!bss) {
+            WHBLogPrintf("dol: BSS 0x%08X+0x%X not in guest memory",
+                         h.bss_address, h.bss_size);
+            return false;
+        }
+        memset(bss, 0, h.bss_size);
+    }
+
     for (int i = 0; i < DOL_NUM_SECTIONS; ++i) {
         if (h.size[i] == 0)
             continue;
@@ -108,11 +120,6 @@ bool dol_load(const void *buf, uint32_t size, DolLoadResult *out) {
     }
 
     if (h.bss_size) {
-        if (!wii_mem_range(h.bss_address, h.bss_size)) {
-            WHBLogPrintf("dol: BSS 0x%08X+0x%X not in guest memory",
-                         h.bss_address, h.bss_size);
-            return false;
-        }
         if (h.bss_address + h.bss_size > r.image_hi)
             r.image_hi = h.bss_address + h.bss_size;
     }
