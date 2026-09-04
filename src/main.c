@@ -280,6 +280,74 @@ static bool selfTestBoot(void) {
     return ok;
 }
 
+static bool selfTestDiscBoot(void) {
+    enum {
+        DOL_OFFSET = 0x100,
+        FST_OFFSET = 0x400,
+        FST_SIZE = 0x20,
+    };
+    static const uint8_t expected_fst[FST_SIZE] = {
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 'f', 'i', 'l', 'e',
+        '.', 'b', 'i', 'n', 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    uint8_t plain[DISC_BLOCK_DATA] = {0};
+    uint8_t encrypted[DISC_BLOCK_TOTAL] = {0};
+    uint8_t iv[AES_BLOCK_SIZE] = {0};
+    const uint8_t zero_key[AES_KEY_SIZE] = {0};
+
+    putBe32(plain + 0x420, DOL_OFFSET >> 2);
+    putBe32(plain + 0x424, FST_OFFSET >> 2);
+    putBe32(plain + 0x428, FST_SIZE >> 2);
+    const uint32_t dol_size = buildSyntheticDol(plain + DOL_OFFSET);
+    memcpy(plain + FST_OFFSET, expected_fst, sizeof(expected_fst));
+
+    for (uint32_t i = 0; i < sizeof(iv); ++i)
+        iv[i] = (uint8_t)(0xA0u + i);
+    memcpy(encrypted + 0x3D0, iv, sizeof(iv));
+
+    Disc disc = {
+        .mem = encrypted,
+        .size = sizeof(encrypted),
+        .backing_size = sizeof(encrypted),
+        .valid = true,
+        .is_wii = true,
+        .part_open = true,
+        .part_data = 0,
+    };
+    memcpy(disc.game_id, "RTST01", 6);
+    AesKey key;
+    aes128_set_key(&key, zero_key);
+    aes128_set_key(&disc.part_key, zero_key);
+    aes128_cbc_encrypt(&key, iv, plain, encrypted + DISC_BLOCK_HEADER,
+                       DISC_BLOCK_DATA);
+
+    DolLoadResult result;
+    if (!boot_dol_from_disc(&disc, &result)) {
+        WHBLogPrint("boot disc selftest: rejected a valid encrypted partition");
+        return false;
+    }
+
+    const uint32_t expected_fst_ea = (result.image_hi + 0x1Fu) & ~0x1Fu;
+    const uint32_t expected_arena_lo = (expected_fst_ea + FST_SIZE + 0x1Fu) & ~0x1Fu;
+    if (result.entry_point != TEST_TEXT_EA || result.image_hi != TEST_BSS_EA + 0x40 ||
+        wii_read_u32(0x80000038) != expected_fst_ea ||
+        wii_read_u32(0x8000003C) != FST_SIZE ||
+        wii_read_u32(0x80000030) != expected_arena_lo ||
+        memcmp(wii_mem_ptr(expected_fst_ea), expected_fst, sizeof(expected_fst)) != 0 ||
+        wii_read_u32(TEST_TEXT_EA) != 0x7C13FBA6 ||
+        wii_read_u32(TEST_DATA_EA) != 0xCAFEB0BA) {
+        WHBLogPrint("boot disc selftest: DOL/FST handoff state is wrong");
+        return false;
+    }
+    if (dol_size != TEST_DOL_SIZE) {
+        WHBLogPrint("boot disc selftest: synthetic DOL length changed unexpectedly");
+        return false;
+    }
+    return true;
+}
+
 // A boot.dol read from SD and kept until we run it.
 static uint8_t *g_dol_buf = NULL;
 static long     g_dol_len = 0;
@@ -418,6 +486,20 @@ static void runGuestSlice(uint32_t block_budget) {
     } else if (session.stop == PPC_XSTOP_FAULT) {
         WHBLogPrintf("guest: faulted @0x%08X word=0x%08X class=%u",
                      session.last_pc, session.last_word, session.last_class);
+        if (session.last_transfer_pc)
+            WHBLogPrintf("guest: last transfer @0x%08X word=0x%08X -> 0x%08X lr=0x%08X ctr=0x%08X",
+                         session.last_transfer_pc, session.last_transfer_word,
+                         session.last_transfer_target, g_guest_run.context.lr,
+                         g_guest_run.context.ctr);
+        for (uint32_t i = 0; i < session.transfer_count; ++i) {
+            const PpcXlateTransfer *transfer = &session.transfers[i];
+            WHBLogPrintf("guest: transfer[%u] @0x%08X word=0x%08X -> 0x%08X lr=0x%08X",
+                         i, transfer->pc, transfer->word, transfer->target, transfer->lr);
+        }
+        WHBLogPrintf("guest: fault state r3=0x%08X r4=0x%08X r1=0x%08X cr=0x%08X msr=0x%08X",
+                     g_guest_run.context.gpr[3], g_guest_run.context.gpr[4],
+                     g_guest_run.context.gpr[1], g_guest_run.context.cr,
+                     g_guest_run.context.msr);
         g_guest_run.active = false;
     } else if (session.stop != PPC_XSTOP_BUDGET) {
         WHBLogPrintf("guest: translator stopped at 0x%08X (stop=%d)",
@@ -604,6 +686,7 @@ int main(int argc, char **argv) {
     wii_audio_reset();
     WHBLogPrintf("wii_mem selftest: %s", selfTestWiiMemory() ? "PASS" : "FAIL");
     WHBLogPrintf("boot selftest: %s", selfTestBoot() ? "PASS" : "FAIL");
+    WHBLogPrintf("boot disc selftest: %s", selfTestDiscBoot() ? "PASS" : "FAIL");
     tryLoadDolFromSd();
     switch (cpu_exec_selftest()) {
         case CPU_EXEC_PASS:        WHBLogPrint("cpu_exec selftest: PASS"); break;
