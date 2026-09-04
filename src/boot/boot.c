@@ -18,12 +18,21 @@
 #define OSBOOTINFO_FST_SIZE  0x0000003Cu
 
 #define OSBOOTINFO_DISC_ID_CHECK  0x00003180u
+#define OSBOOTINFO_IOS_VERSION     0x00003140u
+#define OSBOOTINFO_APPLOADER_IOS_VERSION 0x00003188u
 #define OSBOOTINFO_PART_TYPE      0x00003194u
 #define OSBOOTINFO_PART_OFFSET    0x00003198u
 
 #define DISC_BOOT_DOL_OFFSET 0x420u
 #define DISC_BOOT_FST_OFFSET 0x424u
 #define DISC_BOOT_FST_SIZE   0x428u
+
+#define APPLOADER_DISC_OFFSET 0x2440u
+#define APPLOADER_LOAD_EA     0x81200000u
+#define APPLOADER_ENTRY       0x10u
+#define APPLOADER_SIZE        0x14u
+#define APPLOADER_TRAILER     0x18u
+#define APPLOADER_HEADER_SIZE 0x20u
 
 static uint32_t align_up(uint32_t v, uint32_t a) {
     return (v + (a - 1)) & ~(a - 1);
@@ -103,8 +112,11 @@ static bool boot_apply_disc_runtime(const Disc *disc) {
     }
     for (uint32_t i = 0; i < 4; ++i)
         wii_write_u8(OSBOOTINFO_DISC_ID_CHECK + i, (uint8_t)disc->game_id[i]);
+    wii_write_u32(OSBOOTINFO_IOS_VERSION, disc->part_ios_version);
+    wii_write_u32(OSBOOTINFO_APPLOADER_IOS_VERSION, disc->part_ios_version);
     wii_write_u32(OSBOOTINFO_PART_TYPE, 0);  // data partition
     wii_write_u32(OSBOOTINFO_PART_OFFSET, (uint32_t)(disc->part_offset >> 2));
+    WHBLogPrintf("boot: IOS%u from partition TMD", disc->part_ios_version);
     return true;
 }
 
@@ -144,4 +156,30 @@ bool boot_dol_from_disc(Disc *disc, DolLoadResult *out) {
                          boot_load_fst(disc, boot, out) && boot_apply_disc_runtime(disc);
     free(dol);
     return load_ok;
+}
+
+bool boot_apploader_from_disc(Disc *disc, uint32_t *entry_point) {
+    if (!disc || !entry_point || !disc->part_open)
+        return false;
+
+    uint8_t header[APPLOADER_HEADER_SIZE];
+    if (!disc_read_partition(disc, APPLOADER_DISC_OFFSET, header, sizeof(header)))
+        return false;
+    const uint32_t entry = read_be32(header + APPLOADER_ENTRY);
+    const uint64_t size = (uint64_t)read_be32(header + APPLOADER_SIZE) +
+                          read_be32(header + APPLOADER_TRAILER);
+    if (!entry || size == 0 || size > UINT32_MAX ||
+        !wii_mem_range(APPLOADER_LOAD_EA, (uint32_t)size)) {
+        WHBLogPrintf("boot: invalid apploader entry=0x%08X size=0x%llX", entry,
+                     (unsigned long long)size);
+        return false;
+    }
+    if (!disc_read_partition(disc, APPLOADER_DISC_OFFSET + APPLOADER_HEADER_SIZE,
+                             wii_mem_ptr(APPLOADER_LOAD_EA), (uint32_t)size))
+        return false;
+
+    *entry_point = entry;
+    WHBLogPrintf("boot: apploader @0x%08X size=0x%X entry=0x%08X",
+                 APPLOADER_LOAD_EA, (uint32_t)size, entry);
+    return true;
 }

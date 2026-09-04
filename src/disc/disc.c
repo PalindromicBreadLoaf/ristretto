@@ -14,7 +14,9 @@
 #define TICKET_TITLE_KEY   0x1BF
 #define TICKET_TITLE_ID    0x1DC
 #define TICKET_KEY_INDEX   0x1F1
+#define PART_TMD_OFF_ADDR  0x2A8  // >>2-encoded offset of the partition TMD
 #define PART_DATA_OFF_ADDR 0x2B8  // >>2-encoded offset of the partition's data
+#define TMD_SYSTEM_VERSION 0x184
 
 #define WBFS_MAGIC              0x57424653u
 #define WBFS_HEADER_SIZE        12u
@@ -307,12 +309,23 @@ bool disc_open_partition(Disc *d, uint64_t part_offset) {
     aes128_cbc_decrypt(&common, iv, enc_key, title_key, 16);
     aes128_set_key(&d->part_key, title_key);
 
-    uint8_t doff[4];
-    if (!disc_read_raw(d, part_offset + PART_DATA_OFF_ADDR, doff, 4)) return false;
+    uint8_t tmdoff[4], doff[4], ios_title_id[8];
+    if (!disc_read_raw(d, part_offset + PART_TMD_OFF_ADDR, tmdoff, sizeof(tmdoff)) ||
+        !disc_read_raw(d, part_offset + PART_DATA_OFF_ADDR, doff, sizeof(doff)))
+        return false;
+    const uint64_t tmd_offset = (uint64_t)be32(tmdoff) << 2;
+    if (part_offset > UINT64_MAX - tmd_offset ||
+        part_offset + tmd_offset > UINT64_MAX - TMD_SYSTEM_VERSION ||
+        !disc_read_raw(d, part_offset + tmd_offset + TMD_SYSTEM_VERSION,
+                       ios_title_id, sizeof(ios_title_id)))
+        return false;
     uint64_t data_offset = (uint64_t)be32(doff) << 2;
+    if (data_offset > UINT64_MAX - part_offset)
+        return false;
 
     d->part_offset = part_offset;
     d->part_data = part_offset + data_offset;
+    d->part_ios_version = be32(ios_title_id + 4);
     d->part_open = true;
     return true;
 }
@@ -395,7 +408,10 @@ bool disc_selftest(void) {
                            img + ST_PART_OFF + TICKET_TITLE_KEY, 16);
         memcpy(img + ST_PART_OFF + TICKET_TITLE_ID, title_id, 8);
         img[ST_PART_OFF + TICKET_KEY_INDEX] = 0;
+        put_be32(img + ST_PART_OFF + PART_TMD_OFF_ADDR, 0x400 >> 2);
         put_be32(img + ST_PART_OFF + PART_DATA_OFF_ADDR, ST_DATA_OFF >> 2);
+        put_be32(img + ST_PART_OFF + 0x400 + TMD_SYSTEM_VERSION, 1);
+        put_be32(img + ST_PART_OFF + 0x404 + TMD_SYSTEM_VERSION, 53);
 
         // One encrypted cluster
         static uint8_t payload[DISC_BLOCK_DATA];
@@ -415,7 +431,7 @@ bool disc_selftest(void) {
 
         uint64_t part;
         if (!disc_find_game_partition(&d, &part) || part != ST_PART_OFF) break;
-        if (!disc_open_partition(&d, part)) break;
+        if (!disc_open_partition(&d, part) || d.part_ios_version != 53) break;
 
         // Read across a cluster-internal boundary.
         uint8_t got[512];
@@ -452,7 +468,7 @@ bool disc_selftest(void) {
         if (!disc_open_memory(&d, wbfs, wbfs_len) || !disc_is_wbfs(&d) ||
             strcmp(d.game_id, "RTST01") != 0) break;
         if (!disc_find_game_partition(&d, &part) || part != ST_PART_OFF ||
-            !disc_open_partition(&d, part)) break;
+            !disc_open_partition(&d, part) || d.part_ios_version != 53) break;
         if (!disc_read_partition(&d, 0x1000, got, sizeof(got)) ||
             memcmp(got, payload + 0x1000, sizeof(got)) != 0) break;
         if (disc_read_raw(&d, (uint64_t)used_blocks * wbfs_size, got, sizeof(got))) break;

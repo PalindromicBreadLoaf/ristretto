@@ -43,6 +43,7 @@ typedef struct {
     bool     part_open;    // a partition is open for decrypted reads
     uint64_t part_offset;  // absolute byte offset of the open partition
     uint64_t part_data;    // absolute byte offset of its first encrypted cluster
+    uint32_t part_ios_version;  // IOS version requested by the partition TMD
     AesKey   part_key;     // decrypted title key for the open partition
 } Disc;
 

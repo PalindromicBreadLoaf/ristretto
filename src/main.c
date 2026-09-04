@@ -316,6 +316,7 @@ static bool selfTestDiscBoot(void) {
         .valid = true,
         .is_wii = true,
         .part_open = true,
+        .part_ios_version = 53,
         .part_data = 0,
     };
     memcpy(disc.game_id, "RTST01", 6);
@@ -338,6 +339,7 @@ static bool selfTestDiscBoot(void) {
         wii_read_u32(0x8000003C) != FST_SIZE ||
         wii_read_u32(0x80000030) != expected_arena_lo ||
         memcmp(wii_mem_ptr(0x80003180), "RTST", 4) != 0 ||
+        wii_read_u32(0x80003140) != 53 || wii_read_u32(0x80003188) != 53 ||
         wii_read_u32(0x80003194) != 0 || wii_read_u32(0x80003198) != 0 ||
         memcmp(wii_mem_ptr(expected_fst_ea), expected_fst, sizeof(expected_fst)) != 0 ||
         wii_read_u32(TEST_TEXT_EA) != 0x7C13FBA6 ||
@@ -462,9 +464,24 @@ static uint32_t g_guest_xfb = 0;
 #define XFB_HEIGHT 480u
 #define GUEST_STARTUP_SLICE_BLOCKS 200000u
 #define GUEST_STARTUP_MAX_SLICES   12u
+#define GUEST_BOOTSTRAP_PROBE_BLOCKS 2048u
 #define GUEST_FRAME_SLICE_BLOCKS   2049u
 #define WII_BOOT_STACK             0x816FFFF0u
 #define WII_BOOT_MSR               0x00002032u
+#define WII_BOOT_HID0              0x0011C664u
+#define WII_BOOT_HID1              0x80000000u
+#define WII_BOOT_HID2              0xE0000000u
+#define WII_BOOT_HID4              0x83900000u
+#define PPC_RFI                    0x4C000064u
+#define PPC_BLR                    0x4E800020u
+#define APPLOADER_FUNCTIONS_EA     0x80004000u
+#define APPLOADER_REPORT_EA        0x81300000u
+#define APPLOADER_COPY_ADDR_EA     (APPLOADER_REPORT_EA + 4u)
+#define APPLOADER_COPY_SIZE_EA     (APPLOADER_REPORT_EA + 8u)
+#define APPLOADER_COPY_OFFSET_EA   (APPLOADER_REPORT_EA + 12u)
+#define APPLOADER_RETURN_EA        0x80003000u
+#define APPLOADER_CALL_BLOCKS      200000u
+#define APPLOADER_MAX_CALLS        64u
 
 typedef struct {
     PpcContext context;
@@ -476,7 +493,115 @@ typedef struct {
 
 static GuestRun g_guest_run;
 
-static void runGuestSlice(uint32_t block_budget) {
+static void logGuestTransfers(const char *label, const PpcXlateSession *session) {
+    for (uint32_t i = 0; i < session->transfer_count; ++i) {
+        const PpcXlateTransfer *transfer = &session->transfers[i];
+        if (label[0]) {
+            WHBLogPrintf("guest: %s transfer[%u] @0x%08X word=0x%08X -> 0x%08X lr=0x%08X sp=0x%08X r3=0x%08X x%u",
+                         label, i, transfer->pc, transfer->word, transfer->target, transfer->lr,
+                         transfer->sp, transfer->r3, transfer->repeats);
+        } else {
+            WHBLogPrintf("guest: transfer[%u] @0x%08X word=0x%08X -> 0x%08X lr=0x%08X sp=0x%08X r3=0x%08X x%u",
+                         i, transfer->pc, transfer->word, transfer->target, transfer->lr,
+                         transfer->sp, transfer->r3, transfer->repeats);
+        }
+    }
+}
+
+static void logGuestCode(uint32_t ea) {
+    WHBLogPrintf("guest: code @0x%08X %08X %08X %08X %08X",
+                 ea, wii_read_u32(ea), wii_read_u32(ea + 4u),
+                 wii_read_u32(ea + 8u), wii_read_u32(ea + 12u));
+}
+
+static bool runGuestCall(PpcContext *context, uint32_t entry, uint32_t r3,
+                         uint32_t r4, uint32_t r5, uint32_t *return_value,
+                         const char *name) {
+    context->pc = entry;
+    context->lr = APPLOADER_RETURN_EA;
+    context->gpr[3] = r3;
+    context->gpr[4] = r4;
+    context->gpr[5] = r5;
+    for (uint32_t slice = 0; slice < GUEST_STARTUP_MAX_SLICES; ++slice) {
+        PpcXlateSession session;
+        PpcXlateResult result = ppc_xlate_run(context, context->pc, APPLOADER_RETURN_EA,
+                                               APPLOADER_CALL_BLOCKS, &session);
+        if (result == PPC_XLATE_OK && session.stop == PPC_XSTOP_STOP_PC) {
+            *return_value = context->gpr[3];
+            return true;
+        }
+        if (result != PPC_XLATE_OK || session.stop != PPC_XSTOP_BUDGET) {
+            WHBLogPrintf("boot: apploader %s stopped result=%d stop=%d pc=0x%08X",
+                         name, result, session.stop, context->pc);
+            return false;
+        }
+    }
+    WHBLogPrintf("boot: apploader %s exceeded %u blocks", name,
+                 GUEST_STARTUP_MAX_SLICES * APPLOADER_CALL_BLOCKS);
+    return false;
+}
+
+static bool runDiscApploader(Disc *disc, PpcContext *context, uint32_t *launch_entry) {
+    uint32_t apploader_entry;
+    if (!boot_apploader_from_disc(disc, &apploader_entry))
+        return false;
+
+    uint32_t result;
+    if (!runGuestCall(context, apploader_entry, APPLOADER_FUNCTIONS_EA,
+                      APPLOADER_FUNCTIONS_EA + 4u, APPLOADER_FUNCTIONS_EA + 8u,
+                      &result, "entry"))
+        return false;
+    const uint32_t init = wii_read_u32(APPLOADER_FUNCTIONS_EA);
+    const uint32_t main_fn = wii_read_u32(APPLOADER_FUNCTIONS_EA + 4u);
+    const uint32_t close = wii_read_u32(APPLOADER_FUNCTIONS_EA + 8u);
+    if (!init || !main_fn || !close) {
+        WHBLogPrintf("boot: invalid apploader callbacks %08X %08X %08X",
+                     init, main_fn, close);
+        return false;
+    }
+    WHBLogPrintf("boot: apploader callbacks init=%08X main=%08X close=%08X",
+                 init, main_fn, close);
+
+    wii_write_u32(APPLOADER_REPORT_EA, PPC_BLR);
+    if (!runGuestCall(context, init, APPLOADER_REPORT_EA, 0, 0, &result, "init"))
+        return false;
+
+    for (uint32_t i = 0; i < APPLOADER_MAX_CALLS; ++i) {
+        if (!runGuestCall(context, main_fn, APPLOADER_COPY_ADDR_EA, APPLOADER_COPY_SIZE_EA,
+                          APPLOADER_COPY_OFFSET_EA, &result, "main"))
+            return false;
+        if (result == 0)
+            break;
+
+        const uint32_t destination = wii_read_u32(APPLOADER_COPY_ADDR_EA);
+        const uint32_t size = wii_read_u32(APPLOADER_COPY_SIZE_EA);
+        const uint64_t offset = (uint64_t)wii_read_u32(APPLOADER_COPY_OFFSET_EA) << 2;
+        WHBLogPrintf("boot: apploader copy %u result=%u dst=0x%08X size=0x%X off=0x%llX",
+                     i, result, destination, size, (unsigned long long)offset);
+        if (size == 0) {
+            result = 0;
+            break;
+        }
+        if (size == 0 || !wii_mem_range(destination, size) ||
+            !disc_read_partition(disc, offset, wii_mem_ptr(destination), size)) {
+            WHBLogPrintf("boot: apploader copy %u invalid dst=0x%08X size=0x%X off=0x%llX",
+                         i, destination, size, (unsigned long long)offset);
+            return false;
+        }
+        ppc_xlate_invalidate_cache();
+    }
+    if (result != 0) {
+        WHBLogPrintf("boot: apploader exceeded %u section copies", APPLOADER_MAX_CALLS);
+        return false;
+    }
+    if (!runGuestCall(context, close, 0, 0, 0, launch_entry, "close") || !*launch_entry)
+        return false;
+
+    WHBLogPrintf("boot: apploader selected entry=0x%08X", *launch_entry);
+    return true;
+}
+
+static void runGuestSlice(uint32_t block_budget, bool bootstrap_probe) {
     if (!g_guest_run.active)
         return;
 
@@ -486,6 +611,11 @@ static void runGuestSlice(uint32_t block_budget) {
                                           block_budget, &session);
     g_guest_run.blocks_run += session.blocks_run;
     ++g_guest_run.slices_run;
+    if (bootstrap_probe) {
+        WHBLogPrintf("guest: bootstrap probe blocks=%u stop=%d pc=0x%08X",
+                     session.blocks_run, session.stop, g_guest_run.context.pc);
+        logGuestTransfers("bootstrap", &session);
+    }
     if (result != PPC_XLATE_OK) {
         WHBLogPrintf("guest: translator stopped with status %d", result);
         g_guest_run.active = false;
@@ -497,12 +627,7 @@ static void runGuestSlice(uint32_t block_budget) {
                          session.last_transfer_pc, session.last_transfer_word,
                          session.last_transfer_target, g_guest_run.context.lr,
                          g_guest_run.context.ctr);
-        for (uint32_t i = 0; i < session.transfer_count; ++i) {
-            const PpcXlateTransfer *transfer = &session.transfers[i];
-            WHBLogPrintf("guest: transfer[%u] @0x%08X word=0x%08X -> 0x%08X lr=0x%08X sp=0x%08X r3=0x%08X x%u",
-                         i, transfer->pc, transfer->word, transfer->target, transfer->lr,
-                         transfer->sp, transfer->r3, transfer->repeats);
-        }
+        logGuestTransfers("", &session);
         WHBLogPrintf("guest: fault state r3=0x%08X r4=0x%08X r1=0x%08X cr=0x%08X msr=0x%08X",
                      g_guest_run.context.gpr[3], g_guest_run.context.gpr[4],
                      g_guest_run.context.gpr[1], g_guest_run.context.cr,
@@ -562,19 +687,41 @@ static void loadAndRunGuestDol(void) {
     }
 
     memset(&g_guest_run, 0, sizeof g_guest_run);
-    g_guest_run.context.pc     = r.entry_point;
     g_guest_run.context.gpr[1] = WII_BOOT_STACK;
     g_guest_run.context.msr    = WII_BOOT_MSR;
+    g_guest_run.context.hid0   = WII_BOOT_HID0;
+    g_guest_run.context.hid1   = WII_BOOT_HID1;
+    g_guest_run.context.hid2   = WII_BOOT_HID2;
+    g_guest_run.context.hid4   = WII_BOOT_HID4;
+    wii_write_u32(0x00000300, PPC_RFI);
+    wii_write_u32(0x00000800, PPC_RFI);
+    wii_write_u32(0x00000C00, PPC_RFI);
+
+    uint32_t launch_entry = r.entry_point;
+    if (g_disc_dol_loaded && !runDiscApploader(&g_disc, &g_guest_run.context, &launch_entry))
+        WHBLogPrint("boot: apploader failed);
+    g_guest_run.context.pc     = launch_entry;
     g_guest_run.active         = true;
     g_guest_run.capture_gx     = capture_gx;
-    WHBLogPrintf("guest: boot stack=0x%08X msr=0x%08X",
-                 g_guest_run.context.gpr[1], g_guest_run.context.msr);
+    WHBLogPrintf("guest: boot stack=0x%08X msr=0x%08X hid4=0x%08X",
+                 g_guest_run.context.gpr[1], g_guest_run.context.msr,
+                 g_guest_run.context.hid4);
+    if (g_disc_dol_loaded) {
+        logGuestCode(r.entry_point);
+        logGuestCode(launch_entry);
+        logGuestCode(0x80004270u);
+        logGuestCode(0x80004600u);
+        logGuestCode(0x800046B0u);
+        logGuestCode(0x801AA180u);
+        logGuestCode(0x801AA300u);
+    }
 
+    runGuestSlice(GUEST_BOOTSTRAP_PROBE_BLOCKS, true);
     for (uint32_t slice = 0; slice < GUEST_STARTUP_MAX_SLICES && g_guest_run.active; ++slice)
-        runGuestSlice(GUEST_STARTUP_SLICE_BLOCKS);
+        runGuestSlice(GUEST_STARTUP_SLICE_BLOCKS, false);
 
     if (!g_guest_xfb)
-        WHBLogPrint("guest: VI configured no XFB. Showing test shader.");
+        WHBLogPrint("guest: VI never configured XFB. Showing test shader.");
     else if (g_guest_run.active)
         WHBLogPrint("guest: frame scheduler armed");
 }
@@ -856,7 +1003,7 @@ int main(int argc, char **argv) {
             if (guest_frame_started)
                 gx_submit_begin_frame(&g_gx_submit);
             guest_frame_started = true;
-            runGuestSlice(GUEST_FRAME_SLICE_BLOCKS);
+            runGuestSlice(GUEST_FRAME_SLICE_BLOCKS, false);
         }
 
         if (presentGuest && g_guest_xfb)
